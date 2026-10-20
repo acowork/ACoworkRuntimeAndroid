@@ -1,0 +1,40 @@
+# Rust
+target/
+**/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# Android / Gradle
+.gradle/
+build/
+local.properties
+*.apk
+*.aab
+*.ap_
+*.dex
+*.keystore
+captures/
+.cxx/
+
+# NDK / native artifacts
+*.o
+*.a
+*.so
+
+# IDE
+.vscode/
+.idea/
+.qoder/
+.workbuddy/
+*.swp
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs & local env
+*.log
+.env
+.env.local
