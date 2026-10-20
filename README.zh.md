@@ -51,6 +51,8 @@ acowork-android serve --gateway-http http://<gateway-host>:19876
 
 - 与桌面端 `acowork-node` 一致的 CLI 使用体验：注册 Gateway、启动 / 停止 Agent、浏览文件、安装包。
 - 以普通非特权用户身份运行，基础能力集不需要 Root。
+- 在已 Root 的调试设备上，可启用 `root-shell` 宿主档（见下节）做系统级开发与调试。这是同一个二进制的
+  **一种运行模式**，不是第三个产物。
 - 面向高级用户、无屏设备、设备侧 CI 与脚本化自动化场景。
 
 ### 2. App 版本 —— `acowork-android-app`
@@ -64,6 +66,36 @@ acowork-android serve --gateway-http http://<gateway-host>:19876
 
 两个版本共享同一套 Agent 引擎，差别在于**生命周期管理方式**（Termux 进程 vs. 前台服务）与
 **存储 / 权限策略**，而非运行时语义本身。
+
+## 宿主档（Host Profiles）
+
+引擎可以运行在三种 Android 宿主上。具体落到哪一档，是**启动时探测**出来的，而不是手工配置的：同一个
+二进制在一台原生手机上和在一台已 Root 的工程机上，表现并不相同。
+
+| 能力 | `apk-sandbox` | `termux` | `root-shell`（调试设备） |
+|---|:---:|:---:|:---:|
+| shell 执行 | ❌ | ✅ `bash` | ✅ `/system/bin/sh`（mksh）+ toybox / busybox |
+| 文件可达范围 | 应用私有目录 | `$PREFIX` + 用户授权的 SAF | `/data` 大范围；`/system` 仅在可 remount 后 |
+| 跨应用数据（`/data/data/*`） | ❌ | ❌ | ✅（以 SELinux 允许为限） |
+| 全量 `logcat` | ❌ | 仅本应用 | ✅ |
+| `setprop` / `am` / `pm` / `input` / `screencap` | ❌ | ❌ | ✅ |
+| 风险等级 | 低 | 中 | **高（可变砖）** |
+
+三条宿主档共同遵守两条规则：
+
+- **Runtime 自身绝不以 root 运行。** 它持有 Gateway 凭证与 LLM API key，在回环地址上提供 HTTP 服务，
+  并执行来自网络侧的指令。提权只发生在**单次工具调用**内部、发生在窄接口的执行后端里 —— 于是一次提示
+  注入不会丢掉整台设备；同时 Agent 写出的文件，下次以非特权身份启动时仍然读得到、删得掉。
+- **`root` 不是一个布尔量。** 它被拆成可审批的 capability：`android:shell:read`、`android:shell:write`、
+  `android:fs:outside-app`、`android:fs:system`、`android:selinux:permissive`，各自走既有的会话审批机制，
+  各自留审计记录。破坏性操作（`dd` 写块设备、`wipe data`、刷分区）默认拒绝。
+
+需要强调的是，Android 上真正起约束作用的并不是 root，而是 **SELinux 域**：uid 0 的进程依然受策略限制；
+user 版上 `/system` 依然有 verity 保护且只读；`/system/bin/sh` 是 mksh 而不是 bash。探测机制测量的正是
+这些事实，而不是假设它们。
+
+设计取舍：[ADR-AND-001](docs/adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md) ·
+探测规格：[android-host-probe.md](docs/design/zh/android-host-probe.md)
 
 ## 为什么独立建仓？
 
@@ -107,7 +139,7 @@ graph TD
 |------|------|
 | `crates/` | 两个版本共用的 Rust crate —— 适配 Android 的 runtime + node 引擎。 |
 | `apps/` | APK 应用（Gradle 工程，Kotlin/Java 外壳，前台服务）。 |
-| `docs/` | 设计说明、平台笔记与移植取舍记录。 |
+| `docs/` | 设计说明、平台笔记与移植取舍记录 —— 见 [ADR-AND-001](docs/adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md)（宿主档与权限模型）与 [android-host-probe.md](docs/design/zh/android-host-probe.md)（启动能力探测）。 |
 
 ## 与上游的关系
 
@@ -127,9 +159,16 @@ graph TD
 | 2 | 共享 crate：把 node + runtime 引擎抽取到平台 trait 之后 | ⬜ 计划中 |
 | 3 | 命令行版本在 Termux 下运行，并注册到真实 Gateway | ⬜ 计划中 |
 | 4 | App 版本：前台服务、受作用域存储、保活 | ⬜ 计划中 |
-| 5 | 无 shell 的 Android 环境下的工具执行策略 | ⬜ 计划中 |
+| 5 | `ExecutionBackend` trait + 启动时 HostProfile 能力探测 | ⬜ 计划中 |
 | 6 | 电池 / Doze 调优与长跑稳定性测试 | ⬜ 计划中 |
 | 7 | 发布产物（Termux 包 + 签名 APK） | ⬜ 计划中 |
+| 8 | `root-shell` 宿主档，**仅只读能力**（`logcat` / `dumpsys` / `getprop`） | ⬜ 计划中 |
+| 9 | Android 调试工具集（截屏、ANR / tombstone / bugreport 采集）+ 命令审计日志 | ⬜ 计划中 |
+| 10 | 写能力档：审批门控、设备级写锁、prop / 文件自动回滚 | ⬜ 计划中 |
+| 11 | Magisk 模块形态，用于长期挂机的调试设备农场 —— **仅当该需求真实成立** | ⬜ 暂缓 |
+
+顺序是刻意安排的：**先只读，后可写**。只读的 root 档已经能覆盖绝大多数系统调试诉求（日志、状态、属性），
+且几乎没有变砖风险；而写能力档集中了所有不可逆决策，因此被单独隔离到最后交付。
 
 ## 构建
 

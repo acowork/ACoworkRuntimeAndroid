@@ -54,6 +54,8 @@ acowork-android serve --gateway-http http://<gateway-host>:19876
 
 - Same CLI ergonomics as the desktop `acowork-node`: enroll with a Gateway, start / stop agents, browse files, install packages.
 - Runs under a normal unprivileged user — no root required for the base feature set.
+- On a rooted debug device it can opt into the `root-shell` host profile (see below) for system-level
+  development and debugging. This is a **mode of the same binary**, not a third build.
 - Intended for power users, headless devices, CI-on-device, and scripted automation.
 
 ### 2. APK build — `acowork-android-app`
@@ -67,6 +69,39 @@ The same capabilities packaged as an Android application.
 
 Both builds share the same agent engine — the difference is **lifecycle management** (Termux process vs.
 foreground service) and **storage / permission strategy**, not the runtime semantics.
+
+## Host profiles
+
+The engine runs on three kinds of Android host. Which one you get is **probed at startup**, not configured
+by hand: the same binary behaves differently on a stock phone and on a rooted engineering device.
+
+| Capability | `apk-sandbox` | `termux` | `root-shell` (debug devices) |
+|---|:---:|:---:|:---:|
+| Shell execution | ❌ | ✅ `bash` | ✅ `/system/bin/sh` (mksh) + toybox / busybox |
+| File reach | app-private dirs | `$PREFIX` + user-granted SAF | `/data` at large; `/system` only after remount |
+| Other apps' data (`/data/data/*`) | ❌ | ❌ | ✅ where SELinux allows |
+| Full `logcat` | ❌ | own app only | ✅ |
+| `setprop` / `am` / `pm` / `input` / `screencap` | ❌ | ❌ | ✅ |
+| Risk | low | medium | **high — can brick the device** |
+
+Two rules hold across all three profiles:
+
+- **The Runtime itself never runs as root.** It holds Gateway credentials and an LLM API key, serves HTTP
+  on loopback, and executes instructions arriving over the network. Escalation happens **per tool call**,
+  inside a narrow execution backend, so that one prompt injection cannot own the whole device — and so
+  that files written by the agent stay readable by the next, unprivileged start.
+- **`root` is not a boolean.** It is decomposed into approvable capabilities (`android:shell:read`,
+  `android:shell:write`, `android:fs:outside-app`, `android:fs:system`, `android:selinux:permissive`),
+  each gated by the existing session approval mechanism, each audited. Destructive operations
+  (`dd` to a block device, `wipe data`, partition flashes) are refused by default.
+
+Note that root alone is not the interesting constraint on Android — **the SELinux domain is**. A uid-0
+process is still confined by policy, `/system` is still verity-protected and read-only on user builds,
+and `/system/bin/sh` is mksh, not bash. The probe measures all of this rather than assuming it.
+
+Design rationale: [ADR-AND-001](docs/adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md) ·
+Probe specification: [android-host-probe.md](docs/design/zh/android-host-probe.md)
+
 
 ## Why a separate repository?
 
@@ -115,7 +150,7 @@ graph TD
 |------|----------|
 | `crates/` | Rust crates shared by both builds — the Android-aware runtime + node engine. |
 | `apps/` | The APK application (Gradle project, Kotlin/Java shell, foreground service). |
-| `docs/` | Design notes, platform notes, and the porting rationale. |
+| `docs/` | Design notes, platform notes, and the porting rationale — see [ADR-AND-001](docs/adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md) (host profiles & privilege model) and [android-host-probe.md](docs/design/zh/android-host-probe.md) (startup capability probing). |
 
 ## Relationship to upstream
 
@@ -135,9 +170,17 @@ graph TD
 | 2 | Shared crate: extract node + runtime engine behind platform traits | ⬜ Planned |
 | 3 | CLI build running under Termux, enrolling with a real Gateway | ⬜ Planned |
 | 4 | APK build: foreground service, scoped storage, keep-alive | ⬜ Planned |
-| 5 | Tool-execution strategy for a shell-less Android environment | ⬜ Planned |
+| 5 | `ExecutionBackend` trait + startup HostProfile probe | ⬜ Planned |
 | 6 | Battery / doze tuning and long-run stability testing | ⬜ Planned |
 | 7 | Release artifacts (Termux package + signed APK) | ⬜ Planned |
+| 8 | `root-shell` profile, **read-only capabilities** (`logcat` / `dumpsys` / `getprop`) | ⬜ Planned |
+| 9 | Android debugging toolset (screencap, ANR / tombstone / bugreport capture) + command audit log | ⬜ Planned |
+| 10 | Write capabilities: approval gating, per-device write lock, prop / file auto-rollback | ⬜ Planned |
+| 11 | Magisk-module form factor for always-on debug fleets — **only if that need is real** | ⬜ Deferred |
+
+Ordering is deliberate: **read-only before writable**. The read-only root profile already covers most
+system-debugging value (logs, state, properties) with essentially no brick risk, while the write profile
+is where every irreversible decision lives and gets isolated accordingly.
 
 ## Building
 
