@@ -7,6 +7,15 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# The platform-neutral rules. This is the crate's only non-serde dependency, and it
+# is deliberately not the acowork monorepo: an Android port must be buildable without
+# pulling a workspace that has no published tags (readiness assessment B3).
+#
+# `features = ["std"]` because Android *is* a std platform. The workspace dependency
+# declares `default-features = false` so that a bare-metal port inherits the no_std
+# configuration by default and has to opt in — the opposite default would silently
+# make every embedded consumer carry `serde/std`.
+acowork-platform-contract = { workspace = true, features = ["std"] }
 async-trait.workspace = true
 serde.workspace = true
 

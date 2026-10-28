@@ -31,7 +31,13 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::host::capability::{CapabilitySet, derive_capabilities};
+use acowork_platform_contract::{
+    CapabilityTable, EscalationModel, HostDescription, PrivilegeLevel,
+};
+
+use crate::host::capability::{
+    Capability, PLATFORM, android_vocabulary, derive_claims, explain_absence,
+};
 use crate::host::facts::{
     AppletSet, DeviceFacts, FsRoot, Privilege, SelinuxDomain, SelinuxState, ShellDialect, SuProbe,
 };
@@ -61,6 +67,20 @@ impl HostProfileName {
     /// that profile, so `android:fs:system` is simply unreachable there.
     pub fn has_shell(&self) -> bool {
         !matches!(self, HostProfileName::ApkSandbox)
+    }
+
+    /// The stable wire spelling of this tier.
+    ///
+    /// This is the value the contract's [`HostSummary::profile`] carries. It is the
+    /// port's own name for its configuration and is opaque to the contract — used for
+    /// scheduling and for humans, never in a gate decision, because a rule keyed on a
+    /// profile *name* would be a platform branch in disguise (contract rule R6).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HostProfileName::ApkSandbox => "apk-sandbox",
+            HostProfileName::Termux => "termux",
+            HostProfileName::RootShell => "root-shell",
+        }
     }
 }
 
@@ -109,8 +129,13 @@ pub struct HostProfile {
     pub su: SuProbe,
     /// Whether `/system` survived an actual remount probe.
     pub system_remountable: bool,
-    /// Derived capabilities. A pure function of the fields above.
-    pub caps: CapabilitySet,
+    /// The contract capability table: the Android vocabulary plus what this device
+    /// actually demonstrated. A pure function of the fields above — never configured.
+    ///
+    /// This replaced a local `CapabilitySet`. Holding the contract type directly is
+    /// what stops two capability models from drifting apart: there is now one set of
+    /// declared capabilities in the whole crate, and it is the one the gate reads.
+    pub caps: CapabilityTable,
     /// Immutable device facts.
     pub device: DeviceFacts,
 }
@@ -288,10 +313,10 @@ impl HostProfile {
             fs_roots,
             su,
             system_remountable,
-            caps: CapabilitySet::new(),
+            caps: empty_table(),
             device,
         };
-        profile.caps = derive_capabilities(&profile);
+        profile.caps = derive_table(&profile);
 
         // Structural invariant: the tier says "has a shell" exactly when the
         // derivation produced a shell capability. This is a self-check, not a
@@ -300,9 +325,7 @@ impl HostProfile {
         // the tool registry in one direction or the other.
         debug_assert_eq!(
             profile.name.has_shell(),
-            profile
-                .caps
-                .contains(crate::host::capability::Capability::ShellRead),
+            profile.caps.is_declared(&Capability::ShellRead.id()),
             "host tier and declared shell capability disagree"
         );
 
@@ -316,7 +339,7 @@ impl HostProfile {
                     root.own_package = true;
                 }
             }
-            profile.caps = derive_capabilities(&profile);
+            profile.caps = derive_table(&profile);
         }
 
         profile
@@ -339,7 +362,12 @@ impl HostProfile {
         HostCapabilitySummary {
             profile: self.name,
             privilege: self.privilege,
-            caps: self.caps.ids(),
+            caps: self
+                .caps
+                .declared_ids()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
             shell_dialect: self.shell.map(|d| match d {
                 ShellDialect::Bash => "bash",
                 ShellDialect::MkSh => "mksh",
@@ -353,9 +381,104 @@ impl HostProfile {
     /// ADR-AND-001 §4.1 makes "the Runtime is never root" a non-negotiable
     /// invariant, and §6 P1 makes asserting it an acceptance criterion. This is
     /// the predicate that assertion checks.
+    ///
+    /// It is the Android spelling of contract rule R3; [`HostDescription::is_r3_conformant`]
+    /// is the platform-neutral one, and the two agree by construction because
+    /// [`Privilege::to_contract`] maps `Root` to `Unrestricted`.
     pub fn runtime_is_unprivileged(&self) -> bool {
         self.privilege < Privilege::Root
     }
+}
+
+/// An empty table over the Android vocabulary.
+///
+/// Exists because [`HostProfile::assemble`] builds the struct before it has the facts
+/// to derive from; the real table is filled in on the next line.
+fn empty_table() -> CapabilityTable {
+    CapabilityTable::new(PLATFORM, android_vocabulary())
+        .expect("the Android vocabulary satisfies the contract")
+}
+
+/// Derive the declared-capability table from probed facts.
+///
+/// Two steps, and the split is the contract's, not Android's: [`derive_claims`] turns
+/// facts into claims with evidence, then [`acowork_platform_contract::audit_claims`]
+/// validates them against the vocabulary and folds in the survivors. Going through the
+/// audit rather than declaring directly is what enforces rules R4 and R5 on this port —
+/// a claim backed by a denial, or an ID outside the vocabulary, cannot become a
+/// declared capability even if the derivation logic says it should.
+fn derive_table(profile: &HostProfile) -> CapabilityTable {
+    let mut table = empty_table();
+    let claims = derive_claims(profile);
+    // Evidence is taken at probe time and the profile is session-immutable, so the
+    // re-probe interval is the session lifetime: nothing here expires by age. The
+    // invalidation events in android-host-probe.md §6 rebuild the profile instead.
+    let audit = acowork_platform_contract::audit_claims(
+        &mut table,
+        &claims,
+        std::time::Duration::from_secs(u64::MAX / 2),
+    );
+    debug_assert!(
+        audit.unregistered.is_empty(),
+        "derivation produced an ID outside the Android vocabulary: {:?}",
+        audit.unregistered
+    );
+    table
+}
+
+impl HostDescription for HostProfile {
+    fn platform(&self) -> &str {
+        PLATFORM
+    }
+
+    fn profile_name(&self) -> &str {
+        self.name.as_str()
+    }
+
+    fn privilege(&self) -> Option<PrivilegeLevel> {
+        // Android always has uids, so this is never `None`. The `Option` exists for
+        // platforms with no privilege separation at all — an ESP32 has no MMU and no
+        // uid, and inventing a value there would make the field mean nothing.
+        Some(self.privilege.to_contract())
+    }
+
+    fn escalation(&self) -> EscalationModel {
+        // `su -c` is a per-call helper: it runs one command at elevated privilege and
+        // returns. That is the conformant shape under R3. A device with no working
+        // `su` has no escalation at all.
+        if self.su.got_root() || self.privilege >= Privilege::Root {
+            EscalationModel::PerCallHelper
+        } else {
+            EscalationModel::None
+        }
+    }
+
+    fn capabilities(&self) -> &CapabilityTable {
+        &self.caps
+    }
+
+    fn explain_absence(&self, capability: &acowork_platform_contract::HostCapability) -> String {
+        // An ID outside the Android five has no Android-specific explanation, and
+        // inventing one would be a guess. Say so plainly: the gate refuses such an ID
+        // on rule R5 before it ever asks why.
+        match crate::host::capability::lookup(capability) {
+            Some(cap) => explain_absence(self, cap),
+            None => format!(
+                "`{capability}` is not a capability the Android port registers, so this device \
+                 has no evidence about it either way"
+            ),
+        }
+    }
+
+    // `summary` is deliberately *not* overridden. The contract's default builds the
+    // reported shape from `platform`/`profile_name`/`privilege`/`escalation`/`capabilities`,
+    // and that shape is the one whose fields were designed so no device identifier can be
+    // put in them (rule R13). Overriding it here would both duplicate that guarantee and
+    // — as an earlier revision did — recurse infinitely, because `HostDescription::summary`
+    // resolves statically to this impl rather than to the default.
+    //
+    // `gateway_summary` remains for the Android-specific extras ADR-AND-001 §7.1 asks for,
+    // notably the shell dialect, which the contract has no opinion about.
 }
 
 /// The Gateway-facing capability summary (ADR-AND-001 §7.1).
@@ -368,7 +491,7 @@ pub struct HostCapabilitySummary {
     /// Privilege level of the Runtime process itself.
     pub privilege: Privilege,
     /// Declared capability IDs.
-    pub caps: Vec<&'static str>,
+    pub caps: Vec<String>,
     /// Primary shell dialect, for tool registration.
     pub shell_dialect: Option<&'static str>,
 }
@@ -447,7 +570,7 @@ mod tests {
     fn rooted_device_derives_the_full_capability_set() {
         let p = HostProfile::assemble(&rooted_probe(), "com.example.agent");
         for cap in Capability::all() {
-            assert!(p.caps.contains(cap), "missing {cap}");
+            assert!(p.caps.is_declared(&cap.id()), "missing {cap}");
         }
     }
 
@@ -481,12 +604,12 @@ mod tests {
         // Both dialects are visible so §4.5 can register two tools.
         assert!(p.dialects.contains(&ShellDialect::Bash));
         assert!(p.dialects.contains(&ShellDialect::MkSh));
-        assert!(p.caps.contains(Capability::ShellRead));
+        assert!(p.caps.is_declared(&Capability::ShellRead.id()));
         assert!(
-            !p.caps.contains(Capability::ShellWrite),
+            !p.caps.is_declared(&Capability::ShellWrite.id()),
             "Termux without su must stay read-only"
         );
-        assert!(!p.caps.contains(Capability::FsSystem));
+        assert!(!p.caps.is_declared(&Capability::FsSystem.id()));
     }
 
     #[test]
@@ -494,7 +617,7 @@ mod tests {
         // §2 item 1: the probe itself failing means apk-sandbox.
         let p = HostProfile::assemble(&ProbeOutput::nothing_ran(), "com.example.agent");
         assert_eq!(p.name, HostProfileName::ApkSandbox);
-        assert!(p.caps.is_empty());
+        assert!(p.caps.declared().is_empty());
         assert_eq!(p.selinux, SelinuxState::Unknown);
         assert_eq!(p.domain, SelinuxDomain::Unreadable);
         assert!(!p.name.has_shell());
@@ -517,7 +640,7 @@ mod tests {
         };
         let p = HostProfile::assemble(&probe, "com.example.agent");
         assert_eq!(p.name, HostProfileName::ApkSandbox);
-        assert!(p.caps.is_empty());
+        assert!(p.caps.declared().is_empty());
     }
 
     #[test]
@@ -529,7 +652,7 @@ mod tests {
         let p = HostProfile::assemble(&probe, "com.example.agent");
         assert_ne!(p.name, HostProfileName::RootShell);
         assert!(p.su.prompt_denied);
-        assert!(!p.caps.contains(Capability::ShellWrite));
+        assert!(!p.caps.is_declared(&Capability::ShellWrite.id()));
     }
 
     #[test]
@@ -546,7 +669,7 @@ mod tests {
         let p = HostProfile::assemble(&probe, "com.example.agent");
         assert!(p.fs_roots[0].own_package);
         // With only our own directory writable, outside-app must not be granted.
-        assert!(!p.caps.contains(Capability::FsOutsideApp));
+        assert!(!p.caps.is_declared(&Capability::FsOutsideApp.id()));
     }
 
     #[test]
@@ -556,7 +679,7 @@ mod tests {
         let json = serde_json::to_string(&summary).unwrap();
 
         assert_eq!(summary.profile, HostProfileName::RootShell);
-        assert!(summary.caps.contains(&"android:shell:read"));
+        assert!(summary.caps.iter().any(|c| c == "android:shell:read"));
         assert_eq!(summary.shell_dialect, Some("mksh"));
 
         // ADR-AND-001 §7.1: none of these may cross the wire.

@@ -43,6 +43,39 @@ impl Privilege {
             _ => Privilege::AppUid,
         })
     }
+
+    /// The canonical uid for this level, for diagnostics and evidence strings.
+    ///
+    /// `AppUid` has no single uid — it is `u0_aNNN`, per-app — so this returns the
+    /// base of that range. It is used only in human-readable evidence, never in a
+    /// comparison; the ordering on [`Privilege`] is what rules read.
+    pub fn uid(&self) -> u32 {
+        match self {
+            Privilege::AppUid => 10_000,
+            Privilege::ShellUid => 2_000,
+            Privilege::Root => 0,
+        }
+    }
+
+    /// Map onto the contract's platform-neutral level.
+    ///
+    /// This is the bridge between an Android fact and a rule that must also hold on
+    /// a device with no uids at all. The mapping is the port's to make and the
+    /// contract's to consume; nothing else in the system needs to know that
+    /// `ShellUid` exists.
+    ///
+    /// `Root` maps to `Unrestricted`, which is what makes contract rule R3 bite: a
+    /// node process probing as root is non-conformant, and the gate will refuse its
+    /// mutating capabilities. That is ADR-AND-001 §4.1 expressed as a rule the
+    /// compiler and the gate both enforce, rather than as a sentence in a document.
+    pub fn to_contract(&self) -> acowork_platform_contract::PrivilegeLevel {
+        use acowork_platform_contract::PrivilegeLevel;
+        match self {
+            Privilege::AppUid => PrivilegeLevel::Unprivileged,
+            Privilege::ShellUid => PrivilegeLevel::Elevated,
+            Privilege::Root => PrivilegeLevel::Unrestricted,
+        }
+    }
 }
 
 /// SELinux enforcement state, as reported by `getenforce`.

@@ -16,6 +16,22 @@
 //! parsers ([`super::facts`], which read probe output) and the backend
 //! ([`super::backend`], which runs commands).
 //!
+//! # What the contract owns versus what this module owns
+//!
+//! The **remedy vocabulary** and the rule that a remedy must be *admissible on this
+//! device* belong to `acowork-platform-contract` ([`Remedy`], [`Diagnostic`],
+//! [`DiagnosticLedger`](acowork_platform_contract::DiagnosticLedger)). What is Android's
+//! is the classification itself: reading an `avc: denied` record, knowing that
+//! `permissive=1` is not a failure, and knowing that a denial in an unprivileged domain
+//! is an escalation candidate while a denial in a privileged domain is not.
+//!
+//! That split is not cosmetic. It is what fixed a real defect: this module used to answer
+//! "wrong path, privilege will not help" for an out-of-roots path on *every* host, which
+//! is false on a rooted device and steered the model away from the only fix that existed.
+//! The guard is now keyed on the host's [`EscalationModel`](acowork_platform_contract::EscalationModel),
+//! and the contract independently refuses to forward an `Escalate` remedy to a device
+//! that has no escalation — two layers, so the mistake cannot recur silently.
+//!
 //! # Two rules from ADR-AND-001 §4.6
 //!
 //! 1. **Denial classification** (item 2): extract `avc: denied` from stderr and
@@ -28,6 +44,8 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+
+use acowork_platform_contract::{Diagnostic, HostDescription, Remedy};
 
 use crate::host::facts::SelinuxDomain;
 use crate::host::profile::HostProfile;
@@ -178,170 +196,10 @@ fn parse_key_value_pairs(text: &str) -> BTreeMap<String, String> {
     map
 }
 
-/// What the model should do next, in plain language.
-///
-/// ADR-AND-001 §4.6 item 2 requires the hint to be *executable* — naming the
-/// missing capability rather than restating the denial. Each variant maps to a
-/// concrete next action, which is what stops the retry loop.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DenialHint {
-    /// The access was logged but granted (`permissive=1`). Not a failure.
-    NotBlocked,
-    /// The command ran in an unprivileged domain and needs the `su` helper.
-    /// Next step: re-issue through the privileged backend.
-    NeedsEscalatedDomain {
-        /// The domain the command actually ran in.
-        from: SelinuxDomain,
-        /// The capability the privileged backend would need.
-        capability: String,
-    },
-    /// Even the privileged domain is refused by policy. The only route is
-    /// `setenforce 0`, which needs its own explicit approval and is restored at
-    /// session end (ADR-AND-001 §8).
-    /// Even the privileged domain is refused; only `setenforce 0` would help.
-    NeedsPermissiveApproval {
-        /// The capability that would have to be approved: `android:selinux:permissive`.
-        capability: String,
-    },
-    /// The target is outside every probed `fs_roots` entry. No amount of
-    /// privilege makes this a good idea; the path itself is wrong.
-    /// The target is outside every probed root — a wrong path, not a privilege gap.
-    PathOutsideRoots {
-        /// The offending path, when the kernel reported one.
-        path: Option<String>,
-    },
-    /// This exact target has already been refused in this session. Retrying is
-    /// the silent-degradation loop §4 exists to prevent.
-    /// This target was already refused in this session. Retrying is the loop §4 blocks.
-    DoNotRetry {
-        /// How many times this same target has now been refused.
-        attempts: u32,
-    },
-    /// A denial we could not classify. Still reported, because swallowing it
-    /// would hide a real block; the raw record travels with it.
-    Unclassified,
-}
-
-impl DenialHint {
-    /// The sentence handed back to the model.
-    ///
-    /// Written as an instruction rather than a description, because the consumer
-    /// is an LLM deciding its next tool call.
-    pub fn message(&self) -> String {
-        match self {
-            DenialHint::NotBlocked => "SELinux logged this access but allowed it (permissive=1). \
-                 Nothing to fix — continue."
-                .to_string(),
-            DenialHint::NeedsEscalatedDomain { from, capability } => {
-                format!(
-                    "Blocked by SELinux: the command ran in the {from:?} domain. \
-                     Re-issue it through the privileged backend, which requires \
-                     the `{capability}` capability."
-                )
-            }
-            DenialHint::NeedsPermissiveApproval { capability } => {
-                format!(
-                    "Blocked by SELinux even in the privileged domain. The only \
-                     route is `setenforce 0`, which needs the `{capability}` \
-                     capability and explicit per-command approval; it is \
-                     restored automatically at session end. Do not retry the \
-                     original command unchanged."
-                )
-            }
-            DenialHint::PathOutsideRoots { path } => match path {
-                Some(p) => format!(
-                    "`{p}` is outside every filesystem root this host exposes. \
-                     Privilege will not help — pick a path under a probed root."
-                ),
-                None => "The target is outside every filesystem root this host \
-                         exposes. Privilege will not help."
-                    .to_string(),
-            },
-            DenialHint::DoNotRetry { attempts } => format!(
-                "This same target has already been refused {attempts} time(s) in \
-                 this session. Do not retry — report the limitation instead."
-            ),
-            DenialHint::Unclassified => "SELinux refused this access and the reason could not be \
-                 classified. Treat it as a hard block; do not retry blindly."
-                .to_string(),
-        }
-    }
-}
-
-/// Classify one denial against the profile it happened on.
-///
-/// Pure function: same denial plus same profile always yields the same hint. The
-/// repeat counter is applied separately by [`DenialLedger`], because repeats are
-/// a property of the session rather than of the denial.
-pub fn classify(denial: &SelinuxDenial, profile: &HostProfile) -> DenialHint {
-    if denial.permissive {
-        return DenialHint::NotBlocked;
-    }
-
-    let can_escalate = profile
-        .caps
-        .contains(crate::host::capability::Capability::ShellWrite);
-
-    // A path outside every probed root is a wrong-path problem rather than a
-    // privilege problem — but **only on a host that cannot escalate anyway**.
-    //
-    // The guard matters. `fs_roots` records what the *unprivileged* probe could
-    // reach (android-host-probe.md §2 item 12 probes `$PREFIX`, `/sdcard` and the
-    // package directory); it is not an enumeration of what root can reach, which
-    // per the README capability matrix is "/data 大范围". So on a root-shell host
-    // an out-of-roots path is still an escalation candidate, and answering "wrong
-    // path, privilege will not help" would send the model away from the one thing
-    // that would have worked. On Termux/APK there is no escalation, so the same
-    // answer is correct and is exactly what stops the retry loop.
-    if !can_escalate
-        && let Some(path) = denial.path.as_deref()
-        && !profile.fs_roots.is_empty()
-    {
-        let covered = profile
-            .fs_roots
-            .iter()
-            .any(|root| path == root.path || path.starts_with(&format!("{}/", root.path)));
-        if !covered {
-            return DenialHint::PathOutsideRoots {
-                path: Some(path.to_string()),
-            };
-        }
-    }
-
-    let ran_privileged = denial
-        .scontext
-        .as_deref()
-        .map(SelinuxDomain::parse)
-        .is_some_and(|d| d.is_privileged());
-
-    if !ran_privileged {
-        // The attempt came from an unprivileged domain, so the first thing to try
-        // is the privileged backend — provided the host actually has one.
-        let from = denial
-            .scontext
-            .as_deref()
-            .map(SelinuxDomain::parse)
-            .unwrap_or(profile.domain.clone());
-        let capability = if is_write_access(&denial.permissions) {
-            crate::host::capability::Capability::ShellWrite
-        } else {
-            crate::host::capability::Capability::ShellRead
-        };
-        return DenialHint::NeedsEscalatedDomain {
-            from,
-            capability: capability.as_str().to_string(),
-        };
-    }
-
-    // Already privileged and still refused: only a policy change would help.
-    DenialHint::NeedsPermissiveApproval {
-        capability: crate::host::capability::Capability::SelinuxPermissive
-            .as_str()
-            .to_string(),
-    }
-}
-
 /// Whether any of the denied permissions is a write-class access.
+///
+/// Decides which capability a denial implies, and therefore whether escalating would
+/// even be the right next step.
 fn is_write_access(permissions: &[String]) -> bool {
     permissions.iter().any(|p| {
         matches!(
@@ -351,17 +209,207 @@ fn is_write_access(permissions: &[String]) -> bool {
     })
 }
 
-/// Session-scoped denial accumulator.
+/// The capability a denial implies, from the permissions it lists.
+fn implied_capability(denial: &SelinuxDenial) -> crate::host::capability::Capability {
+    use crate::host::capability::Capability;
+    if is_write_access(&denial.permissions) {
+        Capability::ShellWrite
+    } else {
+        Capability::ShellRead
+    }
+}
+
+/// Classify one parsed denial against the profile it happened on.
 ///
-/// android-host-probe.md §4 item 2 requires denials to be accumulated so that a
-/// second refusal of the same target produces "do not retry". Note the contract
-/// gap this exposes, recorded as **B10** in the readiness assessment: §4 says to
-/// accumulate "到 HostProfile 的 observed-denials", but §3 declares the profile
-/// immutable for the session. Both cannot hold. This ledger is therefore a
-/// separate session-scoped structure, which is also what ADR-AND-001 §7.1 wants —
-/// observed-denial detail must never reach the Gateway, and keeping it out of the
-/// reported profile makes that structurally impossible rather than a matter of
-/// remembering to filter.
+/// Pure: the same denial plus the same profile always yields the same diagnostic.
+/// Per-target repeat detection lives in [`DenialLedger`], because repeats are a property
+/// of the session rather than of the denial.
+///
+/// # The classification this module used to get wrong
+///
+/// An out-of-roots path was classified as "wrong path, privilege will not help" on
+/// *every* host. That is true on Termux and on an APK sandbox, and **false on a rooted
+/// device**, where `fs_roots` records only what the *unprivileged* probe could reach
+/// (android-host-probe.md §2 item 12 probes `$PREFIX`, `/sdcard` and the package
+/// directory) while the README's capability matrix says root reaches "/data 大范围".
+/// Telling a rooted device that escalation cannot help sends the model away from the one
+/// action that would have worked.
+///
+/// The guard below is therefore keyed on whether the host can escalate, and the contract
+/// adds a second line of defence: [`acowork_platform_contract::Remedy::is_admissible`]
+/// rejects `Escalate` on a host whose [`EscalationModel`] is `None`, so even a
+/// mis-classification cannot tell a sandboxed device to do something it cannot do.
+pub fn classify(denial: &SelinuxDenial, profile: &HostProfile) -> Option<Diagnostic> {
+    use acowork_platform_contract::EscalationModel;
+
+    // `permissive=1` means logged-but-allowed: SELinux is not the cause of the failure.
+    // Returning `None` is the honest answer, and the contract turns `None` into "could
+    // not determine why — inspect the output", which is right.
+    if denial.permissive {
+        return None;
+    }
+
+    let capability = implied_capability(denial).id();
+    let can_escalate = matches!(profile.escalation(), EscalationModel::PerCallHelper);
+
+    let diagnostic = |remedy: Remedy, detail: String| {
+        Some(Diagnostic {
+            capability,
+            remedy,
+            detail,
+        })
+    };
+
+    // ── An out-of-roots path ────────────────────────────────────────────────
+    // A wrong-path problem rather than a privilege problem, but *only* on a host that
+    // cannot escalate. See the module note above.
+    if let Some(path) = denial.path.as_deref()
+        && !profile.fs_roots.is_empty()
+    {
+        let covered = profile
+            .fs_roots
+            .iter()
+            .any(|root| path == root.path || path.starts_with(&format!("{}/", root.path)));
+        if !covered {
+            return if can_escalate {
+                // Root reaches further than the unprivileged probe could see, so the
+                // path may well be valid — escalate rather than relocate.
+                diagnostic(
+                    Remedy::Escalate,
+                    format!(
+                        "`{path}` is outside every root the unprivileged probe could reach, but \
+                         this device can escalate and root's reach is wider"
+                    ),
+                )
+            } else {
+                let roots: Vec<&str> = profile.fs_roots.iter().map(|r| r.path.as_str()).collect();
+                diagnostic(
+                    Remedy::Relocate {
+                        to: roots.join(", "),
+                    },
+                    format!(
+                        "`{path}` is outside every filesystem root this host exposes, and this \
+                         device cannot escalate, so no retry will reach it"
+                    ),
+                )
+            };
+        }
+    }
+
+    // ── Which domain did it actually run in? ────────────────────────────────
+    let ran_privileged = denial
+        .scontext
+        .as_deref()
+        .map(SelinuxDomain::parse)
+        .is_some_and(|d| d.is_privileged());
+
+    if !ran_privileged {
+        let from = denial
+            .scontext
+            .as_deref()
+            .map(SelinuxDomain::parse)
+            .unwrap_or_else(|| profile.domain.clone());
+        return if can_escalate {
+            diagnostic(
+                Remedy::Escalate,
+                format!(
+                    "blocked by SELinux in the {from:?} domain; re-issue through the privileged \
+                     backend, which needs `{}`",
+                    implied_capability(denial)
+                ),
+            )
+        } else {
+            // Escalating is not an option here, so say what the real constraint is
+            // rather than suggesting a retry that cannot work.
+            diagnostic(
+                Remedy::AskUser {
+                    question: format!(
+                        "SELinux blocked this in the {from:?} domain and this device has no \
+                         escalation path; is there another way to reach the same result?"
+                    ),
+                },
+                format!("blocked in {from:?} with no `su` available"),
+            )
+        };
+    }
+
+    // ── Already privileged and still refused ────────────────────────────────
+    // Only a policy change would help, and that needs its own explicit approval
+    // (ADR-AND-001 §8: `setenforce 0` is per-command approved and auto-restored).
+    diagnostic(
+        Remedy::AskUser {
+            question: format!(
+                "SELinux refuses this even in the privileged domain. Approve `setenforce 0` for \
+                 this command? It needs `{}` and is restored automatically at session end.",
+                crate::host::capability::Capability::SelinuxPermissive
+            ),
+        },
+        "refused in a privileged domain; only a policy change would help".to_string(),
+    )
+}
+
+/// The Android [`DiagnosticClassifier`]: `avc: denied` records in, contract remedies out.
+///
+/// This is where platform specificity legitimately lives. The contract never sees an
+/// SELinux domain, a `tclass` or a `permissive` flag; it sees a [`Remedy`]. A second
+/// platform writes its own classifier — an ESP32 would inspect an I2C NACK or a
+/// flash-verify mismatch — and nothing above it changes.
+pub struct SelinuxClassifier<'p> {
+    profile: &'p HostProfile,
+}
+
+impl<'p> SelinuxClassifier<'p> {
+    /// A classifier against one probed profile.
+    pub fn new(profile: &'p HostProfile) -> SelinuxClassifier<'p> {
+        SelinuxClassifier { profile }
+    }
+}
+
+impl acowork_platform_contract::DiagnosticClassifier for SelinuxClassifier<'_> {
+    fn classify(
+        &self,
+        capability: &acowork_platform_contract::HostCapability,
+        _stdout: &[u8],
+        stderr: &[u8],
+    ) -> Option<Diagnostic> {
+        // Denials are the informative signal; a failure with none is not something this
+        // classifier can explain, and guessing would be worse than saying so.
+        let text = String::from_utf8_lossy(stderr);
+        let denials = parse_denials(&text);
+        // Classify the first *enforced* denial. A command that touches several objects
+        // produces several records, and the first enforced one is the wall it hit.
+        // `find` skips permissive records: SELinux allowed those, so they are not the
+        // cause of the failure. If every record was permissive — or there were none —
+        // this returns `None`, and the contract's ledger turns that into "could not
+        // determine why", which is the honest answer.
+        denials
+            .iter()
+            .find(|d| !d.permissive)
+            .and_then(|d| classify(d, self.profile))
+            .map(|mut diag| {
+                // Trust the caller's capability over the implied one: the caller knows
+                // what it asked for, and the implied capability is only a fallback for
+                // direct `classify` calls.
+                diag.capability = capability.clone();
+                diag
+            })
+    }
+}
+
+/// Session-scoped denial memory.
+///
+/// android-host-probe.md §4 item 2 requires denials to be accumulated so that a second
+/// refusal of the same target produces "do not retry". The key is the SELinux target
+/// (`tcontext|tclass`), which is finer-grained than the contract's per-capability
+/// counting and is an Android fact: hitting the same *wall* twice is the loop to break,
+/// and two different walls under one capability are genuinely different attempts.
+///
+/// Note the contract gap this exposes, recorded as **B10**: §4 says to accumulate "到
+/// HostProfile 的 observed-denials", but §3 declares the profile immutable for the
+/// session. Both cannot hold. This ledger is therefore separate, which is also what
+/// ADR-AND-001 §7.1 wants — observed-denial detail must never reach the Gateway, and
+/// keeping it out of the reported profile makes that structurally impossible rather than
+/// a matter of remembering to filter.
 #[derive(Debug, Clone, Default)]
 pub struct DenialLedger {
     seen: BTreeMap<String, u32>,
@@ -373,26 +421,45 @@ impl DenialLedger {
         Self::default()
     }
 
-    /// Record a denial and return the hint to give the model.
+    /// Record a denial and return the remedy to give the model.
     ///
-    /// The repeat check runs **before** classification, so a second hit on the
-    /// same wall always says "do not retry" regardless of how the first one was
-    /// explained. That ordering is the point of the ledger: without it the model
-    /// gets a fresh, plausible-sounding instruction every time and keeps going.
-    pub fn record(&mut self, denial: &SelinuxDenial, profile: &HostProfile) -> DenialHint {
+    /// The repeat check runs **before** classification, so a second hit on the same wall
+    /// always says "stop" regardless of how the first one was explained. That ordering is
+    /// the point of the ledger: without it the model gets a fresh, plausible-sounding
+    /// instruction every time and keeps going.
+    ///
+    /// The returned remedy is then subject to the contract's admissibility check when it
+    /// passes through [`acowork_platform_contract::DiagnosticLedger::admit`], so a
+    /// suggestion this layer makes cannot survive if the device cannot act on it.
+    pub fn record(&mut self, denial: &SelinuxDenial, profile: &HostProfile) -> Remedy {
         if denial.permissive {
-            return DenialHint::NotBlocked;
+            // Logged but allowed: nothing to fix, and not a failure to count.
+            return Remedy::Retry;
         }
         let key = denial.repeat_key();
         let attempts = {
-            let counter = self.seen.entry(key).or_insert(0);
+            let counter = self.seen.entry(key.clone()).or_insert(0);
             *counter += 1;
             *counter
         };
         if attempts >= 2 {
-            return DenialHint::DoNotRetry { attempts };
+            return Remedy::Abandon {
+                reason: format!(
+                    "this same SELinux target has already been refused {attempts} times this \
+                     session; report the limitation instead of retrying"
+                ),
+            };
         }
         classify(denial, profile)
+            .map(|d| d.remedy)
+            // No enforced denial we could classify: the contract's ledger turns `None`
+            // into "inspect the output", so hand back the same intent.
+            .unwrap_or_else(|| Remedy::AskUser {
+                question: format!(
+                    "SELinux blocked `{key}` and this device could not determine a next step; \
+                     inspect the output before retrying"
+                ),
+            })
     }
 
     /// How many distinct targets have been refused this session.
@@ -404,6 +471,12 @@ impl DenialLedger {
     pub fn is_repeat(&self, denial: &SelinuxDenial) -> bool {
         self.seen.get(&denial.repeat_key()).is_some_and(|n| *n >= 1)
     }
+
+    /// Drop the session history. The ledger must not outlive its session: a failure
+    /// count that persisted would let one bad run permanently poison a device.
+    pub fn clear(&mut self) {
+        self.seen.clear();
+    }
 }
 
 #[cfg(test)]
@@ -414,10 +487,42 @@ mod tests {
         VerityState,
     };
     use crate::host::profile::HostProfileName;
+    use acowork_platform_contract::{CapabilityTable, EscalationModel, HostDescription};
+
+    /// An empty table over the Android vocabulary.
+    fn empty_table() -> CapabilityTable {
+        CapabilityTable::new(
+            crate::host::capability::PLATFORM,
+            crate::host::capability::android_vocabulary(),
+        )
+        .unwrap()
+    }
+
+    /// Derive a table the same way `HostProfile::assemble` does.
+    fn derive_table_from(profile: &HostProfile) -> CapabilityTable {
+        let mut table = empty_table();
+        let claims = crate::host::capability::derive_claims(profile);
+        let _ = acowork_platform_contract::audit_claims(
+            &mut table,
+            &claims,
+            std::time::Duration::from_secs(u64::MAX / 2),
+        );
+        table
+    }
 
     const REAL_LINE: &str = "avc: denied { read open } for pid=4321 comm=\"cat\" \
 path=\"/data/system/packages.xml\" dev=\"dm-1\" ino=1234 \
 scontext=u:r:shell:s0 tcontext=u:object_r:system_data_file:s0 tclass=file permissive=0";
+
+    /// The same denial against a path *inside* a probed root.
+    ///
+    /// The domain tests need this: `REAL_LINE`'s `/data/system/packages.xml` is outside
+    /// every root in the fixture, so the out-of-roots branch fires first and the domain
+    /// branch is never reached. Testing the domain rule against an out-of-roots path
+    /// would be testing the wrong branch and passing for the wrong reason.
+    const IN_ROOTS_LINE: &str = "avc: denied { read open } for pid=4321 comm=\"cat\" \
+path=\"/data/local/tmp/x\" dev=\"dm-1\" ino=1234 \
+scontext=u:r:shell:s0 tcontext=u:object_r:shell_data_file:s0 tclass=file permissive=0";
 
     fn profile() -> HostProfile {
         let mut profile = HostProfile {
@@ -448,7 +553,7 @@ scontext=u:r:shell:s0 tcontext=u:object_r:system_data_file:s0 tclass=file permis
                 unavailable: false,
             },
             system_remountable: false,
-            caps: Default::default(),
+            caps: empty_table(),
             device: DeviceFacts {
                 build_type: BuildType::UserDebug,
                 debuggable: true,
@@ -463,8 +568,31 @@ scontext=u:r:shell:s0 tcontext=u:object_r:system_data_file:s0 tclass=file permis
         // so ShellWrite is available and the classifier is allowed to suggest
         // escalation. An empty `caps` here would model a device that has su but
         // was granted nothing, which is not the case under test.
-        profile.caps = crate::host::capability::derive_capabilities(&profile);
+        profile.caps = derive_table_from(&profile);
         profile
+    }
+
+    /// A host with no escalation path: `su` absent, app uid.
+    ///
+    /// Modelled by clearing the `su` probe rather than by emptying the capability table,
+    /// because [`HostProfile::escalation`] reads the probe — which is the fact that
+    /// actually decides whether `Remedy::Escalate` is admissible.
+    fn no_escalation() -> HostProfile {
+        let mut p = profile();
+        p.su = SuProbe {
+            uid: None,
+            context: None,
+            prompt_denied: false,
+            unavailable: true,
+        };
+        p.privilege = Privilege::AppUid;
+        p.caps = derive_table_from(&p);
+        assert_eq!(
+            p.escalation(),
+            EscalationModel::None,
+            "fixture must model a host that cannot escalate"
+        );
+        p
     }
 
     #[test]
@@ -514,149 +642,188 @@ scontext=u:r:shell:s0 tcontext=u:object_r:system_data_file:s0 tclass=file permis
     }
 
     #[test]
-    fn permissive_flag_is_honoured() {
+    fn a_permissive_denial_is_not_a_failure() {
+        // `permissive=1` means logged-but-allowed. Classifying it as a block would make
+        // the model "fix" something that is not broken.
         let line = REAL_LINE.replace("permissive=0", "permissive=1");
         let d = &parse_denials(&line)[0];
         assert!(d.permissive);
-        assert_eq!(classify(d, &profile()), DenialHint::NotBlocked);
+        assert_eq!(classify(d, &profile()), None);
     }
 
     #[test]
-    fn absent_permissive_field_means_blocked() {
+    fn an_absent_permissive_field_means_blocked() {
         let line = REAL_LINE.replace(" permissive=0", "");
         let d = &parse_denials(&line)[0];
         assert!(!d.permissive);
-        assert_ne!(classify(d, &profile()), DenialHint::NotBlocked);
+        assert!(classify(d, &profile()).is_some());
     }
 
     #[test]
-    fn unprivileged_domain_is_told_to_escalate() {
-        let d = &parse_denials(REAL_LINE)[0];
-        match classify(d, &profile()) {
-            DenialHint::NeedsEscalatedDomain { from, capability } => {
-                assert_eq!(from, SelinuxDomain::Shell);
-                // read/open are not write-class, so the read capability suffices.
-                assert_eq!(capability, "android:shell:read");
-            }
-            other => panic!("expected escalation hint, got {other:?}"),
-        }
+    fn an_unprivileged_domain_on_an_escalating_host_is_told_to_escalate() {
+        let d = &parse_denials(IN_ROOTS_LINE)[0];
+        let diag = classify(d, &profile()).expect("an enforced denial must classify");
+        assert_eq!(diag.remedy, Remedy::Escalate);
+        // R9: the detail names the domain it ran in and the capability it needs.
+        assert!(diag.detail.contains("Shell"), "{}", diag.detail);
+        assert!(
+            diag.detail.contains("android:shell:read"),
+            "{}",
+            diag.detail
+        );
     }
 
     #[test]
-    fn write_access_from_unprivileged_domain_names_the_write_capability() {
+    fn a_write_access_names_the_write_capability() {
         let line = "avc: denied { write } for comm=\"touch\" path=\"/data/local/tmp/x\" \
                     scontext=u:r:untrusted_app:s0 tcontext=u:object_r:shell_data_file:s0 \
                     tclass=file permissive=0";
         let d = &parse_denials(line)[0];
-        match classify(d, &profile()) {
-            DenialHint::NeedsEscalatedDomain { capability, .. } => {
-                assert_eq!(capability, "android:shell:write")
-            }
-            other => panic!("expected escalation hint, got {other:?}"),
-        }
+        let diag = classify(d, &profile()).unwrap();
+        assert_eq!(diag.remedy, Remedy::Escalate);
+        assert!(
+            diag.detail.contains("android:shell:write"),
+            "{}",
+            diag.detail
+        );
     }
 
     #[test]
-    fn privileged_domain_still_refused_points_at_permissive_approval() {
+    fn an_unprivileged_domain_on_a_sandbox_asks_instead_of_suggesting_escalation() {
+        // The contract would reject `Escalate` here anyway; classifying honestly means
+        // the model is not sent down a path that cannot work.
+        let d = &parse_denials(IN_ROOTS_LINE)[0];
+        let diag = classify(d, &no_escalation()).unwrap();
+        assert!(
+            matches!(diag.remedy, Remedy::AskUser { .. }),
+            "a sandbox has no escalation to suggest; got {:?}",
+            diag.remedy
+        );
+        assert!(diag.remedy.is_admissible(&no_escalation()));
+    }
+
+    #[test]
+    fn a_privileged_domain_still_refused_points_at_permissive_approval() {
         let line = "avc: denied { read } for comm=\"cat\" path=\"/data/local/tmp/x\" \
                     scontext=u:r:magisk:s0 tcontext=u:object_r:system_data_file:s0 \
                     tclass=file permissive=0";
         let d = &parse_denials(line)[0];
-        match classify(d, &profile()) {
-            DenialHint::NeedsPermissiveApproval { capability } => {
-                assert_eq!(capability, "android:selinux:permissive")
+        let diag = classify(d, &profile()).unwrap();
+        match &diag.remedy {
+            Remedy::AskUser { question } => {
+                assert!(
+                    question.contains("android:selinux:permissive"),
+                    "{question}"
+                );
+                assert!(question.contains("setenforce 0"), "{question}");
             }
-            other => panic!("expected permissive hint, got {other:?}"),
+            other => panic!("expected a permissive-approval question, got {other:?}"),
         }
     }
 
     #[test]
-    fn path_outside_every_root_is_a_wrong_path_problem_not_a_privilege_one() {
+    fn an_out_of_roots_path_on_a_sandbox_relocates() {
         let line = "avc: denied { read } for comm=\"cat\" path=\"/mnt/secret/x\" \
                     scontext=u:r:shell:s0 tcontext=u:object_r:mnt_file:s0 \
                     tclass=file permissive=0";
         let d = &parse_denials(line)[0];
-        // A host that cannot escalate: here "wrong path" is the truthful answer.
-        let mut no_escalation = profile();
-        no_escalation.caps = Default::default();
-        match classify(d, &no_escalation) {
-            DenialHint::PathOutsideRoots { path } => {
-                assert_eq!(path.as_deref(), Some("/mnt/secret/x"))
+        let diag = classify(d, &no_escalation()).unwrap();
+        match &diag.remedy {
+            Remedy::Relocate { to } => {
+                assert!(to.contains("/data/local/tmp"), "{to}");
             }
-            other => panic!("expected outside-roots hint, got {other:?}"),
+            other => panic!("expected Relocate on a sandbox, got {other:?}"),
         }
     }
 
     #[test]
-    fn an_escalatable_host_is_told_to_escalate_even_for_an_out_of_root_path() {
-        // The regression this guards: fs_roots is the *unprivileged* reachability
-        // probe, not an enumeration of what root can reach. Answering "wrong path"
-        // here would send the model away from the fix that would have worked.
-        let line = "avc: denied { read } for comm=\"cat\" path=\"/data/system/packages.xml\" \
-                    scontext=u:r:shell:s0 tcontext=u:object_r:system_data_file:s0 \
+    fn an_out_of_roots_path_on_a_rooted_device_still_offers_escalation() {
+        // This is the defect the guard exists for. `fs_roots` records what the
+        // *unprivileged* probe could reach, not what root can reach, so on a rooted
+        // device "wrong path, privilege will not help" is false — and saying it steers
+        // the model away from the one action that would have worked.
+        let line = "avc: denied { read } for comm=\"cat\" path=\"/mnt/secret/x\" \
+                    scontext=u:r:shell:s0 tcontext=u:object_r:mnt_file:s0 \
                     tclass=file permissive=0";
         let d = &parse_denials(line)[0];
-        assert!(matches!(
-            classify(d, &profile()),
-            DenialHint::NeedsEscalatedDomain { .. }
-        ));
+        let diag = classify(d, &profile()).unwrap();
+        assert_eq!(
+            diag.remedy,
+            Remedy::Escalate,
+            "a rooted device must not be told escalation cannot help"
+        );
+        assert!(diag.detail.contains("/mnt/secret/x"), "{}", diag.detail);
     }
 
     #[test]
-    fn a_path_under_a_probed_root_is_not_reported_as_outside() {
-        let line = "avc: denied { read } for comm=\"cat\" path=\"/data/local/tmp/sub/x\" \
-                    scontext=u:r:shell:s0 tcontext=u:object_r:shell_data_file:s0 \
-                    tclass=file permissive=0";
-        let d = &parse_denials(line)[0];
-        assert!(matches!(
-            classify(d, &profile()),
-            DenialHint::NeedsEscalatedDomain { .. }
-        ));
-    }
-
-    #[test]
-    fn every_hint_message_is_actionable_and_names_a_next_step() {
-        let hints = [
-            DenialHint::NotBlocked,
-            DenialHint::NeedsEscalatedDomain {
-                from: SelinuxDomain::Shell,
-                capability: "android:shell:read".to_string(),
-            },
-            DenialHint::NeedsPermissiveApproval {
-                capability: "android:selinux:permissive".to_string(),
-            },
-            DenialHint::PathOutsideRoots {
-                path: Some("/mnt/x".to_string()),
-            },
-            DenialHint::DoNotRetry { attempts: 2 },
-            DenialHint::Unclassified,
+    fn every_remedy_this_module_produces_is_admissible_on_its_host() {
+        // The invariant the contract enforces and this module must not violate: never
+        // suggest an action the device cannot perform.
+        let lines = [
+            REAL_LINE,
+            "avc: denied { write } for comm=\"touch\" path=\"/data/local/tmp/x\" \
+             scontext=u:r:untrusted_app:s0 tcontext=u:object_r:shell_data_file:s0 \
+             tclass=file permissive=0",
+            "avc: denied { read } for comm=\"cat\" path=\"/mnt/secret/x\" \
+             scontext=u:r:shell:s0 tcontext=u:object_r:mnt_file:s0 tclass=file permissive=0",
+            "avc: denied { read } for comm=\"cat\" path=\"/data/local/tmp/x\" \
+             scontext=u:r:magisk:s0 tcontext=u:object_r:system_data_file:s0 \
+             tclass=file permissive=0",
         ];
-        for hint in hints {
-            let msg = hint.message();
-            assert!(msg.len() > 20, "hint too terse to act on: {msg}");
-            assert!(
-                !msg.contains("avc:") && !msg.contains("scontext="),
-                "hint must be translated, not a raw kernel line: {msg}"
-            );
+        for (line, host) in lines
+            .iter()
+            .zip([profile(), profile(), no_escalation(), profile()])
+        {
+            let d = &parse_denials(line)[0];
+            if let Some(diag) = classify(d, &host) {
+                assert!(
+                    diag.remedy.is_admissible(&host),
+                    "{:?} is not admissible on a host whose escalation model is {:?}",
+                    diag.remedy,
+                    host.escalation()
+                );
+            }
         }
     }
 
     #[test]
-    fn ledger_turns_a_second_hit_on_the_same_target_into_do_not_retry() {
-        let mut ledger = DenialLedger::new();
-        let d = parse_denials(REAL_LINE)[0].clone();
-        let p = profile();
+    fn the_classifier_reads_denials_out_of_stderr() {
+        use acowork_platform_contract::DiagnosticClassifier;
 
-        let first = ledger.record(&d, &p);
-        assert!(matches!(first, DenialHint::NeedsEscalatedDomain { .. }));
-        assert!(!matches!(first, DenialHint::DoNotRetry { .. }));
+        let profile = profile();
+        let classifier = SelinuxClassifier::new(&profile);
+        let cap = crate::host::capability::Capability::ShellRead.id();
+        let stderr = format!("some noise\n{IN_ROOTS_LINE}\n");
+        let diag = classifier
+            .classify(&cap, b"", stderr.as_bytes())
+            .expect("an enforced denial in stderr must classify");
+        // The caller's capability wins over the implied one: the caller knows what it
+        // asked for.
+        assert_eq!(diag.capability, cap);
+        assert_eq!(diag.remedy, Remedy::Escalate);
+    }
 
-        let second = ledger.record(&d, &p);
-        assert_eq!(second, DenialHint::DoNotRetry { attempts: 2 });
+    #[test]
+    fn the_classifier_returns_none_when_stderr_has_no_enforced_denial() {
+        use acowork_platform_contract::DiagnosticClassifier;
 
-        let third = ledger.record(&d, &p);
-        assert_eq!(third, DenialHint::DoNotRetry { attempts: 3 });
-        assert_eq!(ledger.distinct_targets(), 1);
+        let profile = profile();
+        let classifier = SelinuxClassifier::new(&profile);
+        let cap = crate::host::capability::Capability::ShellRead.id();
+        // A plain permission error with no SELinux record: this classifier cannot
+        // explain it, and guessing would be worse than saying so.
+        assert!(
+            classifier
+                .classify(&cap, b"", b"cat: /x: Permission denied")
+                .is_none()
+        );
+        // Permissive-only denials are not a block either.
+        let permissive = REAL_LINE.replace("permissive=0", "permissive=1");
+        assert!(
+            classifier
+                .classify(&cap, b"", permissive.as_bytes())
+                .is_none()
+        );
     }
 
     #[test]
@@ -681,9 +848,66 @@ scontext=u:r:shell:s0 tcontext=u:object_r:system_data_file:s0 tclass=file permis
         let line = REAL_LINE.replace("permissive=0", "permissive=1");
         let d = parse_denials(&line)[0].clone();
         let p = profile();
-        assert_eq!(ledger.record(&d, &p), DenialHint::NotBlocked);
-        assert_eq!(ledger.record(&d, &p), DenialHint::NotBlocked);
+        // A permissive record is not a refusal, so it is not counted at all.
+        assert_eq!(ledger.record(&d, &p), Remedy::Retry);
+        assert_eq!(ledger.record(&d, &p), Remedy::Retry);
         assert_eq!(ledger.distinct_targets(), 0);
+    }
+
+    #[test]
+    fn a_second_hit_on_the_same_wall_says_stop() {
+        // android-host-probe.md §4 item 2: this is the silent-degradation loop the
+        // ledger exists to break. The repeat check runs *before* classification, so the
+        // second answer is "stop" no matter how plausible the first one sounded.
+        let mut ledger = DenialLedger::new();
+        let p = profile();
+        let d = parse_denials(IN_ROOTS_LINE)[0].clone();
+
+        let first = ledger.record(&d, &p);
+        assert_eq!(
+            first,
+            Remedy::Escalate,
+            "the first hit should suggest the real fix"
+        );
+        let second = ledger.record(&d, &p);
+        match second {
+            Remedy::Abandon { reason } => {
+                assert!(reason.contains("2 times"), "{reason}");
+                assert!(reason.contains("report the limitation"), "{reason}");
+            }
+            other => panic!("expected Abandon on the second hit, got {other:?}"),
+        }
+        assert!(ledger.is_repeat(&d));
+    }
+
+    #[test]
+    fn a_retry_from_a_different_domain_is_the_same_wall() {
+        // `repeat_key` excludes scontext on purpose: escalating and hitting the same
+        // target again is not a new idea, and counting it as one would let the loop run
+        // one more turn.
+        let mut ledger = DenialLedger::new();
+        let p = profile();
+        let a = parse_denials(IN_ROOTS_LINE)[0].clone();
+        let mut b = a.clone();
+        b.scontext = Some("u:r:magisk:s0".to_string());
+
+        ledger.record(&a, &p);
+        assert!(matches!(ledger.record(&b, &p), Remedy::Abandon { .. }));
+        assert_eq!(ledger.distinct_targets(), 1);
+    }
+
+    #[test]
+    fn the_ledger_does_not_outlive_its_session() {
+        let mut ledger = DenialLedger::new();
+        let p = profile();
+        let d = parse_denials(IN_ROOTS_LINE)[0].clone();
+        ledger.record(&d, &p);
+        assert_eq!(ledger.distinct_targets(), 1);
+        ledger.clear();
+        assert_eq!(ledger.distinct_targets(), 0);
+        assert!(!ledger.is_repeat(&d));
+        // After clearing, the same denial is a first hit again.
+        assert_eq!(ledger.record(&d, &p), Remedy::Escalate);
     }
 
     #[test]

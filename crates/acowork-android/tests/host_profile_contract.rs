@@ -14,93 +14,18 @@
 //! Plus the P1 invariant from ADR-AND-001 §6: on the root-shell tier there is no
 //! resident root process, i.e. the Runtime's own privilege stays below root.
 
-use std::collections::BTreeMap;
-
-use acowork_android::host::{AttributionVerdict, AuthorizationContext, LocalReadiness};
 use acowork_android::host::{
-    Capability, CommandOutput, Denial, FsRoot, HostProfile, LockOutcome, Privilege, ProbeCommand,
-    ProbeOutput, SelinuxDomain, SelinuxState, ShellDialect, VerityState, authorize,
+    Capability, CommandOutput, ExecRequest, FsRoot, HostProfile, Privilege, ProbeOutput,
+    SelinuxDomain, SelinuxState, SessionWriteLock, ShellDialect, VerityState,
+};
+use acowork_platform_contract::{
+    AttributionTier, AttributionVerdict, Gate, GateDecision, HostDescription, LocalReadiness,
+    LockState, Refusal,
 };
 
-/// Build a probe output from `(command, stdout)` pairs, leaving everything else
-/// unrun. Mirrors how a real runner reports a device where most applets exist.
-fn probe_of(pairs: &[(ProbeCommand, &str)]) -> ProbeOutput {
-    let mut out = ProbeOutput::default();
-    for (cmd, stdout) in pairs {
-        let value = CommandOutput::ok(stdout);
-        match cmd {
-            ProbeCommand::Id => out.id = Some(value),
-            ProbeCommand::GetEnforce => out.getenforce = Some(value),
-            ProbeCommand::AttrCurrent => out.attr_current = Some(value),
-            ProbeCommand::Su => out.su = Some(value),
-            ProbeCommand::BashPath => out.bash_path = Some(value),
-            ProbeCommand::SystemShVersion => out.system_sh_version = Some(value),
-            ProbeCommand::ToyboxList => out.toybox_list = Some(value),
-            ProbeCommand::BusyboxList => out.busybox_list = Some(value),
-            ProbeCommand::MountTable => out.mount_table = Some(value),
-            ProbeCommand::SystemRemount => out.system_remount = Some(value),
-            ProbeCommand::PropBuildType => out.prop_build_type = Some(value),
-            ProbeCommand::PropDebuggable => out.prop_debuggable = Some(value),
-            ProbeCommand::PropSecure => out.prop_secure = Some(value),
-            ProbeCommand::PropAdbSecure => out.prop_adb_secure = Some(value),
-            ProbeCommand::PropVerityMode => out.prop_veritymode = Some(value),
-            ProbeCommand::PropSdk => out.prop_sdk = Some(value),
-            ProbeCommand::PropAbi => out.prop_abi = Some(value),
-        }
-    }
-    out
-}
+mod common;
 
-const TOYBOX_LIST: &str =
-    "basename\ncat\nchmod\ndf\ndumpsys\ngetprop\nlogcat\nmount\nps\nsetprop\ntoybox\n";
-
-// ── Baseline 1: user build + Termux ─────────────────────────────────────────
-
-fn termux_probe() -> ProbeOutput {
-    let mut probe = probe_of(&[
-        (ProbeCommand::Id, "10233\n"),
-        (ProbeCommand::GetEnforce, "Enforcing\n"),
-        (
-            ProbeCommand::AttrCurrent,
-            "u:r:untrusted_app:s0:c123,c456\n",
-        ),
-        (
-            ProbeCommand::BashPath,
-            "/data/data/com.termux/files/usr/bin/bash\n",
-        ),
-        (
-            ProbeCommand::SystemShVersion,
-            "@(#)MIRBSD KSH R59 2020/10/31\n",
-        ),
-        (ProbeCommand::ToyboxList, TOYBOX_LIST),
-        (
-            ProbeCommand::MountTable,
-            "/dev/block/sda1 /data f2fs rw,seclabel 0 0\n\
-             /dev/block/dm-0 /system ext4 ro,seclabel 0 0\n",
-        ),
-        (ProbeCommand::PropBuildType, "user\n"),
-        (ProbeCommand::PropDebuggable, "0\n"),
-        (ProbeCommand::PropSecure, "1\n"),
-        (ProbeCommand::PropAdbSecure, "1\n"),
-        (ProbeCommand::PropVerityMode, "enforcing\n"),
-        (ProbeCommand::PropSdk, "34\n"),
-        (ProbeCommand::PropAbi, "arm64-v8a\n"),
-    ]);
-    probe.termux_prefix = Some("/data/data/com.termux/files/usr".to_string());
-    probe.fs_roots = vec![
-        FsRoot {
-            path: "/data/data/com.termux/files/usr".to_string(),
-            writable: true,
-            own_package: false,
-        },
-        FsRoot {
-            path: "/data/data/com.termux/files/home".to_string(),
-            writable: true,
-            own_package: false,
-        },
-    ];
-    probe
-}
+use common::{apk_probe, rooted_probe, termux_probe};
 
 #[test]
 fn baseline_termux_user_build() {
@@ -121,10 +46,14 @@ fn baseline_termux_user_build() {
     assert!(profile.dialects.contains(&ShellDialect::MkSh));
 
     // Read tier yes, write tier no: no su on a user build.
-    assert!(profile.caps.contains(Capability::ShellRead));
-    assert!(!profile.caps.contains(Capability::ShellWrite));
-    assert!(!profile.caps.contains(Capability::FsSystem));
-    assert!(!profile.caps.contains(Capability::SelinuxPermissive));
+    assert!(profile.caps.is_declared(&Capability::ShellRead.id()));
+    assert!(!profile.caps.is_declared(&Capability::ShellWrite.id()));
+    assert!(!profile.caps.is_declared(&Capability::FsSystem.id()));
+    assert!(
+        !profile
+            .caps
+            .is_declared(&Capability::SelinuxPermissive.id())
+    );
 
     // `$PREFIX` is Termux's *own* storage, and the CLI deliverable runs inside
     // the Termux package — so writing there is writing to our own space, not
@@ -132,7 +61,7 @@ fn baseline_termux_user_build() {
     // the user grants SAF access to somewhere else. This matches the README
     // capability matrix ("文件可达范围: `$PREFIX` + 用户授权的 SAF").
     assert!(
-        !profile.caps.contains(Capability::FsOutsideApp),
+        !profile.caps.is_declared(&Capability::FsOutsideApp.id()),
         "$PREFIX is own storage, not outside-app"
     );
     assert!(profile.fs_roots.iter().all(|r| r.own_package));
@@ -155,66 +84,15 @@ fn termux_with_a_saf_grant_gains_outside_app_and_nothing_else() {
 
     let profile = HostProfile::assemble(&probe, "com.termux");
 
-    assert!(profile.caps.contains(Capability::FsOutsideApp));
-    assert!(profile.caps.contains(Capability::ShellRead));
-    assert!(!profile.caps.contains(Capability::ShellWrite));
-    assert!(!profile.caps.contains(Capability::FsSystem));
-    assert!(!profile.caps.contains(Capability::SelinuxPermissive));
-}
-
-// ── Baseline 2: userdebug + Magisk root ─────────────────────────────────────
-
-fn rooted_probe() -> ProbeOutput {
-    let mut probe = probe_of(&[
-        (ProbeCommand::Id, "10233\n"),
-        (ProbeCommand::GetEnforce, "Enforcing\n"),
-        (
-            ProbeCommand::AttrCurrent,
-            "u:r:untrusted_app:s0:c123,c456\n",
-        ),
-        (ProbeCommand::Su, "0\nu:r:magisk:s0\n"),
-        (
-            ProbeCommand::SystemShVersion,
-            "@(#)MIRBSD KSH R59 2020/10/31\n",
-        ),
-        (ProbeCommand::ToyboxList, TOYBOX_LIST),
-        (
-            ProbeCommand::BusyboxList,
-            "BusyBox v1.34.1 multi-call binary.\nash\nsed\ngrep\n",
-        ),
-        (
-            ProbeCommand::MountTable,
-            "/dev/block/sda1 /data f2fs rw,seclabel 0 0\n\
-             /dev/block/dm-0 /system ext4 ro,seclabel 0 0\n",
-        ),
-        (ProbeCommand::SystemRemount, ""),
-        (ProbeCommand::PropBuildType, "userdebug\n"),
-        (ProbeCommand::PropDebuggable, "1\n"),
-        (ProbeCommand::PropVerityMode, "disabled\n"),
-        (ProbeCommand::PropSdk, "34\n"),
-        (ProbeCommand::PropAbi, "arm64-v8a\n"),
-    ]);
-    let mut spot = BTreeMap::new();
-    for applet in acowork_android::host::SPOT_CHECK_APPLETS {
-        spot.insert(
-            applet.to_string(),
-            CommandOutput::ok(&format!("/system/bin/{applet}\n")),
-        );
-    }
-    probe.applet_spot_checks = spot;
-    probe.fs_roots = vec![
-        FsRoot {
-            path: "/data/data/com.example.agent".to_string(),
-            writable: true,
-            own_package: true,
-        },
-        FsRoot {
-            path: "/data/local/tmp".to_string(),
-            writable: true,
-            own_package: false,
-        },
-    ];
-    probe
+    assert!(profile.caps.is_declared(&Capability::FsOutsideApp.id()));
+    assert!(profile.caps.is_declared(&Capability::ShellRead.id()));
+    assert!(!profile.caps.is_declared(&Capability::ShellWrite.id()));
+    assert!(!profile.caps.is_declared(&Capability::FsSystem.id()));
+    assert!(
+        !profile
+            .caps
+            .is_declared(&Capability::SelinuxPermissive.id())
+    );
 }
 
 #[test]
@@ -228,7 +106,7 @@ fn baseline_userdebug_magisk_root() {
 
     // The full capability set, because every fact supports it.
     for cap in Capability::all() {
-        assert!(profile.caps.contains(cap), "missing {cap}");
+        assert!(profile.caps.is_declared(&cap.id()), "missing {cap}");
     }
 
     // Applets come from both list sources plus the spot checks.
@@ -247,19 +125,9 @@ fn baseline_userdebug_magisk_root() {
     assert_eq!(profile.domain, SelinuxDomain::UntrustedApp);
 }
 
-// ── Baseline 3: APK sandbox ─────────────────────────────────────────────────
-
 #[test]
 fn baseline_apk_sandbox() {
-    // Nothing could be spawned: every command probe is absent, and only the
-    // syscall-based item 12 produced an answer.
-    let mut probe = ProbeOutput::nothing_ran();
-    probe.fs_roots = vec![FsRoot {
-        path: "/data/data/com.example.agent/files".to_string(),
-        writable: true,
-        own_package: true,
-    }];
-
+    let probe = apk_probe();
     let profile = HostProfile::assemble(&probe, "com.example.agent");
 
     assert!(!profile.name.has_shell());
@@ -267,9 +135,9 @@ fn baseline_apk_sandbox() {
     assert_eq!(profile.domain, SelinuxDomain::Unreadable);
     assert_eq!(profile.device.verity, VerityState::Unknown);
     assert!(
-        profile.caps.is_empty(),
+        profile.caps.declared().is_empty(),
         "an APK sandbox must declare nothing, got {:?}",
-        profile.caps.ids()
+        profile.caps.declared_ids()
     );
     assert!(profile.runtime_is_unprivileged());
 }
@@ -286,10 +154,14 @@ fn fault_denied_su_prompt_degrades_without_panic() {
     assert!(profile.su.prompt_denied);
     assert!(!profile.su.got_root());
     // The write tier and the SELinux toggle must both disappear.
-    assert!(!profile.caps.contains(Capability::ShellWrite));
-    assert!(!profile.caps.contains(Capability::SelinuxPermissive));
+    assert!(!profile.caps.is_declared(&Capability::ShellWrite.id()));
+    assert!(
+        !profile
+            .caps
+            .is_declared(&Capability::SelinuxPermissive.id())
+    );
     // Read tier survives: the shell is still there.
-    assert!(profile.caps.contains(Capability::ShellRead));
+    assert!(profile.caps.is_declared(&Capability::ShellRead.id()));
 }
 
 #[test]
@@ -302,7 +174,9 @@ fn fault_missing_getenforce_closes_the_write_tier() {
 
     assert_eq!(profile.selinux, SelinuxState::Unknown);
     assert!(
-        !profile.caps.contains(Capability::SelinuxPermissive),
+        !profile
+            .caps
+            .is_declared(&Capability::SelinuxPermissive.id()),
         "android-host-probe.md §2 item 2: unknown SELinux never opens the write tier"
     );
 }
@@ -313,7 +187,11 @@ fn fault_getenforce_entirely_absent_is_still_unknown() {
     probe.getenforce = None;
     let profile = HostProfile::assemble(&probe, "com.example.agent");
     assert_eq!(profile.selinux, SelinuxState::Unknown);
-    assert!(!profile.caps.contains(Capability::SelinuxPermissive));
+    assert!(
+        !profile
+            .caps
+            .is_declared(&Capability::SelinuxPermissive.id())
+    );
 }
 
 #[test]
@@ -332,7 +210,7 @@ fn fault_both_applet_sources_missing_degrades_to_builtins_only() {
     );
     // A missing applet list is not a missing shell: mksh was still detected.
     assert_eq!(profile.shell, Some(ShellDialect::MkSh));
-    assert!(profile.caps.contains(Capability::ShellRead));
+    assert!(profile.caps.is_declared(&Capability::ShellRead.id()));
 }
 
 #[test]
@@ -346,9 +224,9 @@ fn fault_system_remount_failure_closes_fs_system() {
     let profile = HostProfile::assemble(&probe, "com.example.agent");
 
     assert!(!profile.system_remountable);
-    assert!(!profile.caps.contains(Capability::FsSystem));
+    assert!(!profile.caps.is_declared(&Capability::FsSystem.id()));
     // Everything else on the root tier is unaffected.
-    assert!(profile.caps.contains(Capability::ShellWrite));
+    assert!(profile.caps.is_declared(&Capability::ShellWrite.id()));
 }
 
 #[test]
@@ -359,7 +237,7 @@ fn fault_malformed_mount_table_does_not_panic() {
     ));
     // Must not panic; the profile still assembles from the other facts.
     let profile = HostProfile::assemble(&probe, "com.example.agent");
-    assert!(profile.caps.contains(Capability::ShellRead));
+    assert!(profile.caps.is_declared(&Capability::ShellRead.id()));
 }
 
 #[test]
@@ -378,7 +256,7 @@ fn fault_garbage_property_values_degrade_to_unknown() {
     assert_eq!(profile.device.api_level, None);
     assert_eq!(profile.device.verity, VerityState::Unknown);
     // Unknown verity is treated as enforcing, so fs:system stays closed.
-    assert!(!profile.caps.contains(Capability::FsSystem));
+    assert!(!profile.caps.is_declared(&Capability::FsSystem.id()));
 }
 
 // ── The tier invariant, across every baseline ───────────────────────────────
@@ -395,7 +273,7 @@ fn tier_and_declared_shell_capability_never_disagree() {
     for profile in cases {
         assert_eq!(
             profile.name.has_shell(),
-            profile.caps.contains(Capability::ShellRead),
+            profile.caps.is_declared(&Capability::ShellRead.id()),
             "{:?} disagrees with its own capability set",
             profile.name
         );
@@ -442,49 +320,308 @@ fn gateway_summary_never_leaks_device_detail_on_any_tier() {
 }
 
 // ── The §7.4 conjunction, end to end ────────────────────────────────────────
+//
+// These drive the *contract* gate, not an Android-local one. That is the point of the
+// rewiring: the rules that decide a request live in `acowork-platform-contract`, so a
+// second platform inherits them by depending on the crate. What Android contributes here
+// is the request shape (`ExecRequest`), the host description (`HostProfile`) and the
+// session-identity lock.
 
-fn ctx(dangerous: bool, attribution: AttributionVerdict) -> AuthorizationContext {
-    AuthorizationContext {
-        attribution,
-        local: LocalReadiness {
-            dangerous_mode: dangerous,
-            lock: LockOutcome::Acquired,
-        },
+/// Readiness with every local switch on, so a test isolates one rule at a time.
+fn ready() -> LocalReadiness {
+    LocalReadiness {
+        dangerous_session: true,
+        approval_presented: true,
+        lock: LockState::Available,
     }
 }
 
 #[test]
-fn read_tier_flows_on_every_baseline_without_any_gate() {
-    // The P1 deliverable: read-only system inspection works on a rooted device
-    // with no approval, no lock and no attribution — that is the whole point of
-    // "先只读、后可写".
-    let profile = HostProfile::assemble(&rooted_probe(), "com.example.agent");
-    let request = acowork_android::host::ExecRequest::read("logcat -d", "s-1");
-    let grant = authorize(&request, &profile, &ctx(false, AttributionVerdict::Absent)).unwrap();
-    assert!(!grant.holds_write_lock);
-    assert!(!grant.attribution_checked);
+fn read_tier_flows_without_approval_lock_or_attribution() {
+    // The P1 deliverable: read-only system inspection works with no approval, no lock
+    // and no attribution verdict — the whole point of "先只读、后可写".
+    //
+    // It flows on the two baselines that *have a shell*. It does not flow on the APK
+    // sandbox, and that is not an exception to the rule: with no shell there is nothing
+    // to read with, so `android:shell:read` was never declared. Declaring it anyway would
+    // be the "capability lie" upstream design doc 30 §11.1 warns is worse than no
+    // capability at all, and which B12's shell conjunct exists to prevent.
+    let request = ExecRequest::read("logcat -d", "s-1");
+
+    for probe in [rooted_probe(), termux_probe()] {
+        let profile = HostProfile::assemble(&probe, "com.example.agent");
+        let gate = Gate::new(&profile);
+        // `for_read` presents no approval, no dangerous-mode switch and no verdict.
+        let d = gate.decide(&request, None, LocalReadiness::for_read());
+        assert_eq!(
+            d,
+            GateDecision::Allow {
+                capability: Capability::ShellRead.id(),
+                hold_lock: false
+            },
+            "read tier must flow on {:?} with nothing presented",
+            profile.name
+        );
+    }
+}
+
+#[test]
+fn read_tier_is_refused_on_the_apk_sandbox_because_there_is_no_shell() {
+    // The other direction, pinned so the two cannot drift: a host with no shell must not
+    // be handed a shell capability, however harmless read-only access sounds.
+    let profile = HostProfile::assemble(&apk_probe(), "com.example.agent");
+    let gate = Gate::new(&profile);
+    assert!(
+        profile.caps.declared().is_empty(),
+        "the APK sandbox declares nothing; got {:?}",
+        profile.caps.declared_ids()
+    );
+
+    let d = gate.decide(
+        &ExecRequest::read("logcat -d", "s-1"),
+        None,
+        LocalReadiness::for_read(),
+    );
+    assert!(
+        matches!(d.refusal(), Some(Refusal::NotDeclared(_))),
+        "got {d:?}"
+    );
+
+    // And the gap is explained, not silently absent (R9).
+    let gap = gate
+        .gaps()
+        .iter()
+        .find(|g| g.capability == Capability::ShellRead.id())
+        .expect("shell:read must be reported as a gap on the APK sandbox")
+        .reason
+        .clone();
+    assert!(gap.contains("no usable shell"), "{gap}");
 }
 
 #[test]
 fn system_tier_is_refused_on_the_termux_baseline_because_the_fact_is_missing() {
     let profile = HostProfile::assemble(&termux_probe(), "com.termux");
-    let request = acowork_android::host::ExecRequest {
-        capability: Capability::FsSystem,
+    let gate = Gate::new(&profile);
+    let request = ExecRequest {
+        capability: Capability::FsSystem.id(),
         approval_token: Some(acowork_android::host::ApprovalToken::new("t")),
-        ..acowork_android::host::ExecRequest::read("mount -o remount,rw /system", "s-1")
+        rollback_plan: Some("reflash the stock image".to_string()),
+        ..ExecRequest::read("mount -o remount,rw /system", "s-1")
     };
-    // Even with dangerous-mode on and attribution granted, the device simply
-    // cannot do this — and the refusal names the missing fact.
-    let err = authorize(&request, &profile, &ctx(true, AttributionVerdict::Granted)).unwrap_err();
-    match err {
-        Denial::NotDeclared { reason, .. } => {
-            assert!(
-                reason.contains("verity") || reason.contains("remount"),
-                "{reason}"
-            );
+
+    // Even with dangerous-mode on, an approval presented and attribution granted, the
+    // device simply cannot do this — and the refusal names the missing fact (R9).
+    let d = gate.decide(
+        &request,
+        Some(AttributionVerdict::granted_for(AttributionTier::Manage)),
+        ready(),
+    );
+    assert!(
+        matches!(d.refusal(), Some(Refusal::NotDeclared(_))),
+        "got {d:?}"
+    );
+
+    // The explanation comes from the port, through the contract's gap reporting.
+    let gaps = gate.gaps();
+    let fs_system = gaps
+        .iter()
+        .find(|g| g.capability == Capability::FsSystem.id())
+        .expect("fs:system must be reported as a gap on Termux");
+    assert!(
+        fs_system.reason.contains("verity") || fs_system.reason.contains("remount"),
+        "the gap must name the missing fact: {}",
+        fs_system.reason
+    );
+}
+
+#[test]
+fn the_manage_tier_needs_a_gateway_verdict_even_on_a_capable_device() {
+    // B1, end to end: the rooted device *can* do this, dangerous-mode is on, an approval
+    // is presented — and it is still refused, because the control plane has not said this
+    // session may touch this device. No verdict means no pass.
+    let profile = HostProfile::assemble(&rooted_probe(), "com.example.agent");
+    let gate = Gate::new(&profile);
+    assert!(
+        profile.caps.is_declared(&Capability::FsSystem.id()),
+        "the rooted baseline must actually declare fs:system for this test to mean anything"
+    );
+
+    let request = ExecRequest {
+        capability: Capability::FsSystem.id(),
+        approval_token: Some(acowork_android::host::ApprovalToken::new("t")),
+        rollback_plan: Some("reflash the stock image".to_string()),
+        ..ExecRequest::read("mount -o remount,rw /system", "s-1")
+    };
+
+    let d = gate.decide(&request, None, ready());
+    assert!(
+        matches!(
+            d.refusal(),
+            Some(Refusal::AttributionDenied {
+                required: AttributionTier::Manage
+            })
+        ),
+        "got {d:?}"
+    );
+
+    // A `use`-tier verdict does not satisfy a `manage`-tier capability.
+    let d = gate.decide(
+        &request,
+        Some(AttributionVerdict::granted_for(AttributionTier::Use)),
+        ready(),
+    );
+    assert!(
+        matches!(d.refusal(), Some(Refusal::AttributionDenied { .. })),
+        "got {d:?}"
+    );
+
+    // The matching verdict does.
+    let d = gate.decide(
+        &request,
+        Some(AttributionVerdict::granted_for(AttributionTier::Manage)),
+        ready(),
+    );
+    assert!(d.is_allowed(), "got {d:?}");
+    assert!(
+        matches!(
+            d,
+            GateDecision::Allow {
+                hold_lock: true,
+                ..
+            }
+        ),
+        "a mutating capability must tell the caller to hold the lock"
+    );
+}
+
+#[test]
+fn the_verdict_carries_no_identity() {
+    // ADR-087 D1/D5: the node must not learn who was authorised. The verdict is a
+    // boolean plus the tier it was issued for, and serializing it must not grow a field.
+    let v = AttributionVerdict::granted_for(AttributionTier::Manage);
+    let json = serde_json::to_string(&v).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let keys: Vec<&str> = value
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["granted", "tier"],
+        "verdict shape changed: {json}"
+    );
+}
+
+#[test]
+fn a_busy_device_refuses_a_second_mutating_call_and_names_the_holder() {
+    // ADR-AND-001 §7.2: no queueing, no preemption, and the refusal names the holder —
+    // which is information the contract's identity-free lock cannot carry, so the
+    // Android session lock supplies it.
+    let profile = HostProfile::assemble(&rooted_probe(), "com.example.agent");
+    let lock = SessionWriteLock::new();
+    let t0 = std::time::Duration::ZERO;
+
+    assert!(matches!(
+        lock.try_acquire("s-1", t0),
+        acowork_android::host::SessionLockOutcome::Acquired
+    ));
+    match lock.try_acquire("s-2", std::time::Duration::from_secs(5)) {
+        acowork_android::host::SessionLockOutcome::HeldBy {
+            holder,
+            retry_after,
+        } => {
+            assert_eq!(holder, "s-1");
+            assert_eq!(retry_after, std::time::Duration::from_secs(595));
         }
-        other => panic!("expected NotDeclared, got {other:?}"),
+        other => panic!("expected HeldBy, got {other:?}"),
     }
+
+    // The gate sees the same fact and refuses.
+    let gate = Gate::new(&profile);
+    let request = ExecRequest {
+        capability: Capability::ShellWrite.id(),
+        approval_token: Some(acowork_android::host::ApprovalToken::new("t")),
+        ..ExecRequest::read("setprop debug.x 1", "s-2")
+    };
+    let busy = LocalReadiness {
+        lock: lock.lock_state("s-2", std::time::Duration::from_secs(5)),
+        ..ready()
+    };
+    assert!(matches!(
+        gate.decide(&request, None, busy).refusal(),
+        Some(Refusal::DeviceBusy { .. })
+    ));
+
+    // The holder itself is not blocked by its own lock.
+    let own = LocalReadiness {
+        lock: lock.lock_state("s-1", std::time::Duration::from_secs(5)),
+        ..ready()
+    };
+    assert!(gate.decide(&request, None, own).is_allowed());
+}
+
+#[test]
+fn a_root_runtime_is_refused_mutating_work_by_r3() {
+    // ADR-AND-001 §4.1 as an enforced rule rather than a sentence in a document. The
+    // baselines never produce this, so build it deliberately.
+    let mut profile = HostProfile::assemble(&rooted_probe(), "com.example.agent");
+    profile.privilege = Privilege::Root;
+    assert!(!profile.is_r3_conformant());
+
+    let gate = Gate::new(&profile);
+    let request = ExecRequest {
+        capability: Capability::ShellWrite.id(),
+        approval_token: Some(acowork_android::host::ApprovalToken::new("t")),
+        ..ExecRequest::read("setprop debug.x 1", "s-1")
+    };
+    assert!(
+        matches!(
+            gate.decide(&request, None, ready()).refusal(),
+            Some(Refusal::PrivilegeViolation { .. })
+        ),
+        "a root node must not be handed mutating capabilities"
+    );
+    // Reads still work: R3 is about not *holding* privilege, not about being useless.
+    assert!(
+        gate.decide(
+            &ExecRequest::read("getprop", "s-1"),
+            None,
+            LocalReadiness::for_read()
+        )
+        .is_allowed()
+    );
+}
+
+#[test]
+fn an_irreversible_capability_needs_a_stated_rollback_path() {
+    // Contract rule R8. `/system` has no snapshot to restore from, so the model must
+    // acknowledge the cost — in practice "reflash the stock image".
+    let profile = HostProfile::assemble(&rooted_probe(), "com.example.agent");
+    let gate = Gate::new(&profile);
+    let v = Some(AttributionVerdict::granted_for(AttributionTier::Manage));
+
+    let no_plan = ExecRequest {
+        capability: Capability::FsSystem.id(),
+        approval_token: Some(acowork_android::host::ApprovalToken::new("t")),
+        rollback_plan: None,
+        ..ExecRequest::read("mount -o remount,rw /system", "s-1")
+    };
+    assert!(matches!(
+        gate.decide(&no_plan, v, ready()).refusal(),
+        Some(Refusal::RollbackPlanRequired(_))
+    ));
+
+    // `setenforce 0` is auto-restored at session end (ADR-AND-001 §8), so it has a real
+    // undo and must not be made to state one.
+    let permissive = ExecRequest {
+        capability: Capability::SelinuxPermissive.id(),
+        approval_token: Some(acowork_android::host::ApprovalToken::new("t")),
+        rollback_plan: None,
+        ..ExecRequest::read("setenforce 0", "s-1")
+    };
+    assert!(gate.decide(&permissive, v, ready()).is_allowed());
 }
 
 #[test]

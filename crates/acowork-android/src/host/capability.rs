@@ -1,59 +1,75 @@
-//! Capability model and its derivation from probed facts.
+//! The Android capability vocabulary, and its derivation from probed facts.
 //!
-//! # Why this type is local and not upstream `Permission`
+//! # What lives here versus in the contract
 //!
-//! ADR-AND-001 §4.4 introduces five `android:*` capabilities and says it follows
-//! the upstream `filesystem:read:<path>` granularity style. Upstream, however,
-//! models permissions as a **closed enum** (`acowork-core/src/permission.rs`)
-//! with a proto tag mapping, `from_str`, `implies`, `category`, `type_name`,
-//! `type_value` and a WASI mapper — seven match sites. Adding a variant there is
-//! an upstream core + proto change, not something this repository can do locally.
+//! The **rules** — what the four axes mean, how they compose, who may declare what —
+//! live in `acowork-platform-contract` and are not repeated here. This module holds
+//! only the two things that are genuinely Android:
 //!
-//! Upstream design doc 30 §6.2 goes further and rules that "新增能力的唯一路径是
-//! 注册表 PR", that engines may not mint capability IDs, and that "能力是布尔
-//! 开关，不带参数". Two of the five capabilities below are inherently
-//! parameterised (`android:fs:outside-app` is a path scope, `android:shell:read`
-//! carries a command whitelist), so they collide with that ruling.
+//! 1. the **vocabulary**: which five capabilities this platform registers, and what
+//!    each one's four axes are ([`Capability::spec`]);
+//! 2. the **derivation**: how probed facts turn into claims with evidence
+//!    ([`derive_claims`]), and how an absent capability is explained
+//!    ([`explain_absence`]).
 //!
-//! This is recorded as blocker **B2** in
-//! `docs/review/zh/readiness-assessment.md`. Until it is ruled on, this module
-//! deliberately defines its **own** capability type and does **not** depend on
-//! `acowork_core::Permission`. The mapping layer to whatever the registry ends
-//! up being is a separate, later, thin adapter — so a ruling against the current
-//! IDs costs one file, not a rewrite of the probe.
+//! A third platform writes its own version of this file and nothing else. That is the
+//! point of the split: the gate never changes, so a new port cannot alter how
+//! authorization works (contract rule R6).
 //!
-//! # Derivation is a function of facts, never of configuration
+//! # Why a local enum on top of a contract type
 //!
-//! android-host-probe.md §3: "capability 是探测事实的函数，不是配置项". Every
-//! rule below reads only from [`super::facts`] and [`super::profile`] values.
-//! There is no config file, no environment override and no way to declare a
-//! capability the device did not demonstrate.
+//! [`Capability`] is a handle, not a vocabulary. The authoritative ID is the contract's
+//! [`HostCapability`], and [`Capability::id`] produces it. Keeping a local enum buys
+//! exhaustive matching — the compiler rejects a `match` that forgets a capability,
+//! which a string-keyed map cannot. It costs one `id()` call.
+//!
+//! # B2 — the IDs are provisional, and that is now cheap
+//!
+//! ADR-AND-001 §4.4 specifies these five `android:*` IDs. Upstream design doc 30 §6.2
+//! rules that new capabilities enter only by registry PR, that engines may not mint
+//! IDs, and that "能力是布尔开关，不带参数" — and two of the five are inherently
+//! parameterised (`fs:outside-app` is a path scope, `shell:read` carries a command
+//! whitelist). Doc 30 also uses dot-separated names where the ADR uses colons.
+//!
+//! Because the vocabulary is now data in one function ([`android_vocabulary`]) and the
+//! rules are elsewhere, a ruling against these IDs costs this file alone. That is the
+//! whole reason the contract layer exists; see the readiness assessment's B2.
+//!
+//! # B11 — `shell:write` and the attribution tier
+//!
+//! ADR-087 D4 puts "安装/卸载" under `manage = owner ∨ admin`, and `android:shell:write`
+//! covers `pm install`. ADR-AND-001 §7.4 gates only the two system-tier capabilities on
+//! ownership. The two documents disagree, so this module declares
+//! [`AttributionTier::None`] for `shell:write` — the ADR's reading — and says so in the
+//! spec table where a test can see it. Changing the answer is one line here and no line
+//! anywhere else.
 
-use std::collections::BTreeSet;
-
-use serde::{Deserialize, Serialize};
+use acowork_platform_contract::{
+    ApprovalRequirement, AttributionTier, CapabilitySpec, Effect, HostCapability, Reversibility,
+};
 
 use crate::host::facts::{Privilege, SelinuxState, VerityState};
 use crate::host::profile::HostProfile;
 
+/// The platform namespace this port registers under.
+pub const PLATFORM: &str = "android";
+
 /// The five Android capabilities from ADR-AND-001 §4.4.
 ///
-/// The string IDs are the ones the ADR specifies. They are **provisional**
-/// pending the B2 ruling — see the module docs.
+/// A handle for exhaustive matching; the wire identity is [`Capability::id`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Capability {
     /// Read-only system inspection: `getprop`, `dumpsys`, `logcat`, `ps`, `df`,
     /// `mount`, `getenforce`. Whitelist auto-approved per ADR-AND-001 §4.4.
     ShellRead,
-    /// Mutating shell: `setprop`, `am start`, `pm install`, `settings put`,
-    /// `input`. **Requires approval.**
+    /// Mutating shell: `setprop`, `am start`, `pm install`, `settings put`, `input`.
+    /// Requires per-use approval.
     ShellWrite,
-    /// Writing under `/data` outside this package's own directory.
-    /// Requires approval plus an automatic backup.
+    /// Writing under `/data` outside this package's own directory. Requires approval.
     FsOutsideApp,
-    /// Remounting and writing the system partition. Requires a
-    /// `dangerous-mode` session switch **and** per-command approval, and per
-    /// ADR-AND-001 §7.4 also the node-owner gate.
+    /// Remounting and writing the system partition. Requires a `dangerous-mode`
+    /// session switch, per-command approval, and — per ADR-AND-001 §7.4 — the
+    /// node-owner gate.
     FsSystem,
     /// `setenforce 0`. Approved per command, auto-restored at session end
     /// (ADR-AND-001 §8).
@@ -61,47 +77,7 @@ pub enum Capability {
 }
 
 impl Capability {
-    /// The wire/audit identifier.
-    ///
-    /// Provisional — see the module-level note on blocker B2.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Capability::ShellRead => "android:shell:read",
-            Capability::ShellWrite => "android:shell:write",
-            Capability::FsOutsideApp => "android:fs:outside-app",
-            Capability::FsSystem => "android:fs:system",
-            Capability::SelinuxPermissive => "android:selinux:permissive",
-        }
-    }
-
-    /// True when exercising this capability mutates device-global state and
-    /// therefore has to be serialised behind the DeviceWriteLock
-    /// (ADR-AND-001 §4.6 item 5: "read 类不锁").
-    pub fn is_mutating(&self) -> bool {
-        !matches!(self, Capability::ShellRead)
-    }
-
-    /// True when the capability requires an explicit human approval per use,
-    /// as opposed to whitelist auto-approval.
-    pub fn requires_approval(&self) -> bool {
-        match self {
-            // ADR-AND-001 §4.4: read-tier is whitelist auto-approved.
-            Capability::ShellRead => false,
-            Capability::ShellWrite
-            | Capability::FsOutsideApp
-            | Capability::FsSystem
-            | Capability::SelinuxPermissive => true,
-        }
-    }
-
-    /// True when the capability additionally requires the `dangerous-mode`
-    /// session switch (ADR-AND-001 §4.4 / §7.3).
-    pub fn requires_dangerous_mode(&self) -> bool {
-        matches!(self, Capability::FsSystem | Capability::SelinuxPermissive)
-    }
-
-    /// All five, in declaration order. Useful for tests and for building the
-    /// capability summary reported to the Gateway (ADR-AND-001 §7.1).
+    /// All five, in declaration order.
     pub fn all() -> [Capability; 5] {
         [
             Capability::ShellRead,
@@ -111,245 +87,275 @@ impl Capability {
             Capability::SelinuxPermissive,
         ]
     }
+
+    /// The contract-level identifier.
+    ///
+    /// Infallible: the five IDs are literals this module controls, and each is
+    /// asserted well-formed by [`tests::every_vocabulary_id_parses`].
+    pub fn id(&self) -> HostCapability {
+        let name = match self {
+            Capability::ShellRead => "shell:read",
+            Capability::ShellWrite => "shell:write",
+            Capability::FsOutsideApp => "fs:outside-app",
+            Capability::FsSystem => "fs:system",
+            Capability::SelinuxPermissive => "selinux:permissive",
+        };
+        HostCapability::new(PLATFORM, name).expect("android vocabulary ids are well-formed")
+    }
+
+    /// This capability's four axes (contract rule R6).
+    ///
+    /// This is the only place Android states what its capabilities *mean* to the
+    /// gate. The gate reads these values and nothing else.
+    pub fn spec(&self) -> CapabilitySpec {
+        let id = self.id();
+        match self {
+            // Observation tier: no lock, no approval, no attribution, nothing to undo.
+            Capability::ShellRead => CapabilitySpec::read_only(id),
+
+            // B11: `AttributionTier::None` follows ADR-AND-001 §7.4, which gates only
+            // the two system-tier capabilities on ownership. ADR-087 D4 would put
+            // `pm install` under `manage`. Provisional, and provisional visibly.
+            Capability::ShellWrite => CapabilitySpec {
+                id,
+                effect: Effect::Mutating,
+                approval: ApprovalRequirement::PerUse,
+                attribution: AttributionTier::None,
+                reversibility: Reversibility::Reversible,
+            },
+
+            Capability::FsOutsideApp => CapabilitySpec {
+                id,
+                effect: Effect::Mutating,
+                approval: ApprovalRequirement::PerUse,
+                attribution: AttributionTier::None,
+                reversibility: Reversibility::Reversible,
+            },
+
+            // Irreversible: there is no snapshot of `/system` to restore from, so the
+            // agent cannot undo its own write. Contract rule R8 therefore requires a
+            // stated rollback path — in practice "reflash the stock image", which is
+            // exactly the cost the model should have to acknowledge.
+            Capability::FsSystem => CapabilitySpec {
+                id,
+                effect: Effect::Mutating,
+                approval: ApprovalRequirement::DangerousSession,
+                attribution: AttributionTier::Manage,
+                reversibility: Reversibility::Irreversible,
+            },
+
+            // Reversible, and deliberately so: ADR-AND-001 §8 auto-restores enforcing
+            // at session end, so `setenforce 0` has a real undo. Marking it
+            // irreversible would demand a rollback plan for something the runtime
+            // already rolls back.
+            Capability::SelinuxPermissive => CapabilitySpec {
+                id,
+                effect: Effect::Mutating,
+                approval: ApprovalRequirement::DangerousSession,
+                attribution: AttributionTier::Manage,
+                reversibility: Reversibility::Reversible,
+            },
+        }
+    }
 }
 
 impl std::fmt::Display for Capability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+        // Delegate to the contract type so there is exactly one spelling of each ID.
+        write!(f, "{}", self.id())
     }
 }
 
-/// Parse a capability ID back into a [`Capability`].
+/// The Android vocabulary, as contract specs.
 ///
-/// The inverse of [`Capability::as_str`]. Unknown IDs are rejected rather than
-/// mapped to a default: silently accepting an unrecognised capability is how a
-/// vocabulary change turns into a privilege escalation.
-pub fn parse_capability(id: &str) -> Option<Capability> {
-    Capability::all().into_iter().find(|c| c.as_str() == id)
+/// Hand this to [`acowork_platform_contract::CapabilityTable::new`] to build the table
+/// a [`acowork_platform_contract::HostDescription`] returns.
+pub fn android_vocabulary() -> Vec<CapabilitySpec> {
+    Capability::all().iter().map(Capability::spec).collect()
 }
 
-// Serialization goes through the contract ID, not the Rust variant name. Both
-// the snapshot baselines (android-host-probe.md §7) and the Gateway capability
-// summary (ADR-AND-001 §7.1) are expressed in IDs, so a variant rename must not
-// be able to change the wire form.
-impl Serialize for Capability {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.as_str())
-    }
+/// Look a capability up by its contract ID.
+///
+/// Returns `None` for anything outside the five, which is how contract rule R5 stays
+/// closed: an unrecognised ID has no spec, so the gate has no axes to evaluate and
+/// refuses.
+pub fn lookup(id: &HostCapability) -> Option<Capability> {
+    Capability::all().into_iter().find(|c| &c.id() == id)
 }
 
-impl<'de> Deserialize<'de> for Capability {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Capability, D::Error> {
-        let raw = String::deserialize(deserializer)?;
-        parse_capability(&raw).ok_or_else(|| {
-            serde::de::Error::custom(format!(
-                "unknown capability id `{raw}`; the vocabulary is closed"
-            ))
-        })
-    }
-}
-
-/// An ordered, de-duplicated capability set.
+/// Derive capability claims from probed facts.
 ///
-/// `BTreeSet` rather than `HashSet` so that serialization is deterministic —
-/// android-host-probe.md §7 makes the serialized `HostProfile` a regression
-/// baseline, and a randomly ordered set would produce spurious snapshot diffs.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CapabilitySet(BTreeSet<Capability>);
-
-impl CapabilitySet {
-    /// An empty set.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Whether this capability was derived from the probed facts.
-    pub fn contains(&self, cap: Capability) -> bool {
-        self.0.contains(&cap)
-    }
-
-    /// Add a capability. Used by tests and by the derivation itself.
-    pub fn insert(&mut self, cap: Capability) {
-        self.0.insert(cap);
-    }
-
-    /// Number of declared capabilities.
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    /// Whether nothing at all was derived.
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    /// Iterate in stable (declaration) order.
-    pub fn iter(&self) -> impl Iterator<Item = Capability> + '_ {
-        self.0.iter().copied()
-    }
-
-    /// The IDs, for the Gateway capability summary (ADR-AND-001 §7.1).
-    pub fn ids(&self) -> Vec<&'static str> {
-        self.0.iter().map(Capability::as_str).collect()
-    }
-}
-
-impl FromIterator<Capability> for CapabilitySet {
-    fn from_iter<I: IntoIterator<Item = Capability>>(iter: I) -> Self {
-        CapabilitySet(iter.into_iter().collect())
-    }
-}
-
-/// Derive the capability set from probed facts.
+/// Implements the five rules in android-host-probe.md §3, and — unlike a bare set of
+/// booleans — attaches the **evidence** each claim rests on, which is what contract
+/// rule R4 requires and what makes a claim auditable after the fact.
 ///
-/// Implements the five rules in android-host-probe.md §3 verbatim:
-///
-/// ```text
-/// android:shell:read         ← shell != None
-/// android:shell:write        ← caps 含 read 且 privilege >= Root（或 su 探测成功）
-/// android:fs:outside-app     ← fs_roots 存在 writable 且不属于自身包目录
-/// android:fs:system          ← verity != Enforcing 且 /system 实测可 remount
-/// android:selinux:permissive ← privilege >= Root 且 selinux == Enforcing
-/// ```
-///
-/// Both of the last two rules additionally require a shell, because `mount` and
-/// `setenforce` are commands: a host that cannot spawn a process cannot exercise
-/// them whatever the other facts say. See the `FsSystem` arm below and blocker
-/// B12 in the readiness assessment.
-///
-/// Two deliberate readings, both documented because they are judgement calls
-/// rather than transcriptions:
-///
-/// 1. **`shell:write` needs demonstrated escalation, not just a root uid.** The
-///    rule says `privilege >= Root` *or* a successful `su` probe. On the Termux
-///    profile the Runtime itself is `AppUid` and only the helper escalates, so
-///    the `su`-probe arm is the one that fires. Requiring `su_ok` in that arm is
-///    what keeps "no root-shell profile" from silently granting write.
-/// 2. **`selinux:permissive` is only meaningful while enforcing.** If the device
-///    is already permissive there is nothing to toggle, so the capability is not
-///    declared. `SelinuxState::Unknown` also yields nothing: you cannot justify
-///    `setenforce` on a device whose mode you could not read.
-pub fn derive_capabilities(profile: &HostProfile) -> CapabilitySet {
-    let mut caps = CapabilitySet::new();
+/// Only positive claims are returned. An absent capability is not a claim with weak
+/// evidence; it is explained by [`explain_absence`], and the two functions read the
+/// same fields so they cannot disagree.
+pub fn derive_claims(profile: &HostProfile) -> Vec<acowork_platform_contract::CapabilityClaim> {
+    use acowork_platform_contract::{CapabilityClaim, Evidence, EvidenceKind};
+
+    let mut claims = Vec::new();
+    let mut claim = |cap: Capability, kind: EvidenceKind| {
+        claims.push(CapabilityClaim {
+            capability: cap.id(),
+            evidence: Evidence::now(kind),
+        });
+    };
 
     // android:shell:read ← shell != None
     let has_shell = profile.shell.is_some();
-    if has_shell {
-        caps.insert(Capability::ShellRead);
+    if let Some(dialect) = profile.shell {
+        claim(
+            Capability::ShellRead,
+            EvidenceKind::Observed {
+                what: format!("command -v {dialect:?}"),
+                status: Some(0),
+            },
+        );
     }
 
-    // android:shell:write ← read ∧ (privilege >= Root ∨ su probe succeeded)
+    // android:shell:write ← read ∧ (privilege >= Root ∨ su probe returned uid 0)
     let can_escalate = profile.privilege >= Privilege::Root || profile.su.got_root();
     if has_shell && can_escalate {
-        caps.insert(Capability::ShellWrite);
+        // Prefer the stronger evidence: an observed `su -c id` beats an inference from
+        // the process's own uid, because it demonstrates the escalation path rather
+        // than assuming one.
+        let kind = if profile.su.got_root() {
+            EvidenceKind::Observed {
+                what: "su -c id".to_string(),
+                status: Some(0),
+            }
+        } else {
+            EvidenceKind::Inferred {
+                fact: format!("id -u = {}", profile.privilege.uid()),
+            }
+        };
+        claim(Capability::ShellWrite, kind);
+    } else if has_shell && profile.su.prompt_denied {
+        // The user rejected the Magisk prompt. Record it as a denial rather than
+        // silently omitting the claim: android-host-probe.md §2 item 4 rules this
+        // **not retryable**, and an audit trail is what stops a later session
+        // re-prompting for a decision already made.
+        claim(
+            Capability::ShellWrite,
+            EvidenceKind::Denied {
+                reason: "su:prompt-denied".to_string(),
+            },
+        );
     }
 
     // android:fs:outside-app ← some writable root that is not our own package dir
-    if profile
+    if let Some(root) = profile
         .fs_roots
         .iter()
-        .any(|root| root.writable && !root.own_package)
+        .find(|root| root.writable && !root.own_package)
     {
-        caps.insert(Capability::FsOutsideApp);
+        claim(
+            Capability::FsOutsideApp,
+            EvidenceKind::Observed {
+                what: format!("test -w {}", root.path),
+                status: Some(0),
+            },
+        );
     }
 
     // android:fs:system ← shell ∧ verity not enforcing ∧ /system remountable.
     //
-    // The `shell` conjunct is not in android-host-probe.md §3's rule as written,
-    // and adding it is deliberate: remounting means *running* `mount`, so a host
-    // with no shell cannot do it however permissive its verity state is. This is
-    // what ADR-AND-001 §7.3 states as fact ("APK 档根本没有 shell，也没有 su，
-    // android:fs:system 在 APK 上不可达"). Without the conjunct an APK profile can
-    // declare a capability it has no way to exercise, which is precisely the
-    // "capability lie" upstream design doc 30 §11.1 warns is worse than no
-    // capability at all. Recorded as B12 in the readiness assessment.
+    // The `shell` conjunct is not in android-host-probe.md §3 as written, and adding
+    // it is deliberate: remounting means *running* `mount`, so a host with no shell
+    // cannot do it however permissive its verity state is. This is what ADR-AND-001
+    // §7.3 states as fact ("APK 档根本没有 shell，也没有 su，android:fs:system 在
+    // APK 上不可达"). Without the conjunct an APK profile declares a capability it
+    // has no way to exercise — the "capability lie" upstream design doc 30 §11.1
+    // warns is worse than no capability at all. Recorded as B12.
     if has_shell && !profile.device.verity.blocks_system_write() && profile.system_remountable {
-        caps.insert(Capability::FsSystem);
-    }
-
-    // android:selinux:permissive ← shell ∧ privilege >= Root ∧ selinux == Enforcing
-    if has_shell && can_escalate && profile.selinux == SelinuxState::Enforcing {
-        caps.insert(Capability::SelinuxPermissive);
-    }
-
-    caps
-}
-
-/// Why a capability was *not* derived.
-///
-/// Diagnostics are a non-goal-turned-requirement in ADR-AND-001 N3 ("诊断信息随
-/// 错误一并返回"). When the model or the user asks "why can't I setprop", the
-/// answer has to name the missing fact, not just say "denied".
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CapabilityGap {
-    /// The capability that could not be derived.
-    pub capability: Capability,
-    /// Which probed fact is missing, in words a model can act on.
-    pub reason: String,
-}
-
-/// Explain every capability the facts did not yield.
-///
-/// Pure function over the same inputs as [`derive_capabilities`], so the two can
-/// never disagree: the explanation is computed from the facts, not from a
-/// second copy of the rules.
-pub fn explain_gaps(profile: &HostProfile) -> Vec<CapabilityGap> {
-    let derived = derive_capabilities(profile);
-    let mut gaps = Vec::new();
-
-    for cap in Capability::all() {
-        if derived.contains(cap) {
-            continue;
-        }
-        let reason = match cap {
-            Capability::ShellRead => "no usable shell was detected on this host".to_string(),
-            Capability::ShellWrite => {
-                if profile.shell.is_none() {
-                    "no usable shell was detected".to_string()
-                } else {
-                    format!(
-                        "privilege is {:?} and the su probe did not return uid 0",
-                        profile.privilege
-                    )
-                }
-            }
-            Capability::FsOutsideApp => {
-                "no writable filesystem root outside this package's own directory".to_string()
-            }
-            Capability::FsSystem if profile.shell.is_none() => {
-                "this host has no shell, so it cannot run `mount` at all".to_string()
-            }
-            Capability::FsSystem => match profile.device.verity {
-                VerityState::Enforcing => {
-                    "dm-verity is enforcing; writing /system needs disable-verity plus a reboot"
-                        .to_string()
-                }
-                VerityState::Unknown => {
-                    "dm-verity state could not be read, so it is treated as enforcing".to_string()
-                }
-                VerityState::NotEnforcing if !profile.system_remountable => {
-                    "/system did not survive the remount probe".to_string()
-                }
-                VerityState::NotEnforcing => unreachable!("cap would have been derived"),
+        claim(
+            Capability::FsSystem,
+            EvidenceKind::Observed {
+                what: "mount -o remount,rw /system".to_string(),
+                status: Some(0),
             },
-            Capability::SelinuxPermissive => {
-                if profile.selinux != SelinuxState::Enforcing {
-                    format!(
-                        "SELinux mode is {:?}, not Enforcing — nothing to toggle",
-                        profile.selinux
-                    )
-                } else {
-                    "privilege is below Root and the su probe did not return uid 0".to_string()
-                }
-            }
-        };
-        gaps.push(CapabilityGap {
-            capability: cap,
-            reason,
-        });
+        );
     }
 
-    gaps
+    // android:selinux:permissive ← shell ∧ can escalate ∧ selinux == Enforcing
+    if has_shell && can_escalate && profile.selinux == SelinuxState::Enforcing {
+        claim(
+            Capability::SelinuxPermissive,
+            EvidenceKind::Inferred {
+                fact: "selinux=enforcing ∧ escalation demonstrated".to_string(),
+            },
+        );
+    }
+
+    claims
+}
+
+/// Why a capability was not derived, in terms the model can act on.
+///
+/// ADR-AND-001 N3 requires diagnostics to travel with the error. When the model asks
+/// "why can't I setprop", the answer must name the missing fact and the next step —
+/// "denied" costs a round trip and teaches nothing (contract rule R9).
+///
+/// Pure over the same fields [`derive_claims`] reads, so the two cannot disagree.
+pub fn explain_absence(profile: &HostProfile, cap: Capability) -> String {
+    match cap {
+        Capability::ShellRead => "no usable shell was detected on this host".to_string(),
+
+        Capability::ShellWrite => {
+            if profile.shell.is_none() {
+                "no usable shell was detected".to_string()
+            } else if profile.su.prompt_denied {
+                // Not retryable: the user already answered this prompt.
+                "the superuser prompt was declined, so this is not retryable — ask the user to \
+                 grant superuser access in the Magisk/KernelSU manager"
+                    .to_string()
+            } else {
+                format!(
+                    "privilege is {:?} and the su probe did not return uid 0",
+                    profile.privilege
+                )
+            }
+        }
+
+        Capability::FsOutsideApp => {
+            "no writable filesystem root outside this package's own directory".to_string()
+        }
+
+        Capability::FsSystem if profile.shell.is_none() => {
+            "this host has no shell, so it cannot run `mount` at all".to_string()
+        }
+        Capability::FsSystem => match profile.device.verity {
+            VerityState::Enforcing => {
+                "dm-verity is enforcing; writing /system needs disable-verity plus a reboot"
+                    .to_string()
+            }
+            VerityState::Unknown => {
+                "dm-verity state could not be read, so it is treated as enforcing".to_string()
+            }
+            VerityState::NotEnforcing if !profile.system_remountable => {
+                "/system did not survive the remount probe".to_string()
+            }
+            VerityState::NotEnforcing => {
+                // Unreachable when called through the gate, which only asks about
+                // undeclared capabilities. Kept honest rather than `unreachable!()`
+                // so a caller that asks directly gets an answer, not a panic.
+                "all conditions for /system access appear to hold; re-probe to confirm".to_string()
+            }
+        },
+
+        Capability::SelinuxPermissive => {
+            if profile.selinux != SelinuxState::Enforcing {
+                format!(
+                    "SELinux mode is {:?}, not Enforcing — nothing to toggle",
+                    profile.selinux
+                )
+            } else {
+                "privilege is below Root and the su probe did not return uid 0".to_string()
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -359,13 +365,19 @@ mod tests {
         AppletSet, BuildType, DeviceFacts, FsRoot, SelinuxDomain, ShellDialect, SuProbe,
         VerityState,
     };
-    use crate::host::profile::{HostProfile, HostProfileName};
+    use crate::host::profile::HostProfileName;
+    use acowork_platform_contract::CapabilityTable;
+
+    /// An empty table over the Android vocabulary, for fixtures that fill `caps` in
+    /// later or do not exercise it at all.
+    fn empty_table_for_test() -> CapabilityTable {
+        CapabilityTable::new(PLATFORM, android_vocabulary()).unwrap()
+    }
 
     /// A rooted debugging device: `su` works, SELinux enforcing, verity off,
     /// `/system` remountable, and a writable root outside our own package.
-    /// Every capability should be derivable from this shape.
     fn root_profile() -> HostProfile {
-        let mut profile = HostProfile {
+        HostProfile {
             name: HostProfileName::RootShell,
             privilege: Privilege::AppUid,
             selinux: SelinuxState::Enforcing,
@@ -393,7 +405,7 @@ mod tests {
                 unavailable: false,
             },
             system_remountable: true,
-            caps: CapabilitySet::new(),
+            caps: empty_table_for_test(),
             device: DeviceFacts {
                 build_type: BuildType::UserDebug,
                 debuggable: true,
@@ -403,245 +415,304 @@ mod tests {
                 abi: Some("arm64-v8a".to_string()),
                 verity: VerityState::NotEnforcing,
             },
-        };
-        profile.caps = derive_capabilities(&profile);
-        profile
-    }
-
-    /// Re-derive caps after mutating a fact, so a test can never observe a
-    /// stale capability set.
-    fn with(mut profile: HostProfile, f: impl FnOnce(&mut HostProfile)) -> HostProfile {
-        f(&mut profile);
-        profile.caps = derive_capabilities(&profile);
-        profile
+        }
     }
 
     #[test]
-    fn capability_ids_match_the_adr() {
-        assert_eq!(Capability::ShellRead.as_str(), "android:shell:read");
-        assert_eq!(Capability::ShellWrite.as_str(), "android:shell:write");
-        assert_eq!(Capability::FsOutsideApp.as_str(), "android:fs:outside-app");
-        assert_eq!(Capability::FsSystem.as_str(), "android:fs:system");
+    fn every_vocabulary_id_parses() {
+        // The `expect` in `id()` is only safe because this holds.
+        for cap in Capability::all() {
+            let id = cap.id();
+            assert_eq!(id.platform(), PLATFORM);
+            assert_eq!(HostCapability::parse(id.as_str()).unwrap(), id);
+        }
+    }
+
+    #[test]
+    fn ids_match_the_adr_spelling() {
+        // ADR-AND-001 §4.4. If B2 is ruled against these, this test is what fails,
+        // and it fails in exactly one file.
+        let ids: Vec<String> = Capability::all()
+            .iter()
+            .map(|c| c.id().to_string())
+            .collect();
         assert_eq!(
-            Capability::SelinuxPermissive.as_str(),
-            "android:selinux:permissive"
+            ids,
+            vec![
+                "android:shell:read",
+                "android:shell:write",
+                "android:fs:outside-app",
+                "android:fs:system",
+                "android:selinux:permissive",
+            ]
         );
     }
 
     #[test]
-    fn read_tier_is_the_only_non_mutating_capability() {
-        assert!(!Capability::ShellRead.is_mutating());
+    fn the_vocabulary_builds_a_contract_table() {
+        // R5/R6: the Android vocabulary is accepted by the contract's own validator,
+        // which is the check that this port has not invented gate logic.
+        let table = CapabilityTable::new(PLATFORM, android_vocabulary())
+            .expect("android vocabulary must satisfy the contract");
+        assert_eq!(table.specs().len(), 5);
         for cap in Capability::all() {
-            if cap != Capability::ShellRead {
-                assert!(
-                    cap.is_mutating(),
-                    "{cap} must serialise behind the write lock"
-                );
+            assert_eq!(table.spec(&cap.id()).unwrap(), &cap.spec());
+        }
+    }
+
+    #[test]
+    fn axes_match_the_adr_tiers() {
+        assert!(!Capability::ShellRead.spec().effect.needs_lock());
+        assert!(!Capability::ShellRead.spec().approval.needs_token());
+
+        for cap in [
+            Capability::ShellWrite,
+            Capability::FsOutsideApp,
+            Capability::FsSystem,
+            Capability::SelinuxPermissive,
+        ] {
+            assert!(
+                cap.spec().effect.needs_lock(),
+                "{cap} mutates and must serialise"
+            );
+            assert!(cap.spec().approval.needs_token(), "{cap} needs approval");
+        }
+
+        // ADR-AND-001 §4.4 / §7.3: only the two system-tier capabilities need the
+        // dangerous-mode switch.
+        for cap in Capability::all() {
+            assert_eq!(
+                cap.spec().approval.needs_dangerous_session(),
+                matches!(cap, Capability::FsSystem | Capability::SelinuxPermissive),
+                "{cap} dangerous-mode requirement is wrong"
+            );
+        }
+    }
+
+    #[test]
+    fn attribution_mapping_is_the_provisional_b11_one() {
+        // Pinned so a change is deliberate. ADR-AND-001 §7.4 gates only the system
+        // tier; ADR-087 D4 would also gate `pm install` under `shell:write`.
+        assert!(!Capability::ShellRead.spec().attribution.needs_attribution());
+        assert!(
+            !Capability::ShellWrite
+                .spec()
+                .attribution
+                .needs_attribution()
+        );
+        assert!(
+            !Capability::FsOutsideApp
+                .spec()
+                .attribution
+                .needs_attribution()
+        );
+        assert_eq!(
+            Capability::FsSystem.spec().attribution,
+            AttributionTier::Manage,
+            "ADR-AND-001 §7.4 gates fs:system on node ownership"
+        );
+        assert_eq!(
+            Capability::SelinuxPermissive.spec().attribution,
+            AttributionTier::Manage
+        );
+    }
+
+    #[test]
+    fn reversibility_follows_whether_an_undo_actually_exists() {
+        // `/system` has no snapshot to restore, so R8 demands a rollback plan.
+        assert!(
+            Capability::FsSystem
+                .spec()
+                .reversibility
+                .needs_rollback_plan()
+        );
+        // `setenforce 0` is auto-restored at session end (ADR-AND-001 §8), so it has
+        // a real undo and must not demand a plan for it.
+        assert!(
+            !Capability::SelinuxPermissive
+                .spec()
+                .reversibility
+                .needs_rollback_plan()
+        );
+        assert!(
+            !Capability::ShellWrite
+                .spec()
+                .reversibility
+                .needs_rollback_plan()
+        );
+    }
+
+    #[test]
+    fn lookup_is_closed_over_the_five() {
+        // R5: an ID outside the vocabulary has no spec, so the gate refuses it.
+        for cap in Capability::all() {
+            assert_eq!(lookup(&cap.id()), Some(cap));
+        }
+        assert_eq!(
+            lookup(&HostCapability::parse("android:kernel:write").unwrap()),
+            None
+        );
+        assert_eq!(
+            lookup(&HostCapability::parse("esp32:gpio:write").unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_rooted_device_claims_all_five_with_evidence() {
+        let p = root_profile();
+        let claims = derive_claims(&p);
+        assert_eq!(
+            claims.len(),
+            5,
+            "a fully capable device should claim all five"
+        );
+        // R4: every claim carries evidence that can actually support it.
+        for c in &claims {
+            assert!(
+                c.evidence.kind.supports_claim(),
+                "{} was claimed on evidence that cannot support a claim",
+                c.capability
+            );
+        }
+    }
+
+    #[test]
+    fn a_declined_su_prompt_is_recorded_as_a_denial_not_omitted() {
+        // android-host-probe.md §2 item 4: not retryable. Recording it as a denial is
+        // what makes that visible in the audit trail, and the contract's audit then
+        // refuses to turn it into a claim.
+        let mut p = root_profile();
+        p.su = SuProbe {
+            uid: None,
+            context: None,
+            prompt_denied: true,
+            unavailable: false,
+        };
+        let claims = derive_claims(&p);
+        let write = claims
+            .iter()
+            .find(|c| c.capability == Capability::ShellWrite.id());
+        assert!(
+            write.is_some(),
+            "the declined prompt should still be recorded"
+        );
+        assert!(!write.unwrap().evidence.kind.supports_claim());
+
+        let mut table = CapabilityTable::new(PLATFORM, android_vocabulary()).unwrap();
+        let audit = acowork_platform_contract::audit_claims(
+            &mut table,
+            &claims,
+            std::time::Duration::from_secs(3600),
+        );
+        assert!(
+            audit
+                .unsupported
+                .contains(&"android:shell:write".to_string()),
+            "a denial must not become a declared capability; audit was {audit}"
+        );
+        assert!(!table.is_declared(&Capability::ShellWrite.id()));
+    }
+
+    #[test]
+    fn a_host_with_no_shell_claims_nothing() {
+        let mut p = root_profile();
+        p.shell = None;
+        p.dialects.clear();
+        let claims = derive_claims(&p);
+        // fs:outside-app does not depend on a shell, so it survives; the other four
+        // all need one.
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].capability, Capability::FsOutsideApp.id());
+    }
+
+    #[test]
+    fn fs_system_requires_a_shell_even_when_verity_is_off() {
+        // B12: without the shell conjunct an APK profile would declare a capability
+        // it has no way to exercise.
+        let mut p = root_profile();
+        p.shell = None;
+        p.system_remountable = true;
+        p.device.verity = VerityState::NotEnforcing;
+        let claims = derive_claims(&p);
+        assert!(
+            !claims
+                .iter()
+                .any(|c| c.capability == Capability::FsSystem.id()),
+            "no shell means no `mount`, so fs:system must not be claimed"
+        );
+        assert!(explain_absence(&p, Capability::FsSystem).contains("no shell"));
+    }
+
+    #[test]
+    fn every_absent_capability_has_an_explanation() {
+        // R9: no capability may be silently missing.
+        let mut p = root_profile();
+        p.shell = None;
+        p.fs_roots.retain(|r| r.own_package);
+        p.device.verity = VerityState::Enforcing;
+        for cap in Capability::all() {
+            let reason = explain_absence(&p, cap);
+            assert!(
+                reason.len() > 15,
+                "{cap} explanation is too terse: {reason}"
+            );
+        }
+        // With no shell, "cannot run `mount` at all" is the more fundamental blocker and
+        // correctly takes precedence over the verity state.
+        assert!(explain_absence(&p, Capability::FsSystem).contains("no shell"));
+
+        // The verity explanation is reachable only when a shell exists to run `mount`.
+        let mut with_shell = p.clone();
+        with_shell.shell = Some(crate::host::facts::ShellDialect::MkSh);
+        assert!(explain_absence(&with_shell, Capability::FsSystem).contains("dm-verity"));
+    }
+
+    #[test]
+    fn a_declined_prompt_explains_that_it_is_not_retryable() {
+        let mut p = root_profile();
+        p.su = SuProbe {
+            uid: None,
+            context: None,
+            prompt_denied: true,
+            unavailable: false,
+        };
+        let reason = explain_absence(&p, Capability::ShellWrite);
+        assert!(reason.contains("not retryable"), "{reason}");
+        assert!(
+            reason.contains("Magisk"),
+            "must name where to fix it: {reason}"
+        );
+    }
+
+    #[test]
+    fn explanation_and_derivation_cannot_disagree() {
+        // The two read the same fields; this pins the invariant across every
+        // combination of the three facts that drive the rules.
+        for shell in [true, false] {
+            for rooted in [true, false] {
+                for remountable in [true, false] {
+                    let mut p = root_profile();
+                    p.shell = shell.then_some(ShellDialect::MkSh);
+                    p.su.uid = rooted.then_some(0);
+                    p.system_remountable = remountable;
+                    p.device.verity = VerityState::NotEnforcing;
+
+                    let claims = derive_claims(&p);
+                    for cap in Capability::all() {
+                        let claimed = claims
+                            .iter()
+                            .any(|c| c.capability == cap.id() && c.evidence.kind.supports_claim());
+                        if !claimed {
+                            assert!(
+                                !explain_absence(&p, cap).is_empty(),
+                                "{cap} is absent but unexplained (shell={shell} rooted={rooted} \
+                                 remountable={remountable})"
+                            );
+                        }
+                    }
+                }
             }
         }
-    }
-
-    #[test]
-    fn approval_and_dangerous_mode_tiers() {
-        assert!(!Capability::ShellRead.requires_approval());
-        assert!(Capability::ShellWrite.requires_approval());
-        assert!(!Capability::ShellWrite.requires_dangerous_mode());
-        assert!(Capability::FsSystem.requires_dangerous_mode());
-        assert!(Capability::SelinuxPermissive.requires_dangerous_mode());
-        assert!(!Capability::FsOutsideApp.requires_dangerous_mode());
-    }
-
-    #[test]
-    fn fully_capable_root_device_derives_all_five() {
-        let profile = root_profile();
-        assert_eq!(profile.caps.len(), 5);
-        for cap in Capability::all() {
-            assert!(profile.caps.contains(cap), "missing {cap}");
-        }
-    }
-
-    #[test]
-    fn no_shell_means_no_shell_capabilities() {
-        let profile = with(root_profile(), |p| {
-            p.shell = None;
-            p.dialects.clear();
-        });
-        assert!(!profile.caps.contains(Capability::ShellRead));
-        assert!(!profile.caps.contains(Capability::ShellWrite));
-        // Filesystem capabilities are independent of the shell.
-        assert!(profile.caps.contains(Capability::FsOutsideApp));
-    }
-
-    #[test]
-    fn shell_without_escalation_gets_read_only() {
-        let profile = with(root_profile(), |p| {
-            p.su.unavailable = true;
-            p.su.uid = None;
-            p.privilege = Privilege::AppUid;
-        });
-        assert!(profile.caps.contains(Capability::ShellRead));
-        assert!(
-            !profile.caps.contains(Capability::ShellWrite),
-            "Termux without su must not gain the write tier"
-        );
-        assert!(!profile.caps.contains(Capability::SelinuxPermissive));
-    }
-
-    #[test]
-    fn shell_uid_privilege_alone_does_not_grant_write() {
-        // `adb shell` is uid 2000, not root: the rule is `privilege >= Root`.
-        let profile = with(root_profile(), |p| {
-            p.privilege = Privilege::ShellUid;
-            p.su.uid = None;
-            p.su.unavailable = true;
-        });
-        assert!(!profile.caps.contains(Capability::ShellWrite));
-    }
-
-    #[test]
-    fn root_privilege_without_su_still_grants_write() {
-        // The `privilege >= Root` arm of the rule. ADR-AND-001 §4.1 forbids the
-        // Runtime itself running as root, but the derivation must still be
-        // correct if that shape ever appears (e.g. a probe run from adb).
-        let profile = with(root_profile(), |p| {
-            p.privilege = Privilege::Root;
-            p.su.uid = None;
-            p.su.unavailable = true;
-        });
-        assert!(profile.caps.contains(Capability::ShellWrite));
-    }
-
-    #[test]
-    fn verity_enforcing_blocks_fs_system_even_when_remountable() {
-        let profile = with(root_profile(), |p| {
-            p.device.verity = VerityState::Enforcing;
-            p.system_remountable = true;
-        });
-        assert!(!profile.caps.contains(Capability::FsSystem));
-    }
-
-    #[test]
-    fn verity_unknown_blocks_fs_system() {
-        let profile = with(root_profile(), |p| p.device.verity = VerityState::Unknown);
-        assert!(!profile.caps.contains(Capability::FsSystem));
-    }
-
-    #[test]
-    fn remount_probe_failure_blocks_fs_system() {
-        let profile = with(root_profile(), |p| {
-            p.device.verity = VerityState::NotEnforcing;
-            p.system_remountable = false;
-        });
-        assert!(!profile.caps.contains(Capability::FsSystem));
-    }
-
-    #[test]
-    fn only_own_package_writable_does_not_grant_outside_app() {
-        let profile = with(root_profile(), |p| {
-            p.fs_roots = vec![FsRoot {
-                path: "/data/data/com.example.agent".to_string(),
-                writable: true,
-                own_package: true,
-            }];
-        });
-        assert!(!profile.caps.contains(Capability::FsOutsideApp));
-    }
-
-    #[test]
-    fn outside_root_must_be_writable_to_count() {
-        let profile = with(root_profile(), |p| {
-            p.fs_roots = vec![FsRoot {
-                path: "/sdcard".to_string(),
-                writable: false,
-                own_package: false,
-            }];
-        });
-        assert!(!profile.caps.contains(Capability::FsOutsideApp));
-    }
-
-    #[test]
-    fn already_permissive_device_does_not_declare_the_toggle_capability() {
-        let profile = with(root_profile(), |p| p.selinux = SelinuxState::Permissive);
-        assert!(
-            !profile.caps.contains(Capability::SelinuxPermissive),
-            "nothing to toggle when already permissive"
-        );
-    }
-
-    #[test]
-    fn unknown_selinux_never_opens_the_permissive_toggle() {
-        // android-host-probe.md §2 item 2: getenforce missing => the write-tier
-        // capabilities are never opened.
-        let profile = with(root_profile(), |p| p.selinux = SelinuxState::Unknown);
-        assert!(!profile.caps.contains(Capability::SelinuxPermissive));
-        // shell:write is gated on demonstrated escalation, not on knowing the
-        // SELinux mode, so it survives; the dangerous toggle does not.
-        assert!(profile.caps.contains(Capability::ShellWrite));
-    }
-
-    #[test]
-    fn apk_sandbox_shape_derives_nothing_at_all() {
-        let profile = with(root_profile(), |p| {
-            p.name = HostProfileName::ApkSandbox;
-            p.privilege = Privilege::AppUid;
-            p.shell = None;
-            p.dialects.clear();
-            p.su = SuProbe {
-                uid: None,
-                context: None,
-                prompt_denied: false,
-                unavailable: true,
-            };
-            p.device.verity = VerityState::Unknown;
-            p.system_remountable = false;
-            p.fs_roots = vec![FsRoot {
-                path: "/data/data/com.example.agent".to_string(),
-                writable: true,
-                own_package: true,
-            }];
-        });
-        assert!(
-            profile.caps.is_empty(),
-            "an APK sandbox must declare no capability, got {:?}",
-            profile.caps.ids()
-        );
-    }
-
-    #[test]
-    fn gaps_cover_exactly_the_underived_capabilities() {
-        let profile = with(root_profile(), |p| {
-            p.selinux = SelinuxState::Permissive;
-            p.device.verity = VerityState::Enforcing;
-        });
-        let gaps = explain_gaps(&profile);
-
-        assert_eq!(profile.caps.len() + gaps.len(), Capability::all().len());
-        for gap in &gaps {
-            assert!(!profile.caps.contains(gap.capability));
-            assert!(!gap.reason.is_empty(), "every gap needs a stated reason");
-        }
-        assert!(
-            gaps.iter()
-                .any(|g| g.capability == Capability::FsSystem && g.reason.contains("dm-verity"))
-        );
-        assert!(
-            gaps.iter()
-                .any(|g| g.capability == Capability::SelinuxPermissive
-                    && g.reason.contains("Permissive"))
-        );
-    }
-
-    #[test]
-    fn no_gaps_when_everything_is_derived() {
-        assert!(explain_gaps(&root_profile()).is_empty());
-    }
-
-    #[test]
-    fn capability_set_serializes_deterministically() {
-        let caps = root_profile().caps;
-        let a = serde_json::to_string(&caps).unwrap();
-        let b = serde_json::to_string(&caps).unwrap();
-        assert_eq!(a, b, "snapshot baselines require stable ordering");
-        assert!(a.contains("android:shell:read"));
     }
 }

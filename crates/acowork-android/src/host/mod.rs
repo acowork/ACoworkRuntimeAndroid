@@ -52,12 +52,14 @@ pub mod probe;
 pub mod profile;
 
 pub use backend::{
-    ApprovalToken, AttributionTier, AttributionVerdict, AuthorizationContext, BackendError, Denial,
-    DeviceWriteLock, ExecOutput, ExecRequest, ExecutionBackend, Grant, LocalReadiness, LockOutcome,
-    WRITE_LOCK_TTL, authorize,
+    ApprovalToken, BackendError, ContractBackend, DEFAULT_OUTPUT_CAP, DEFAULT_READ_TIMEOUT,
+    ExecRecord, ExecRequest, ExecutionBackend, SessionLockOutcome, SessionWriteLock,
+    WRITE_LOCK_TTL,
 };
-pub use capability::{Capability, CapabilityGap, CapabilitySet, derive_capabilities, explain_gaps};
-pub use denial::{DenialHint, DenialLedger, SelinuxDenial, classify, parse_denials};
+pub use capability::{
+    Capability, PLATFORM, android_vocabulary, derive_claims, explain_absence, lookup,
+};
+pub use denial::{DenialLedger, SelinuxClassifier, SelinuxDenial, classify, parse_denials};
 pub use facts::{
     AppletSet, BuildType, DeviceFacts, FsRoot, MountEntry, Privilege, SelinuxDomain, SelinuxState,
     ShellDialect, SuProbe, VerityState, parse_bool_prop, parse_mount_table, parse_prop,
