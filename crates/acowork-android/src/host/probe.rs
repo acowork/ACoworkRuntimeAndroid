@@ -40,6 +40,18 @@ pub const PROBE_TOTAL_BUDGET: Duration = Duration::from_secs(2);
 /// in general, so the list has to stay short enough that each entry is defensible. These ten
 /// are the ones the Android debugging toolset (ADR-AND-001 §4.6 item 6) and the write tier
 /// actually invoke.
+///
+/// Within that, a name earns its slot by being one no other probe item **already proves**.
+/// `logcat`, `dumpsys`, `getprop`, `am`, `pm`, `input`, `screencap` and `settings` are
+/// standalone `/system/bin` binaries on the one real device this has been run against, and
+/// none appears in `toybox --list`. `mount` was the only name here that another item
+/// executes for its own reasons — item 7 runs `mount` and parses the table — so its slot was
+/// buying a second answer to a question item 7 has already answered by running the thing.
+/// `settings` took it: named outright by §4.4's write row, invisible to every listing.
+///
+/// `ps` and `setprop` stay even though the listing shows them here. A listing is a claim
+/// about a dispatcher's own table; `command -v` is a claim about the filesystem the shell
+/// will actually resolve against, and whether the two agree is a device-dependent accident.
 pub const SPOT_CHECK_APPLETS: [&str; 10] = [
     "logcat",
     "dumpsys",
@@ -49,7 +61,7 @@ pub const SPOT_CHECK_APPLETS: [&str; 10] = [
     "pm",
     "input",
     "screencap",
-    "mount",
+    "settings",
     "ps",
 ];
 
@@ -615,7 +627,7 @@ mod tests {
 
     #[test]
     fn spot_checks_confirm_the_commands_an_applet_listing_cannot_see() {
-        // Verbatim from a Huawei BLA-AL00 (API 29) through `adb shell`. Seven of these ten
+        // Verbatim from a Huawei BLA-AL00 (API 29) through `adb shell`. Eight of these ten
         // names do not appear anywhere in that device's 194-applet `toybox` listing, because
         // they are standalone `/system/bin` binaries rather than applets. A profile built
         // from the listing alone reports the entire read surface as absent.
@@ -628,7 +640,7 @@ SPOT am rc=0 path=/system/bin/am
 SPOT pm rc=0 path=/system/bin/pm
 SPOT input rc=0 path=/system/bin/input
 SPOT screencap rc=0 path=/system/bin/screencap
-SPOT mount rc=0 path=/system/bin/mount
+SPOT settings rc=0 path=/system/bin/settings
 SPOT ps rc=0 path=/system/bin/ps
 ";
         let checks = parse_spot_checks(device_output);
@@ -689,7 +701,7 @@ SPOT ps rc=0 path=/system/bin/ps
             "WARNING: shell noise\n\
              logcat: something\n\
              SPOT logcat rc=ok path=/system/bin/logcat\n\
-             SPOT ps rc=0 path=/system/bin/ps\n",
+             SPOT settings rc=0 path=/system/bin/settings\n",
         );
         assert_eq!(checks.len(), 2);
         assert!(!checks["logcat"].succeeded());
@@ -697,7 +709,7 @@ SPOT ps rc=0 path=/system/bin/ps
             checks["logcat"].exit_code.is_none(),
             "unparseable status = no result"
         );
-        assert!(checks["ps"].succeeded());
+        assert!(checks["settings"].succeeded());
     }
 
     #[test]

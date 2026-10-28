@@ -193,8 +193,9 @@ fn the_applet_listing_survives_the_real_typography() {
 #[test]
 fn the_read_surface_exists_on_the_device_where_only_item_6c_can_see_it() {
     // ADR-AND-001 §4.4 defines the read allow-list as getprop / dumpsys / logcat / ps / df /
-    // mount / getenforce. On this device seven of those tools are standalone `/system/bin`
-    // binaries that appear in none of the 194 listed applets. Before item 6c the listings
+    // mount / getenforce, and its write row names settings. On this device eight of those
+    // tools are standalone `/system/bin` binaries that appear in none of the 194 listed
+    // applets. Before item 6c the listings
     // were the *only* source of command presence, so a profile assembled from this device
     // declared absent the exact surface this port exists to offer — and the hand-written
     // fixtures, which listed `logcat` as an applet, kept the two sources from being told
@@ -216,6 +217,7 @@ fn the_read_surface_exists_on_the_device_where_only_item_6c_can_see_it() {
         "pm",
         "input",
         "screencap",
+        "settings",
     ] {
         assert!(
             !listed.contains(name),
@@ -228,8 +230,9 @@ fn the_read_surface_exists_on_the_device_where_only_item_6c_can_see_it() {
         );
     }
 
-    // The ones that genuinely are applets are present through both sources, which is the
-    // expected overlap rather than a contradiction.
+    // `mount` is an applet here, and item 7 proves it by executing it, so it no longer takes
+    // a spot-check slot. `ps` is an applet and is still asked about: the two sources agree,
+    // which is the expected overlap rather than a contradiction.
     assert!(listed.contains("mount") && profile.applets.contains("mount"));
     assert!(listed.contains("ps") && profile.applets.contains("ps"));
 }

@@ -84,12 +84,6 @@
       "exit_code": 0,
       "timed_out": false
     },
-    "mount": {
-      "stdout": "/system/bin/mount",
-      "stderr": "",
-      "exit_code": 0,
-      "timed_out": false
-    },
     "pm": {
       "stdout": "/system/bin/pm",
       "stderr": "",
@@ -110,6 +104,12 @@
     },
     "setprop": {
       "stdout": "/system/bin/setprop",
+      "stderr": "",
+      "exit_code": 0,
+      "timed_out": false
+    },
+    "settings": {
+      "stdout": "/system/bin/settings",
       "stderr": "",
       "exit_code": 0,
       "timed_out": false
