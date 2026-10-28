@@ -1090,6 +1090,7 @@ fn r12_the_contract_projection_carries_no_posix_vocabulary() {
         context: Some("u:r:magisk:s0".to_string()),
         duration_ms: 12,
         truncated: false,
+        timed_out: false,
     };
     let outcome = record.to_contract();
     let json = serde_json::to_string(&outcome).unwrap();
@@ -1115,6 +1116,7 @@ fn r12_a_killed_process_is_not_spelled_as_a_signal() {
         context: None,
         duration_ms: 30_000,
         truncated: false,
+        timed_out: false,
     };
     assert_eq!(record.to_contract().result, Ok(ExitStatus::Terminated));
     assert!(!record.to_contract().succeeded());
@@ -1189,24 +1191,28 @@ fn r13_no_baseline_leaks_device_detail_in_its_summary() {
             );
         }
         // The summary has exactly the five designed fields.
+        //
+        // Compared as a set, not in declaration order: the invariant is "no field appeared or
+        // disappeared", and asserting the order would couple this test to whether the parent
+        // workspace turns on serde_json's `preserve_order`. A shape check that changes result
+        // with a serialisation feature is measuring the feature, not the summary.
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let keys: Vec<&str> = value
+        let mut keys: Vec<&str> = value
             .as_object()
             .unwrap()
             .keys()
             .map(String::as_str)
             .collect();
-        assert_eq!(
-            keys,
-            vec![
-                "platform",
-                "profile",
-                "privilege",
-                "escalation",
-                "capabilities"
-            ],
-            "{name} summary shape changed: {json}"
-        );
+        keys.sort_unstable();
+        let mut want = vec![
+            "capabilities",
+            "escalation",
+            "platform",
+            "privilege",
+            "profile",
+        ];
+        want.sort_unstable();
+        assert_eq!(keys, want, "{name} summary shape changed: {json}");
         // And it still carries what the control plane legitimately needs.
         assert!(json.contains("android"), "{json}");
     }

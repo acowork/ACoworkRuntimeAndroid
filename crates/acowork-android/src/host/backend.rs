@@ -224,6 +224,21 @@ pub struct ExecRecord {
     pub duration_ms: u64,
     /// True when either stream hit [`Budget::output_cap`].
     pub truncated: bool,
+    /// True when the process was killed for exceeding [`Budget::timeout`].
+    ///
+    /// This lives on the record rather than being returned as a `BackendError` because a
+    /// timed-out command still produced evidence: partial stdout, whatever stderr said, and
+    /// — since [`script`](super::script) puts the identity prologue *first* — proof of which
+    /// uid and SELinux domain ran it. Routing a timeout through the error channel would
+    /// discard exactly the information that makes a hang auditable, and would leave the
+    /// caller unable to answer "what did it manage to do before you killed it".
+    ///
+    /// The contract already has this shape: [`ExecOutcome::result`] is a `Result` *inside* a
+    /// struct that carries both streams. `timed_out` is what lets the Android record project
+    /// onto it faithfully, with [`ExecRecord::exit_code`] `None` meaning "we do not know how
+    /// it ended" rather than "it ran out of time" — those two are different facts and a
+    /// caller may need to tell them apart.
+    pub timed_out: bool,
 }
 
 impl ExecRecord {
@@ -242,12 +257,18 @@ impl ExecRecord {
     ///
     /// Lossy by design: the uid, context, denial records and duration stay on the
     /// device, because the contract's shape has no field for them and rule R13 keeps
-    /// them off the wire anyway.
+    /// them off the wire anyway. `timed_out` is the deliberate exception — the contract
+    /// *does* model it, as `Err(ExecutionError::TimedOut)` inside a result that still
+    /// carries both streams, which is the shape this field exists to reproduce.
     pub fn to_contract(&self) -> ExecOutcome {
-        let result = match self.exit_code {
-            Some(code) => Ok(ExitStatus::Code(code)),
-            // No exit code means the process was killed rather than exiting.
-            None => Ok(ExitStatus::Terminated),
+        let result = if self.timed_out {
+            Err(ExecutionError::TimedOut)
+        } else {
+            match self.exit_code {
+                Some(code) => Ok(ExitStatus::Code(code)),
+                // No exit code means the process was killed rather than exiting.
+                None => Ok(ExitStatus::Terminated),
+            }
         };
         ExecOutcome {
             result,
@@ -267,14 +288,33 @@ impl ExecRecord {
 ///
 /// Distinct from a non-zero exit code: this is the backend failing to run the thing at
 /// all. Carries diagnostics because "it failed" is actionable for nobody.
+///
+/// Note what is *not* here. A timeout is not an error variant — it is
+/// [`ExecRecord::timed_out`], because a killed command still returns output and an identity,
+/// and the record is the only channel that can carry them. Likewise, a command that ran and
+/// exited non-zero is not an error: that is the script's answer, not the backend's.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BackendError {
     /// The privileged helper could not be reached: no `su`, or the prompt was denied.
     EscalationUnavailable(String),
-    /// The command ran past its timeout and was killed.
-    TimedOut {
-        /// How long it ran before being killed.
-        after: Duration,
+    /// The backend asked for privilege and did not get it.
+    ///
+    /// A [`RootShellBackend`](super::backend) exists to run a script as uid 0. If the
+    /// identity that actually ran it is not uid 0 — Magisk configured to grant shell
+    /// instead of root, a `su` that silently falls through, a policy that demotes the
+    /// child — then the script ran, but not as the thing the caller asked for, and its
+    /// result cannot be trusted for a privileged operation. Reporting that as a plain
+    /// success with a non-zero exit code would let a silently unprivileged run look like
+    /// an ordinary command failure.
+    ///
+    /// This is the check ADR-AND-001 §7.4 asks for: escalation is only real if it is
+    /// *proved*, and the proof is the uid and domain observed inside the script.
+    PrivilegeNotGranted {
+        /// uid that actually ran the script, when the identity probe produced one.
+        observed_uid: Option<u32>,
+        /// SELinux domain that actually ran it, when the probe produced one. A uid of 0
+        /// in an unprivileged domain is still not the privilege that was asked for.
+        observed_context: Option<String>,
     },
     /// The backend itself broke: spawn failure, I/O error.
     Backend(String),
@@ -287,7 +327,13 @@ impl BackendError {
             BackendError::EscalationUnavailable(why) => {
                 ExecutionError::BackendUnavailable(why.clone())
             }
-            BackendError::TimedOut { .. } => ExecutionError::TimedOut,
+            BackendError::PrivilegeNotGranted {
+                observed_uid,
+                observed_context,
+            } => ExecutionError::BackendUnavailable(format!(
+                "privilege was asked for but not granted: ran as uid {observed_uid:?} in \
+                 context {observed_context:?}"
+            )),
             BackendError::Backend(why) => ExecutionError::Rejected(why.clone()),
         }
     }
@@ -299,9 +345,15 @@ impl std::fmt::Display for BackendError {
             BackendError::EscalationUnavailable(why) => {
                 write!(f, "privilege escalation unavailable: {why}")
             }
-            BackendError::TimedOut { after } => {
-                write!(f, "command timed out after {}ms", after.as_millis())
-            }
+            BackendError::PrivilegeNotGranted {
+                observed_uid,
+                observed_context,
+            } => write!(
+                f,
+                "asked to run as root, ran as uid {observed_uid:?} in context \
+                 {observed_context:?}: the su grant did not deliver uid 0, so this result \
+                 must not be treated as a privileged one"
+            ),
             BackendError::Backend(why) => write!(f, "execution backend failed: {why}"),
         }
     }
@@ -339,7 +391,9 @@ pub trait ExecutionBackend: Send + Sync {
     ///   silent privilege drop is detectable;
     /// - run stderr through [`crate::host::denial::parse_denials`] before returning, so
     ///   callers never re-parse;
-    /// - honour `request.budget.timeout` and report it as [`BackendError::TimedOut`];
+    /// - honour `request.budget.timeout`, and when it fires report it as
+    ///   [`ExecRecord::timed_out`] with the partial output and the observed identity
+    ///   intact — **not** as a [`BackendError`], which would discard the evidence;
     /// - honour `request.budget.output_cap` and set [`ExecRecord::truncated`].
     ///
     /// Implementations may assume the gate has already run. The gate is what calls
@@ -545,7 +599,7 @@ mod tests {
         AppletSet, BuildType, DeviceFacts, FsRoot, Privilege, SelinuxDomain, SelinuxState, SuProbe,
         VerityState,
     };
-    use crate::host::profile::HostProfileName;
+    use crate::host::profile::{HostProfileName, ShellPaths};
     use acowork_platform_contract::{CapabilityTable, HostDescription};
 
     fn rooted_profile() -> HostProfile {
@@ -556,6 +610,7 @@ mod tests {
             context: Some("u:r:shell:s0".to_string()),
             domain: SelinuxDomain::Shell,
             shell: Some(ShellDialect::MkSh),
+            shell_executed: true,
             dialects: [ShellDialect::MkSh].into_iter().collect(),
             applets: AppletSet::parse_list("cat\nlogcat\nsetprop\nmount\n"),
             fs_roots: vec![FsRoot {
@@ -584,6 +639,7 @@ mod tests {
                 abi: Some("arm64-v8a".to_string()),
                 verity: VerityState::NotEnforcing,
             },
+            paths: ShellPaths::default(),
         }
     }
 
@@ -713,6 +769,7 @@ mod tests {
             context: Some("u:r:magisk:s0".to_string()),
             duration_ms: 12,
             truncated: false,
+            timed_out: false,
         };
         let outcome = record.to_contract();
         assert!(outcome.succeeded());
@@ -741,6 +798,7 @@ mod tests {
             context: None,
             duration_ms: 30_000,
             truncated: false,
+            timed_out: false,
         };
         assert_eq!(record.to_contract().result, Ok(ExitStatus::Terminated));
         assert!(!record.to_contract().succeeded());
@@ -748,13 +806,6 @@ mod tests {
 
     #[test]
     fn backend_errors_project_onto_contract_errors() {
-        assert_eq!(
-            BackendError::TimedOut {
-                after: Duration::from_secs(30)
-            }
-            .to_contract(),
-            ExecutionError::TimedOut
-        );
         assert!(matches!(
             BackendError::EscalationUnavailable("su: prompt denied".to_string()).to_contract(),
             ExecutionError::BackendUnavailable(_)
@@ -763,6 +814,50 @@ mod tests {
             BackendError::Backend("spawn failed".to_string()).to_contract(),
             ExecutionError::Rejected(_)
         ));
+    }
+
+    #[test]
+    fn a_silent_privilege_drop_projects_as_unavailable_and_says_what_it_observed() {
+        // The point of the variant is that the *observed* identity survives the projection:
+        // "escalation did not happen" is only actionable if the caller can see what did.
+        let err = BackendError::PrivilegeNotGranted {
+            observed_uid: Some(2000),
+            observed_context: Some("u:r:shell:s0".to_string()),
+        };
+        match err.to_contract() {
+            ExecutionError::BackendUnavailable(why) => {
+                assert!(why.contains("2000"), "{why}");
+                assert!(why.contains("u:r:shell:s0"), "{why}");
+            }
+            other => panic!("expected BackendUnavailable, got {other:?}"),
+        }
+        assert!(err.to_string().contains("asked to run as root"), "{err}");
+    }
+
+    #[test]
+    fn a_timeout_is_a_record_field_not_an_error() {
+        // Both halves of the decision: the record still carries the evidence, and the
+        // contract projection still says TimedOut.
+        let record = ExecRecord {
+            stdout: "partial".into(),
+            stderr: String::new(),
+            exit_code: None,
+            selinux_denials: Vec::new(),
+            uid: Some(0),
+            context: Some("u:r:magisk:s0".into()),
+            duration_ms: 30_000,
+            truncated: false,
+            timed_out: true,
+        };
+        let outcome = record.to_contract();
+        assert_eq!(outcome.result, Err(ExecutionError::TimedOut));
+        assert!(!outcome.succeeded());
+        assert_eq!(
+            String::from_utf8_lossy(&outcome.stdout.bytes),
+            "partial",
+            "a timeout must not discard the output produced before it"
+        );
+        assert_eq!(record.uid, Some(0), "nor the identity that ran it");
     }
 
     #[test]
@@ -809,6 +904,7 @@ mod tests {
                 context: Some("u:r:shell:s0".to_string()),
                 duration_ms: 1,
                 truncated: false,
+                timed_out: false,
             })
         }
     }

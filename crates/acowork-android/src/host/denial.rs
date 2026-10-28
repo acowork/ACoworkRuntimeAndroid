@@ -486,7 +486,7 @@ mod tests {
         AppletSet, BuildType, DeviceFacts, FsRoot, Privilege, SelinuxState, ShellDialect, SuProbe,
         VerityState,
     };
-    use crate::host::profile::HostProfileName;
+    use crate::host::profile::{HostProfileName, ShellPaths};
     use acowork_platform_contract::{CapabilityTable, EscalationModel, HostDescription};
 
     /// An empty table over the Android vocabulary.
@@ -532,6 +532,7 @@ scontext=u:r:shell:s0 tcontext=u:object_r:shell_data_file:s0 tclass=file permiss
             context: Some("u:r:untrusted_app:s0".to_string()),
             domain: SelinuxDomain::UntrustedApp,
             shell: Some(ShellDialect::MkSh),
+            shell_executed: true,
             dialects: [ShellDialect::MkSh].into_iter().collect(),
             applets: AppletSet::new(),
             fs_roots: vec![
@@ -563,6 +564,7 @@ scontext=u:r:shell:s0 tcontext=u:object_r:shell_data_file:s0 tclass=file permiss
                 abi: None,
                 verity: VerityState::Enforcing,
             },
+            paths: ShellPaths::default(),
         };
         // Derive the caps so the fixture is a coherent root-shell host: su works,
         // so ShellWrite is available and the classifier is allowed to suggest

@@ -63,7 +63,7 @@ pub enum ProbeCommand {
     Su,
     /// Item 5a — `command -v bash`.
     BashPath,
-    /// Item 5b — `/system/bin/sh --version`.
+    /// Item 5b — ask `/system/bin/sh` which dialect it is, by having it run a script.
     SystemShVersion,
     /// Item 6a — the `toybox` applet listing.
     ToyboxList,
@@ -109,7 +109,18 @@ impl ProbeCommand {
             ProbeCommand::AttrCurrent => "cat /proc/self/attr/current",
             ProbeCommand::Su => "su -c 'id -u; cat /proc/self/attr/current'",
             ProbeCommand::BashPath => "command -v bash",
-            ProbeCommand::SystemShVersion => "/system/bin/sh --version",
+            // NOT `/system/bin/sh --version`. Android's mksh is built without the version
+            // option, and on a real device the attempt is an error rather than a banner —
+            // measured on a Huawei BLA-AL00 (API 29): `/system/bin/sh: --: unknown option`,
+            // exit 1. `$KSH_VERSION` is set unconditionally, and asking the platform shell
+            // to echo it (rather than reading our own shell's variable) keeps the probe
+            // about `/system/bin/sh` even when the runner is Termux's bash.
+            //
+            // Both dialects are echoed because exactly one will be non-empty, and an empty
+            // answer is itself the evidence that the shell is neither mksh nor bash.
+            ProbeCommand::SystemShVersion => {
+                "/system/bin/sh -c 'echo \"KSH=$KSH_VERSION\"; echo \"BASH=$BASH_VERSION\"'"
+            }
             ProbeCommand::ToyboxList => "toybox",
             ProbeCommand::BusyboxList => "busybox --list",
             ProbeCommand::MountTable => "cat /proc/mounts",

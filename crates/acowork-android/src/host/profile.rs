@@ -28,6 +28,7 @@
 //! *permissive*.
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +41,7 @@ use crate::host::capability::{
 };
 use crate::host::facts::{
     AppletSet, DeviceFacts, FsRoot, Privilege, SelinuxDomain, SelinuxState, ShellDialect, SuProbe,
+    normalize_context,
 };
 use crate::host::probe::ProbeOutput;
 
@@ -84,9 +86,84 @@ impl HostProfileName {
     }
 }
 
+/// Where the executables needed to start a shell actually are.
+///
+/// Split out from the rest of [`HostProfile`] because these are the only probed facts whose
+/// sole consumer is process construction: capability derivation and the gate never read
+/// them. Grouping them also makes the one gap in this set impossible to miss — see
+/// [`ShellPaths::su`].
+///
+/// They matter because [`spawn`](super::spawn) clears the child's environment. A cleared
+/// environment means a bare command name resolves only if `PATH` was supplied, so "run
+/// `bash`" has to become "run `/data/user/0/com.termux/files/usr/bin/bash`". Every path a
+/// backend uses is therefore either probed or a fixed platform fact, never a guess.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellPaths {
+    /// Probe item 5a — the resolved `bash`, when `command -v bash` found one.
+    ///
+    /// `None` is a real answer: a stock Android shell has no bash, which is why the Termux
+    /// tier is decided by *this* and not by whether `$PREFIX` happens to be set.
+    pub bash: Option<PathBuf>,
+    /// Probe item 12 — Termux's `$PREFIX`, when set and reachable.
+    pub termux_prefix: Option<String>,
+    /// The platform's own shell. Not probed: `/system/bin/sh` is what Android *is*, on
+    /// every tier, and it is what a privileged helper is asked to exec.
+    pub system_sh: PathBuf,
+    /// The privileged helper. **Not currently a probed fact.**
+    ///
+    /// Probe item 4 invokes `su` by bare name, so it records *whether* escalation worked
+    /// and throws away *where* the binary was — and under a cleared environment a bare name
+    /// does not resolve at all. Until item 4 is revised to capture `command -v su`, a caller
+    /// supplies this from [`ShellPaths::SU_CANDIDATES`] or from the device harness. Left as
+    /// `None` rather than defaulted to a guess: a wrong path fails loudly as
+    /// `EscalationUnavailable`, whereas a plausible-but-wrong default fails as a root shell
+    /// that silently is not one.
+    pub su: Option<PathBuf>,
+}
+
+impl ShellPaths {
+    /// The locations a `su` binary is found at in practice, in the order a harness should
+    /// test them. Magisk installs into a tmpfs early in boot, so `/sbin` precedes
+    /// `/system/bin`; a SuperSU or KSU install may differ.
+    pub const SU_CANDIDATES: &'static [&'static str] = &[
+        "/sbin/su",
+        "/system/bin/su",
+        "/system/xbin/su",
+        "/data/adb/magisk/su",
+        "/debug_ramdisk/su",
+    ];
+
+    /// The Android default: system shell present, nothing else resolved yet.
+    pub fn android_default() -> ShellPaths {
+        ShellPaths {
+            bash: None,
+            termux_prefix: None,
+            system_sh: PathBuf::from("/system/bin/sh"),
+            su: None,
+        }
+    }
+
+    /// First candidate in [`ShellPaths::SU_CANDIDATES`] that exists on this filesystem.
+    ///
+    /// A cheap `stat`, not a probe: it answers "is there a binary here", which is not the
+    /// same question as "will it grant root" — that stays probe item 4's job.
+    pub fn resolve_su() -> Option<PathBuf> {
+        ShellPaths::SU_CANDIDATES
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.exists())
+    }
+}
+
+impl Default for ShellPaths {
+    fn default() -> ShellPaths {
+        ShellPaths::android_default()
+    }
+}
+
 /// The probed host, in full.
 ///
-/// Field-for-field this is the android-host-probe.md §3 contract, plus four
+/// Field-for-field this is the android-host-probe.md §3 contract, plus five
 /// additions. Each addition is a measured fact that the contract's own derivation
 /// rules or audit requirements already presuppose, so leaving it out would force
 /// callers to re-derive it:
@@ -97,10 +174,12 @@ impl HostProfileName {
 /// | `su` | §2 item 4 requires the uid **and** domain after `su`, and §7 needs the denial/absent distinction because a denied prompt is not retryable |
 /// | `system_remountable` | §2 item 7's `touch`/remount probe result; the `android:fs:system` rule reads it directly |
 /// | `dialects` | ADR-AND-001 §4.5 registers `bash` **and** `ash` as separate tools, which a single-valued `shell` field cannot express |
+/// | `paths` | an execution backend cannot start a shell from a bare name once the child's environment is cleared, so the resolved paths have to be part of the profile rather than guessed at call time |
 ///
 /// The `dialects` addition is recorded as **B8** in the readiness assessment: the
 /// §3 contract needs updating upstream-side, because dual tool registration is
 /// already decided in the ADR but not representable in the contract as written.
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostProfile {
     /// Which tier this device is.
@@ -118,7 +197,23 @@ pub struct HostProfile {
     /// Classified form of `context`.
     pub domain: SelinuxDomain,
     /// Primary shell dialect — the one a bare `shell` tool binds to.
+    ///
+    /// `None` means "we could not name the dialect", **not** "there is no shell". Read
+    /// [`Self::shell_executed`] for that. Conflating the two is not a theoretical hazard: a
+    /// real Huawei BLA-AL00 runs `/system/bin/sh` perfectly well as mksh R57 while setting
+    /// neither of the variables a dialect probe can read, and a profile that derived
+    /// shell-presence from dialect-presence classified it as an APK sandbox with no shell at
+    /// all — which then refused `android:shell:read` on a device that had just answered
+    /// `id -u`.
     pub shell: Option<ShellDialect>,
+    /// Whether a shell actually executed something for us.
+    ///
+    /// This is the fact the host tier and the shell capabilities are keyed on, per
+    /// android-host-probe.md §2: the dividing line between the shell tier and the APK
+    /// sandbox is *execution*, not vocabulary. Established by the platform shell running
+    /// probe item 5b to a successful exit, or by `command -v bash` resolving a bash — two
+    /// independent pieces of evidence, either of which is enough.
+    pub shell_executed: bool,
     /// Every dialect detected, for ADR-AND-001 §4.5 dual registration.
     pub dialects: BTreeSet<ShellDialect>,
     /// Commands actually present (toybox ∪ busybox ∪ spot checks).
@@ -138,6 +233,13 @@ pub struct HostProfile {
     pub caps: CapabilityTable,
     /// Immutable device facts.
     pub device: DeviceFacts,
+    /// Where the executables an execution backend needs are, resolved from the probe.
+    ///
+    /// Carried here rather than passed to each backend separately because these are probed
+    /// facts, and the profile is the only place probed facts live. A backend that had to be
+    /// handed a `bash` path by its caller would be a backend whose shell may disagree with
+    /// the shell the capabilities were derived from.
+    pub paths: ShellPaths,
 }
 
 impl HostProfile {
@@ -166,8 +268,10 @@ impl HostProfile {
             .map(|out| SelinuxState::parse(&out.stdout))
             .unwrap_or(SelinuxState::Unknown);
         let context = probe.attr_current.as_ref().and_then(|out| {
-            let text = out.stdout.trim();
-            (!text.is_empty()).then(|| text.to_string())
+            // The kernel terminates this read with NUL, not a newline — see
+            // `facts::normalize_context`. Storing the raw text would put a NUL in the
+            // profile and in every audit record that quotes it.
+            normalize_context(&out.stdout).map(str::to_string)
         });
         let domain = context
             .as_deref()
@@ -204,6 +308,23 @@ impl HostProfile {
             dialects.insert(d);
         }
 
+        // ── Did a shell execute at all? ────────────────────────────────────
+        // Two independent witnesses, either sufficient:
+        //
+        //   - `/system/bin/sh -c '…'` exited 0. The command *is* the shell being asked to run
+        //     a script, so a zero exit is the shell attesting to itself; an unrecognised
+        //     banner (busybox ash sets neither variable) still counts.
+        //   - `command -v bash` resolved a path. `command` is a shell builtin, so a successful
+        //     lookup could not have happened without a shell parsing it.
+        //
+        // Deliberately not `system_sh_dialect.is_some()`: that is the dialect question, and
+        // answering the existence question with it is what misclassified a working device.
+        let platform_shell_ran = probe
+            .system_sh_version
+            .as_ref()
+            .is_some_and(|out| out.succeeded());
+        let shell_executed = platform_shell_ran || !dialects.is_empty();
+
         // Primary dialect: prefer the one the host is actually known for. On
         // Termux that is bash; on a rooted device driving /system/bin/sh it is
         // whatever that binary turned out to be.
@@ -211,6 +332,24 @@ impl HostProfile {
             Some(ShellDialect::Bash)
         } else {
             system_sh_dialect.or_else(|| dialects.iter().next().copied())
+        };
+
+        // ── Item 5a: where bash actually is ────────────────────────────────
+        // `command -v bash` prints the resolved path and exits non-zero when there is none,
+        // so both conditions are needed — a non-zero exit whose stdout happens to be a
+        // leftover from a wrapper script is not a bash.
+        let bash = probe
+            .bash_path
+            .as_ref()
+            .filter(|out| out.succeeded())
+            .map(|out| out.stdout.trim().to_string())
+            .filter(|text| !text.is_empty())
+            .map(PathBuf::from);
+
+        let paths = ShellPaths {
+            bash,
+            termux_prefix: probe.termux_prefix.clone(),
+            ..ShellPaths::android_default()
         };
 
         // ── Item 6: applets ────────────────────────────────────────────────
@@ -295,7 +434,7 @@ impl HostProfile {
             HostProfileName::ApkSandbox
         } else if su.got_root() {
             HostProfileName::RootShell
-        } else if shell.is_some() {
+        } else if shell_executed {
             HostProfileName::Termux
         } else {
             HostProfileName::ApkSandbox
@@ -308,6 +447,7 @@ impl HostProfile {
             context,
             domain,
             shell,
+            shell_executed,
             dialects,
             applets,
             fs_roots,
@@ -315,6 +455,7 @@ impl HostProfile {
             system_remountable,
             caps: empty_table(),
             device,
+            paths,
         };
         profile.caps = derive_table(&profile);
 
@@ -514,7 +655,7 @@ mod tests {
             attr_current: Some(out("u:r:untrusted_app:s0:c512,c768\n")),
             su: Some(out("0\nu:r:magisk:s0\n")),
             bash_path: Some(out("")),
-            system_sh_version: Some(out("@(#)MIRBSD KSH R59 2020/10/31\n")),
+            system_sh_version: Some(out("KSH=@(#)MIRBSD KSH R57 2019-03-01 Android\\nBASH=\\n")),
             toybox_list: Some(out(
                 "cat\nchmod\ngetprop\nlogcat\nmount\nps\nsetprop\ntoybox\n",
             )),
@@ -587,7 +728,7 @@ mod tests {
         let probe = ProbeOutput {
             su: None,
             bash_path: Some(out("/data/data/com.termux/files/usr/bin/bash\n")),
-            system_sh_version: Some(out("@(#)MIRBSD KSH R59\n")),
+            system_sh_version: Some(out("KSH=@(#)MIRBSD KSH R57 2019-03-01 Android\nBASH=\n")),
             termux_prefix: Some("/data/data/com.termux/files/usr".to_string()),
             prop_veritymode: Some(out("enforcing\n")),
             system_remount: None,

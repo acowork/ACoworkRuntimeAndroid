@@ -205,16 +205,46 @@ impl ShellDialect {
         }
     }
 
-    /// Classify a `sh --version` banner.
+    /// Classify the answer to probe item 5b.
     ///
-    /// Returns `None` for an empty or unrecognised banner rather than defaulting
-    /// to a dialect: a wrong dialect in the tool description teaches the model
-    /// syntax that will not run.
+    /// Two shapes are accepted, because the probe asks the platform shell to name itself:
+    ///
+    /// - the labelled form `KSH=@(#)MIRBSD KSH R57 …` / `BASH=`, which is what
+    ///   [`ProbeCommand::SystemShVersion`](super::probe::ProbeCommand::SystemShVersion)
+    ///   emits;
+    /// - a bare version banner, which is what a shell that supports `--version` prints.
+    ///
+    /// Returns `None` for an empty or unrecognised answer rather than defaulting to a
+    /// dialect: a wrong dialect in the tool description teaches the model syntax that will
+    /// not run. `None` does **not** mean "no shell" — that is a separate fact, decided by
+    /// whether the probe command exited successfully, and recorded as
+    /// [`HostProfile::shell_executed`](super::profile::HostProfile::shell_executed). Busybox
+    /// ash is the everyday case where the two disagree: it runs the script and sets neither
+    /// variable.
     pub fn parse_version_banner(raw: &str) -> Option<ShellDialect> {
         let text = raw.trim();
         if text.is_empty() {
             return None;
         }
+
+        // Labelled form. Only a *non-empty* value counts: `BASH=` on a device whose platform
+        // shell is mksh is evidence against bash, not for it.
+        for line in text.lines() {
+            let (label, value) = match line.split_once('=') {
+                Some(pair) => pair,
+                None => continue,
+            };
+            let value = value.trim();
+            if value.is_empty() {
+                continue;
+            }
+            match label.trim().to_ascii_uppercase().as_str() {
+                "KSH" | "KSH_VERSION" => return Some(ShellDialect::MkSh),
+                "BASH" | "BASH_VERSION" => return Some(ShellDialect::Bash),
+                _ => {}
+            }
+        }
+
         let lower = text.to_ascii_lowercase();
         if lower.contains("mirbsd ksh") || lower.contains("mksh") {
             Some(ShellDialect::MkSh)
@@ -495,6 +525,39 @@ impl SuProbe {
     }
 }
 
+/// Does this stderr say the superuser prompt was **refused by the user**?
+///
+/// Split out of [`parse_su_probe`] because an execution backend has to make the same
+/// distinction at the same time as the probe does — a declined prompt is not retryable
+/// (android-host-probe.md §2 item 4), while "no su here" is a reason to re-probe after
+/// installing a manager. Two copies of the wording list would drift apart, and the drift
+/// would show up as a node that retries a prompt the user already said no to.
+///
+/// Substring matching, not exact comparison: the wording varies by Magisk/KernelSU/SuperSU
+/// version and by whether a manager app is installed at all.
+pub fn su_prompt_denied(stderr: &str) -> bool {
+    let err = stderr.to_ascii_lowercase();
+    [
+        "denied",
+        "permission denied",
+        "not allowed",
+        "rejected",
+        "cancelled",
+    ]
+    .iter()
+    .any(|needle| err.contains(needle))
+}
+
+/// Does this stderr say the privileged helper is **absent or unreachable**?
+///
+/// See [`su_prompt_denied`] for why this is a shared predicate rather than a local one.
+pub fn su_helper_missing(stderr: &str) -> bool {
+    let err = stderr.to_ascii_lowercase();
+    ["not found", "no such file", "inaccessible", "not available"]
+        .iter()
+        .any(|needle| err.contains(needle))
+}
+
 /// Parse the stdout/stderr pair of the `su` probe.
 ///
 /// `stderr` is inspected first because the denial messages are what
@@ -510,21 +573,8 @@ pub fn parse_su_probe(stdout: &str, stderr: &str, timed_out: bool) -> SuProbe {
         };
     }
 
-    let err = stderr.to_ascii_lowercase();
-    // Magisk / KernelSU denial wordings. Kept as a substring match because the
-    // exact text varies by version and by whether a manager app is installed.
-    let denied = [
-        "denied",
-        "permission denied",
-        "not allowed",
-        "rejected",
-        "cancelled",
-    ]
-    .iter()
-    .any(|needle| err.contains(needle));
-    let missing = ["not found", "no such file", "inaccessible", "not available"]
-        .iter()
-        .any(|needle| err.contains(needle));
+    let denied = su_prompt_denied(stderr);
+    let missing = su_helper_missing(stderr);
 
     if denied {
         return SuProbe {
@@ -592,13 +642,33 @@ pub enum SelinuxDomain {
     Unreadable,
 }
 
+/// Strip the terminator the kernel puts on a security-context read.
+///
+/// `/proc/*/attr/current` is **NUL-terminated, not newline-terminated**. Measured on a
+/// Huawei BLA-AL00 (API 29): `cat /proc/self/attr/current` yields the 14 bytes
+/// `u:r:shell:s0\0`. `str::trim` and `is_ascii_whitespace` both leave `\0` in place, so
+/// without this the terminator is carried into [`HostProfile`](super::profile), echoed in
+/// every audit record that cites the context, and compared unequal to the same context
+/// read through a shell — `$(cat …)` *does* drop it, which is why the exec path never
+/// showed the problem while the probe path did.
+///
+/// Returns `None` for an empty or terminator-only read, which is the same "unreadable"
+/// answer [`SelinuxDomain::Unreadable`] encodes.
+pub fn normalize_context(raw: &str) -> Option<&str> {
+    let ctx = raw.trim().trim_end_matches('\0').trim();
+    (!ctx.is_empty()).then_some(ctx)
+}
+
 impl SelinuxDomain {
     /// Classify a raw `/proc/self/attr/current` value.
+    ///
+    /// Tolerates the NUL terminator (see [`normalize_context`]) so a caller that hands it
+    /// the unparsed file read still gets `Shell` rather than `Other("shell")` with a
+    /// trailing NUL in its payload.
     pub fn parse(raw: &str) -> SelinuxDomain {
-        let ctx = raw.trim();
-        if ctx.is_empty() {
+        let Some(ctx) = normalize_context(raw) else {
             return SelinuxDomain::Unreadable;
-        }
+        };
         // The context is `user:role:type[:level]`; the type is the third field.
         let domain = ctx.split(':').nth(2).unwrap_or(ctx);
         match domain {
@@ -748,6 +818,35 @@ mod tests {
         // Unrecognised => None, never a guessed dialect.
         assert_eq!(ShellDialect::parse_version_banner(""), None);
         assert_eq!(ShellDialect::parse_version_banner("sh: unknown flag"), None);
+    }
+
+    /// The labelled form is what probe item 5b now returns, because `/system/bin/sh
+    /// --version` is not an option on a real device. Captured from a Huawei BLA-AL00 (API 29).
+    #[test]
+    fn labelled_shell_identity_is_read_from_the_variable_that_is_set() {
+        let real = "KSH=@(#)MIRBSD KSH R57 2019-03-01 Android\nBASH=\n";
+        assert_eq!(
+            ShellDialect::parse_version_banner(real),
+            Some(ShellDialect::MkSh)
+        );
+
+        // A Termux install whose platform shell is still mksh but whose *runner* is bash.
+        assert_eq!(
+            ShellDialect::parse_version_banner(
+                "KSH=\nBASH=GNU bash, version 5.1.16(1)-release (aarch64-linux-android)\n"
+            ),
+            Some(ShellDialect::Bash)
+        );
+
+        // An empty value is evidence of absence, not a match on the label's own text.
+        assert_eq!(ShellDialect::parse_version_banner("KSH=\nBASH=\n"), None);
+        assert_eq!(ShellDialect::parse_version_banner("KSH=\n"), None);
+        // Busybox ash sets neither, so the probe says nothing and the dialect stays unknown.
+        assert_eq!(
+            ShellDialect::parse_version_banner("KSH=\nBASH=\n"),
+            None,
+            "an unnameable shell must be reported as unknown, not defaulted"
+        );
     }
 
     #[test]
@@ -921,5 +1020,28 @@ mod tests {
         );
         assert_eq!(SelinuxDomain::parse(""), SelinuxDomain::Unreadable);
         assert!(!SelinuxDomain::Unreadable.is_privileged());
+    }
+
+    /// The kernel terminates a security-context read with NUL rather than a newline. This
+    /// is a captured byte-for-byte result, not a guess: on a Huawei BLA-AL00 (API 29),
+    /// `cat /proc/self/attr/current` emits `u:r:shell:s0\0` and nothing else.
+    #[test]
+    fn context_normalization_strips_the_kernels_nul_terminator() {
+        let real = "u:r:shell:s0\0";
+        assert_eq!(normalize_context(real), Some("u:r:shell:s0"));
+        // The shapes a shell or a second read can add around it.
+        assert_eq!(normalize_context("u:r:su:s0\0\n"), Some("u:r:su:s0"));
+        assert_eq!(normalize_context("\n"), None);
+        assert_eq!(normalize_context("\0"), None);
+        assert_eq!(normalize_context("   \0  "), None);
+        // Classification survives the terminator too. Before this, the trailing NUL sat in
+        // the fourth field and happened not to matter — a fact pinned so that a future
+        // context shape with fewer fields cannot quietly start reporting `Other`.
+        assert_eq!(SelinuxDomain::parse(real), SelinuxDomain::Shell);
+        assert_eq!(
+            SelinuxDomain::parse("u:r:magisk\0"),
+            SelinuxDomain::Magisk,
+            "a context without a level field must not lose its NUL to the domain name"
+        );
     }
 }

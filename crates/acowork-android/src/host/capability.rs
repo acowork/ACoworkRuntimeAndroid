@@ -203,13 +203,21 @@ pub fn derive_claims(profile: &HostProfile) -> Vec<acowork_platform_contract::Ca
         });
     };
 
-    // android:shell:read ← shell != None
-    let has_shell = profile.shell.is_some();
-    if let Some(dialect) = profile.shell {
+    // android:shell:read ← a shell actually executed.
+    //
+    // The dialect belongs in the evidence text, not in the condition. A shell we cannot name
+    // is still a shell: refusing a read-tier command on a device that has just run `id -u`
+    // for us would be the port contradicting the device.
+    let has_shell = profile.shell_executed;
+    if has_shell {
+        let what = match profile.shell {
+            Some(dialect) => format!("/system/bin/sh -c ran as {dialect:?}"),
+            None => "/system/bin/sh -c ran, dialect not recognised".to_string(),
+        };
         claim(
             Capability::ShellRead,
             EvidenceKind::Observed {
-                what: format!("command -v {dialect:?}"),
+                what,
                 status: Some(0),
             },
         );
@@ -301,11 +309,13 @@ pub fn derive_claims(profile: &HostProfile) -> Vec<acowork_platform_contract::Ca
 /// Pure over the same fields [`derive_claims`] reads, so the two cannot disagree.
 pub fn explain_absence(profile: &HostProfile, cap: Capability) -> String {
     match cap {
-        Capability::ShellRead => "no usable shell was detected on this host".to_string(),
+        Capability::ShellRead => {
+            "no shell executed the probe, so this host cannot run a command at all".to_string()
+        }
 
         Capability::ShellWrite => {
-            if profile.shell.is_none() {
-                "no usable shell was detected".to_string()
+            if !profile.shell_executed {
+                "no shell executed the probe, so no command can run".to_string()
             } else if profile.su.prompt_denied {
                 // Not retryable: the user already answered this prompt.
                 "the superuser prompt was declined, so this is not retryable — ask the user to \
@@ -323,7 +333,7 @@ pub fn explain_absence(profile: &HostProfile, cap: Capability) -> String {
             "no writable filesystem root outside this package's own directory".to_string()
         }
 
-        Capability::FsSystem if profile.shell.is_none() => {
+        Capability::FsSystem if !profile.shell_executed => {
             "this host has no shell, so it cannot run `mount` at all".to_string()
         }
         Capability::FsSystem => match profile.device.verity {
@@ -365,8 +375,8 @@ mod tests {
         AppletSet, BuildType, DeviceFacts, FsRoot, SelinuxDomain, ShellDialect, SuProbe,
         VerityState,
     };
-    use crate::host::profile::HostProfileName;
-    use acowork_platform_contract::CapabilityTable;
+    use crate::host::profile::{HostProfileName, ShellPaths};
+    use acowork_platform_contract::{CapabilityTable, EvidenceKind};
 
     /// An empty table over the Android vocabulary, for fixtures that fill `caps` in
     /// later or do not exercise it at all.
@@ -384,6 +394,7 @@ mod tests {
             context: Some("u:r:untrusted_app:s0".to_string()),
             domain: SelinuxDomain::UntrustedApp,
             shell: Some(ShellDialect::MkSh),
+            shell_executed: true,
             dialects: [ShellDialect::MkSh].into_iter().collect(),
             applets: AppletSet::parse_list("cat\nlogcat\nsetprop\n"),
             fs_roots: vec![
@@ -415,6 +426,7 @@ mod tests {
                 abi: Some("arm64-v8a".to_string()),
                 verity: VerityState::NotEnforcing,
             },
+            paths: ShellPaths::default(),
         }
     }
 
@@ -617,6 +629,7 @@ mod tests {
     #[test]
     fn a_host_with_no_shell_claims_nothing() {
         let mut p = root_profile();
+        p.shell_executed = false;
         p.shell = None;
         p.dialects.clear();
         let claims = derive_claims(&p);
@@ -626,11 +639,48 @@ mod tests {
         assert_eq!(claims[0].capability, Capability::FsOutsideApp.id());
     }
 
+    /// The device that motivated this test is a Huawei BLA-AL00 on API 29: `/system/bin/sh`
+    /// runs as mksh R57, and the probe command that asks it which dialect it is returns a
+    /// zero exit with an answer the dialect parser can read. Substitute the shell that sets
+    /// neither `$KSH_VERSION` nor `$BASH_VERSION` — busybox ash, a real option on custom
+    /// ROMs — and the dialect is unknown while the shell is unquestionably there.
+    ///
+    /// Deriving existence from vocabulary classified that device as an APK sandbox with no
+    /// shell, and it then refused `android:shell:read` on a host that had just executed
+    /// `id -u` and printed `2000`.
+    #[test]
+    fn an_unnameable_shell_is_still_a_shell() {
+        let mut p = root_profile();
+        p.shell = None;
+        p.dialects.clear();
+        // shell_executed stays true: the probe command exited 0, it simply said nothing we
+        // could classify.
+        let claims = derive_claims(&p);
+        assert!(
+            claims
+                .iter()
+                .any(|c| c.capability == Capability::ShellRead.id()),
+            "a shell that ran but could not be named must still earn android:shell:read"
+        );
+        let read = claims
+            .iter()
+            .find(|c| c.capability == Capability::ShellRead.id())
+            .unwrap();
+        let EvidenceKind::Observed { what, .. } = &read.evidence.kind else {
+            panic!("shell presence must be recorded as observed evidence, not inferred");
+        };
+        assert!(
+            what.contains("not recognised"),
+            "the evidence must admit the dialect is unknown rather than imply one: {what}"
+        );
+    }
+
     #[test]
     fn fs_system_requires_a_shell_even_when_verity_is_off() {
         // B12: without the shell conjunct an APK profile would declare a capability
         // it has no way to exercise.
         let mut p = root_profile();
+        p.shell_executed = false;
         p.shell = None;
         p.system_remountable = true;
         p.device.verity = VerityState::NotEnforcing;
@@ -648,6 +698,7 @@ mod tests {
     fn every_absent_capability_has_an_explanation() {
         // R9: no capability may be silently missing.
         let mut p = root_profile();
+        p.shell_executed = false;
         p.shell = None;
         p.fs_roots.retain(|r| r.own_package);
         p.device.verity = VerityState::Enforcing;
@@ -664,6 +715,7 @@ mod tests {
 
         // The verity explanation is reachable only when a shell exists to run `mount`.
         let mut with_shell = p.clone();
+        with_shell.shell_executed = true;
         with_shell.shell = Some(crate::host::facts::ShellDialect::MkSh);
         assert!(explain_absence(&with_shell, Capability::FsSystem).contains("dm-verity"));
     }

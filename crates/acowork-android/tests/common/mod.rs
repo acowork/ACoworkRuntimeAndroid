@@ -41,6 +41,15 @@ pub fn probe_of(pairs: &[(ProbeCommand, &str)]) -> ProbeOutput {
     out
 }
 
+/// Probe item 5b's answer, captured from a real device rather than written by hand.
+///
+/// A Huawei BLA-AL00 on API 29, from
+/// `/system/bin/sh -c 'echo "KSH=$KSH_VERSION"; echo "BASH=$BASH_VERSION"'`. The `BASH=` line
+/// is deliberately present and empty: it is the evidence that the platform shell is not bash,
+/// and a fixture that omitted it would not exercise the parser's "labelled but empty means
+/// absent" rule.
+pub const SYSTEM_SH_VERSION: &str = "KSH=@(#)MIRBSD KSH R57 2019-03-01 Android\nBASH=\n";
+
 pub const TOYBOX_LIST: &str =
     "basename\ncat\nchmod\ndf\ndumpsys\ngetprop\nlogcat\nmount\nps\nsetprop\ntoybox\n";
 
@@ -58,10 +67,7 @@ pub fn termux_probe() -> ProbeOutput {
             ProbeCommand::BashPath,
             "/data/data/com.termux/files/usr/bin/bash\n",
         ),
-        (
-            ProbeCommand::SystemShVersion,
-            "@(#)MIRBSD KSH R59 2020/10/31\n",
-        ),
+        (ProbeCommand::SystemShVersion, SYSTEM_SH_VERSION),
         (ProbeCommand::ToyboxList, TOYBOX_LIST),
         (
             ProbeCommand::MountTable,
@@ -103,10 +109,7 @@ pub fn rooted_probe() -> ProbeOutput {
             "u:r:untrusted_app:s0:c123,c456\n",
         ),
         (ProbeCommand::Su, "0\nu:r:magisk:s0\n"),
-        (
-            ProbeCommand::SystemShVersion,
-            "@(#)MIRBSD KSH R59 2020/10/31\n",
-        ),
+        (ProbeCommand::SystemShVersion, SYSTEM_SH_VERSION),
         (ProbeCommand::ToyboxList, TOYBOX_LIST),
         (
             ProbeCommand::BusyboxList,

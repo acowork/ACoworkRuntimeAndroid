@@ -395,7 +395,10 @@ fn read_tier_is_refused_on_the_apk_sandbox_because_there_is_no_shell() {
         .expect("shell:read must be reported as a gap on the APK sandbox")
         .reason
         .clone();
-    assert!(gap.contains("no usable shell"), "{gap}");
+    // The wording names the *evidence* that is missing — a shell that ran the probe — rather
+    // than "no usable shell", which a reader could mistake for "a shell exists but we do not
+    // trust it". The two have different remedies.
+    assert!(gap.contains("no shell"), "{gap}");
 }
 
 #[test]
