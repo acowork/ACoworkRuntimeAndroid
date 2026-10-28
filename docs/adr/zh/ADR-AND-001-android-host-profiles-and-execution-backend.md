@@ -1,9 +1,23 @@
 # ADR-AND-001: Android Host Profiles 与 ExecutionBackend（含高权限调试档）
 
-- **状态**：Accepted（遗留问题已全部裁定，见 §7；实现尚未开始）
-- **日期**：2026-05-15
-- **相关**：[README.md](../../README.md)、上游 `docs/design/zh/12-tool-system.md`（平台支持矩阵与运行时平台检测）、上游 `core/acowork-runtime/src/tools/builtin/shell.rs`（多 shell 注册范式）、上游 ADR-087（node/agent 归属与门控）、session 参数 `shellApprovalThreshold` / `approvalTimeoutSecs`
-- **EN mirror**：待本 ADR 定稿后补 `docs/adr/en/`
+- **状态**：**部分 Accepted** —— §1–§6（三档宿主、一个引擎、工具级提权、`ExecutionBackend` 契约）有效并已落地 P0；⚠️ **§7.1 与 §7.4 待与上游对齐**，二者被晚于本 ADR 的上游文档推翻，详见下方「上游冲突」与 [开发就绪度评估](../../review/zh/2026-10-28-readiness-assessment.md) B1/B2。
+- **日期**：2026-10-20（原标 `2026-05-15` 有误：正文引用了 2026-09-13 才创建的 ADR-075、2026-10-05 的 ADR-087、2026-10-09 的 ADR-090，该日期不可能成立）
+- **相关**：[README.md](../../../README.md)、上游 `docs/design/zh/12-tool-system.md`（平台支持矩阵与运行时平台检测）、上游 `core/acowork-runtime/src/tools/builtin/shell.rs`（多 shell 注册范式）、上游 ADR-087（node/agent 归属与门控）、上游 `docs/design/zh/30-runtime-protocol-and-pluggable-engine.md`（能力注册表与可插拔引擎，**v0.2 直接点名本 ADR**）、session 参数 `shellApprovalThreshold` / `approvalTimeoutSecs`
+- **实现**：P0 已交付 —— `crates/acowork-android/src/host/`（探测解析器、capability 推导、`ExecutionBackend` 契约、门控、`avc` 回灌），115 测试通过，clippy `-D warnings` 零告警
+- **EN mirror**：待补 `docs/adr/en/`（上游 `AGENTS.md:142` 要求中英 ADR 同一 commit 更新；本仓库尚未采用该约定，见评估 B7）
+
+> ### ⚠️ 上游冲突（2026-10-28 核对）
+>
+> 本 ADR 提交于 2026-10-20。此后上游有两份文档修订，均与本 ADR 冲突：
+>
+> | 上游 | 日期 | 冲突点 |
+> |---|---|---|
+> | design 30 v0.2 §6.2 / §9 | 2026-10-24 | 「新增能力的唯一路径是注册表 PR」「能力是布尔开关，不带参数」；并明确要求本 ADR §7.1 的能力上报「**应改为**同一份能力注册表的一个来源」 |
+> | ADR-087 v3 D1/D5 | 2026-10-28 | 「执行点 = Gateway 反代入口，Runtime 不引入 owner 概念」「owner 不进 MQTT proto，Node 不感知用户」——与本 ADR §7.4「设备本地判定请求者是 node owner」及 §7.1「Gateway 不做门控判定」不能同时成立 |
+>
+> **已采用的解法**（见评估 B1/B2）：把 §7.4 的合取项拆成两个权威——Gateway 判*归属*（下发不透明布尔裁决，设备看不到 owner 身份，满足 ADR-087 D1/D5），设备判*本地就绪*（`dangerous-mode` ∧ 写锁 ∧ 探测事实），最终合取在设备侧的 `authorize` 完成。capability 则保留为本仓库自己的领域类型，不绑定上游 `Permission` 封闭 enum；到最终注册表的映射层待 B2 裁定后再建，因此裁定倒向任一边都只需改一个文件。
+>
+> 影响面：**仅 P3 写档**。P0/P1/P2 只读档不触及 owner 门控，不受阻塞。
 
 ---
 
@@ -235,6 +249,11 @@ exec {
 
 ### 7.1 HostProfile 是否上报 Gateway → **上报能力摘要，不上报设备细节**
 
+> ⚠️ **本节两处裁定已被上游推翻，待对齐**（评估 B1/B2）：
+> ①「Gateway 不做门控判定」与上游 ADR-087 D5「执行点 = Gateway 反代入口」冲突；
+> ②「上报能力摘要」的词汇表所有权已归上游 design 30 §6.2 的能力注册表，该文档 §9 明确要求本节「**应改为**同一份能力注册表的一个来源」。
+> 「上报什么 / 不上报什么」的隐私红线仍然有效并已落成测试（`gateway_summary_never_leaks_device_detail_on_any_tier`）。
+
 - **上报**：`profile` 名 + `caps` 集合 + `shell dialect` + `privilege` 等级。
 - **不上报**：设备序列号 / 型号、`fs_roots` 具体路径、SELinux context 原字符串、`observed-denials` 明细。
 - **上报主体是 Node Agent，不是 Runtime**：宿主能力是**节点属性**，与具体 Agent 无关。放在 Node 侧上报，避免每个 Runtime 各自重复声明同一事实造成不一致（也与上游 ADR-075 node identity、ADR-090 安装归属「能力归 Node」的方向一致）。
@@ -265,6 +284,11 @@ exec {
 - 理由：**APK 档根本没有 shell，也没有 su**，`android:fs:system` 在 APK 上不可达。给它做 UI 开关是为一条不存在的路径加配置项（YAGNI），还会误导用户以为勾上就能改系统。等 APK 侧真的出现提权路径时再议。
 
 ### 7.4 `android:fs:system` 与 ADR-087 owner 门控如何叠加 → **双条件与，默认拒绝**
+
+> ⚠️ **本节按字面不可实现，已改为两权威分解**（评估 B1）：ADR-087 D1/D5 规定 owner 真相只存 Gateway、不进 MQTT proto、「Runtime 不引入 owner 概念」，因此设备本地无法评估「请求者是 node owner」这一合取项。
+> **保留的**：双条件与、默认拒绝、无主设备一律不开放、fail-closed。
+> **修订的**：归属条件由 Gateway 判定并下发**不透明布尔裁决**（`AttributionVerdict`，不含 user id / owner 名 / 角色），设备侧只判本地就绪并完成合取。布尔裁决不是用户身份，故 ADR-087「Node 不感知用户」依然成立；最终放行仍在设备，故本节立场也成立。
+> 落点：[backend.rs](../../../crates/acowork-android/src/host/backend.rs) 的 `authorize`；测试 `system_tier_needs_both_dangerous_mode_and_attribution`、`unowned_node_never_opens_the_system_tier_even_when_rooted_and_flagged`。
 
 ```
 放行 = 设备本地开关（dangerous-mode 已开） ∧ 归属门控（请求者是 node owner）

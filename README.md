@@ -17,9 +17,16 @@
 
 ---
 
-> **Status: early development / initial skeleton.** This repository has just been created.
-> Everything below marked 🚧 or *planned* is a design intent, not shipped code. No binary is
-> released yet, and nothing here is ready for production use.
+> **Status: early development.** The design docs are in place and the P0 slice (HostProfile probe +
+> `ExecutionBackend` contract) ships as a buildable, tested Rust library. **No runnable binary exists
+> yet**, and nothing here is ready for production use.
+>
+> ⚠️ **This English README lags [README.zh.md](README.zh.md).** The Chinese version is currently
+> authoritative for three sections that changed on 2026-10-28: the roadmap (three items are blocked on
+> upstream rulings, not on engineering), the build instructions, and the APK deliverable's unresolved
+> form-factor overlap with upstream `apps/acowork-mobile`. See the
+> [readiness assessment](docs/review/zh/2026-10-28-readiness-assessment.md) — Chinese only for now.
+> Everything below marked 🚧 or *planned* is a design intent, not shipped code.
 
 ---
 

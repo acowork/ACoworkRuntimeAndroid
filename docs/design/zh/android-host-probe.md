@@ -1,8 +1,8 @@
 # Android HostProfile Probe 设计
 
-- **状态**：Draft
-- **日期**：2026-05-15
-- **相关**：[ADR-AND-001](../adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md)
+- **状态**：Draft —— P0 已按本设计落地（`crates/acowork-android/src/host/`），实现期发现 3 处契约缺口需回写本文，见下方「实现期修订」
+- **日期**：2026-10-20（原标 `2026-05-15` 与所引 ADR-AND-001 同期，该日期不成立，理由见该 ADR 头部）
+- **相关**：[ADR-AND-001](../../adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md)
 - **目的**：定义「启动时一次性能力探测」的探测项、数据契约、失败语义与消费方式，使工具列表与 shell 方言描述由**实测**生成，而非硬编码平台判断。
 
 ---
@@ -58,6 +58,17 @@ pub struct HostProfile {
 }
 ```
 
+> ### 实现期修订（2026-10-28，评估 B8/B12）
+>
+> 落地 P0 时发现本节契约有两处不足，代码已按修订后实现，**本文待回写**：
+>
+> 1. **`shell` 单值字段无法表达 ADR §4.5 的双工具注册（B8）。** §4.5 要求注册 `bash` 与 `ash` 两个独立工具，而 `shell: Option<ShellDialect>` 只能存一个。已增加 `dialects: BTreeSet<ShellDialect>`，`shell` 保留为「主方言」（裸 `shell` 工具绑定的那一个）。
+> 2. **`fs:system` 与 `selinux:permissive` 的推导规则漏了 shell 前置条件（B12）。** remount 意味着*执行* `mount`，`setenforce` 同理；无 shell 的宿主无论如何做不到——这正是 ADR §7.3 陈述为事实的那句话。缺这个前置条件会让 APK 档声明一个无法行使的能力，即上游 design 30 §11.1 警告的「能力谎报」（比「没有能力」更伤信任）。修订后：
+>    ```
+>    android:fs:system          ← shell != None 且 verity != Enforcing 且 /system 实测可 remount
+>    android:selinux:permissive ← shell != None 且 privilege >= Root 且 selinux == Enforcing
+>    ```
+
 **推导规则（关键：capability 是探测事实的函数，不是配置项）**
 
 ```
@@ -75,7 +86,12 @@ android:selinux:permissive ← privilege >= Root 且 selinux == Enforcing
 SELinux 是**运行时按 (scontext, tcontext, tclass) 判定**的，静态探测无法预测具体拒绝。因此必须确立两条语义：
 
 1. **探测结果只用于「是否注册工具 / 是否声明能力」，不作为执行放行的依据。** 真实权限以命令实际 exit code + stderr 为准。
-2. **执行期拒绝必须回灌**：`avc: denied { read } for ... scontext=u:r:magisk:s0 tcontext=u:object_r:system_data_file:s0` 需被结构化抽取，转成给模型的下一步提示（缺哪个能力 / 需要 permissive / 路径不在 fs_roots），并**累计到 HostProfile 的 observed-denials**，供同会话后续门控参考（同一 tcontext 二次拒绝即提示「不要重试」）。
+2. **执行期拒绝必须回灌**：`avc: denied { read } for ... scontext=u:r:magisk:s0 tcontext=u:object_r:system_data_file:s0` 需被结构化抽取，转成给模型的下一步提示（缺哪个能力 / 需要 permissive / 路径不在 fs_roots），并**累计到会话级的 observed-denials 账本**，供同会话后续门控参考（同一 tcontext 二次拒绝即提示「不要重试」）。
+
+> ### 实现期修订（2026-10-28，评估 B10 + 一处分类缺陷）
+>
+> 1. **observed-denials 不能存在 HostProfile 里（B10）。** 本节原文要求「累计到 HostProfile 的 observed-denials」，但 §3 声明 profile「一次生成，会话期内只读」——二者不能同时成立。已改为独立的会话级 `DenialLedger`。这同时让 ADR §7.1 的隐私红线成为**结构性保证**而非「记得过滤」：明细根本不在被上报的 profile 里。
+> 2. **「路径不在 fs_roots」这条提示必须加守卫。** §2 item 12 只探 `$PREFIX` / `/sdcard` / 自身包目录，因此 `fs_roots` 记录的是**非特权**可达范围，**不是** root 可达范围的穷举（README 矩阵写的是「`/data` 大范围」）。对能提权的宿主说「路径不对、提权也没用」，会把模型从唯一可行的修复上引开——这是实现期由测试抓到的真实缺陷。修订后该分支以「宿主无法提权」为前置条件；能提权时一律先建议提权。
 
 > 反模式警告：若把探测当作保证，会形成「探测显示可写 → 模型反复试探 → 每次都吃 denied → 上下文被垃圾填满」的静默降级循环。这是本设计要显式阻断的。
 
@@ -123,7 +139,7 @@ SELinux 是**运行时按 (scontext, tcontext, tclass) 判定**的，静态探�
 
 ## 8. 未决问题 → 已裁定
 
-原三条未决问题已在 [ADR-AND-001 §7.5](../adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md) 定案：
+原三条未决问题已在 [ADR-AND-001 §7.5](../../adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md) 定案：
 
 1. **applets 探测粒度**：`toybox` + `busybox --list` 一次性取全量，再对 ≤10 个高价值命令做 `command -v` 抽查。逐个探测需上百次子进程派生，在移动端功耗不可接受；只信 `--list` 则会漏掉系统原生 `/system/bin/*`。
 2. **APK 档文件操作是否走 `ExecutionBackend`**：**不走**，继续用 `std::fs`。文件操作不需要 shell，为「四件套语义一致」而强行统一属于抽象先行。

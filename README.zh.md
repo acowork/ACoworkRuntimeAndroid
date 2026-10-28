@@ -17,8 +17,11 @@
 
 ---
 
-> **状态：早期开发 / 初始化骨架。** 本仓库刚刚创建。下文标注 🚧 或「计划中」的内容均为设计意图，
-> 并非已交付的代码。目前没有任何可用二进制产物，不适合用于生产环境。
+> **状态：早期开发。** 设计文档齐备，P0 切片（HostProfile 探测 + `ExecutionBackend` 契约）已交付为
+> 可构建、可测试的 Rust 库。**仍无任何可运行的二进制产物**，不适合用于生产环境。
+>
+> 下文标注 🚧 / ⬜ / ⛔ 的内容均为设计意图。三条 ⛔ 是「本仓库裁定 vs 上游权威」的冲突，
+> 需上游或产品裁定，详见[开发就绪度评估](docs/review/zh/2026-10-28-readiness-assessment.md)。
 
 ---
 
@@ -63,6 +66,14 @@ acowork-android serve --gateway-http http://<gateway-host>:19876
 - MQTT 注册与重连由 Android 的网络 / 电池回调驱动。
 - 工作区与包存储映射到应用私有的受作用域目录，可按需申请共享存储访问权限。
 - 面向日常使用：一个常在线、可被 Gateway 通过网络访问的 Agent 宿主。
+
+> ⛔ **形态归属未裁定（评估 B4）。** 上游已有 Android APK：`apps/acowork-mobile`
+> （Tauri v2，design 25 v1.3「工程开发中」/ ADR-086），但定位**相反**——它是「IM 形态的对话控制终端」，
+> 明确「❌ 无本地 Gateway 进程」「❌ Agent 管理不做」，且刻意不带 `acowork-core` / `rumqttc` 依赖；
+> 而本交付物是承载 Node Agent 的**节点宿主**。
+>
+> 未回答的问题：用户装两个 APK，还是 mobile 长出 host mode？包名 / 签名 / 前台服务 / 电池白名单如何共存？
+> 在该问题裁定前不应开工。可复用的是它的 **NDK 构建管线**（见「构建」一节）。
 
 两个版本共享同一套 Agent 引擎，差别在于**生命周期管理方式**（Termux 进程 vs. 前台服务）与
 **存储 / 权限策略**，而非运行时语义本身。
@@ -156,24 +167,49 @@ graph TD
 | # | 范围 | 状态 |
 |---|------|------|
 | 1 | 仓库骨架、许可证与本 README | 🚧 进行中 |
-| 2 | 共享 crate：把 node + runtime 引擎抽取到平台 trait 之后 | ⬜ 计划中 |
-| 3 | 命令行版本在 Termux 下运行，并注册到真实 Gateway | ⬜ 计划中 |
-| 4 | App 版本：前台服务、受作用域存储、保活 | ⬜ 计划中 |
-| 5 | `ExecutionBackend` trait + 启动时 HostProfile 能力探测 | ⬜ 计划中 |
+| 2 | 共享 crate：把 node + runtime 引擎抽取到平台 trait 之后 | ⛔ **阻塞（B3）** —— 上游 design 30 §5 与 §9 对「Android 引擎是编进 `acowork-runtime` 的 crate，还是依赖已发布 Host crate 的独立引擎」给出两种答案，且后者依赖的契约 crate 尚不存在 |
+| 3 | 命令行版本在 Termux 下运行，并注册到真实 Gateway | ⬜ 计划中（依赖 #2） |
+| 4 | App 版本：前台服务、受作用域存储、保活 | ⛔ **阻塞（B4）** —— 与上游 `apps/acowork-mobile`（Tauri v2 Android APK，design 25 / ADR-086）形态撞车而定位相反，归属未裁定 |
+| 5 | `ExecutionBackend` trait + 启动时 HostProfile 能力探测 | ✅ **已交付**（P0）—— `crates/acowork-android/src/host/`，115 测试通过 |
 | 6 | 电池 / Doze 调优与长跑稳定性测试 | ⬜ 计划中 |
-| 7 | 发布产物（Termux 包 + 签名 APK） | ⬜ 计划中 |
-| 8 | `root-shell` 宿主档，**仅只读能力**（`logcat` / `dumpsys` / `getprop`） | ⬜ 计划中 |
-| 9 | Android 调试工具集（截屏、ANR / tombstone / bugreport 采集）+ 命令审计日志 | ⬜ 计划中 |
-| 10 | 写能力档：审批门控、设备级写锁、prop / 文件自动回滚 | ⬜ 计划中 |
+| 7 | 发布产物（Termux 包 + 签名 APK） | ⬜ 计划中（依赖 #2/#4；NDK 管线可复用上游 `apps/acowork-mobile`） |
+| 8 | `root-shell` 宿主档，**仅只读能力**（`logcat` / `dumpsys` / `getprop`） | 🚧 **可开工** —— 契约与门控已就绪，待两个 backend 实现 + 真机验证 |
+| 9 | Android 调试工具集（截屏、ANR / tombstone / bugreport 采集）+ 命令审计日志 | ⬜ 计划中（依赖 #8） |
+| 10 | 写能力档：审批门控、设备级写锁、prop / 文件自动回滚 | ⛔ **阻塞（B1）** —— ADR §7.4 的 owner 合取项与上游 ADR-087 D1/D5 冲突；门控骨架已按「两权威分解」实现，待上游确认 |
 | 11 | Magisk 模块形态，用于长期挂机的调试设备农场 —— **仅当该需求真实成立** | ⬜ 暂缓 |
 
 顺序是刻意安排的：**先只读，后可写**。只读的 root 档已经能覆盖绝大多数系统调试诉求（日志、状态、属性），
 且几乎没有变砖风险；而写能力档集中了所有不可逆决策，因此被单独隔离到最后交付。
 
+三条 ⛔ 都不是本仓库内部能自决的，而是「本仓库裁定 vs 上游权威」的冲突。完整核对记录、已采用的架构解法、
+以及实现期新发现的 5 处契约缺口（B8–B12）见
+[开发就绪度评估](docs/review/zh/2026-10-28-readiness-assessment.md)。
+
 ## 构建
 
-目前尚无可构建内容。待出现第一个可编译的 crate 后，本节会补充构建说明，包括确切的 NDK 版本与
-目标三元组。
+### 宿主侧（当前可构建的部分）
+
+`crates/acowork-android` 是纯 Rust 库，不含平台相关代码，可在任意宿主上构建与测试：
+
+```bash
+cargo build                                        # 构建
+cargo test                                         # 115 个测试（98 单元 + 17 契约）
+cargo clippy --all-targets -- -D warnings          # 上游 CI 约定，须零告警
+cargo fmt --check
+```
+
+工具链对齐上游 `core/Cargo.toml`：edition 2024、rust-version 1.95、`async-trait` 0.1.92。
+该 crate **刻意不依赖** `acowork-runtime` / `acowork-core` —— 上游 design 30 §9 自己指出
+「`ExecutionBackend` 在引擎内部，EIP 在引擎外部」，二者正交；保持零引擎依赖使本 crate 在
+B3 的两种裁定下同时成立（既可折进上游作为模块，也可作为独立 crate 被消费）。
+
+### Android 侧（尚未开始）
+
+交叉编译、JNI 与 `.so` 打包的管线还没有建立，因此确切的 NDK 版本与目标三元组尚未固定。
+
+**不要从零搭**：上游 `apps/acowork-mobile` 已经跑通 Tauri v2 的 Android 构建（其 `Cargo.toml`
+含 `cfg(target_os = "android")` 段与 `jni` 依赖），NDK 版本、target triple 与打包步骤应先以它为基准，
+再按本仓库需要调整。这是评估 B4 里「已有事实未被复用」的那一条。
 
 ## 参与贡献
 
