@@ -1,0 +1,269 @@
+// Device harness: run the real probe, the real profile assembly and a real execution
+// against a physical device, and print what the port actually concluded.
+//
+//     ACOWORK_ADB=/tmp/platform-tools/adb \
+//     ACOWORK_ADB_SERIAL=emulator-5554 \
+//         cargo run -p acowork-android --example device_probe -- --out /tmp/probe.json
+//
+// Three things happen here, in order, and each answers a separate question:
+//
+//   1. **Probe** — what does the device say about itself, verbatim?
+//   2. **Assemble** — what profile and capabilities does the port derive from that, and does
+//      the derivation match what is independently known to be true of this device?
+//   3. **Execute** — does a command actually run through the real backend, with the identity
+//      that ran it correctly extracted from the output?
+//
+// Step 3 is what justifies the harness existing. Steps 1 and 2 can be checked by reading a
+// dump; step 3 is the only place where `script`'s quoting, the identity prologue, the output
+// cap, the deadline and the denial parser meet a shell that is not ours.
+
+use std::error::Error;
+use std::path::PathBuf;
+
+use acowork_android::host::capability::Capability;
+use acowork_android::host::probe::{CommandOutput, ProbeOutput, run_probe};
+use acowork_android::host::spawn::{SpawnInvocation, SpawnRunner};
+use acowork_android::host::{
+    AdbTransport, ExecRequest, ExecutionBackend, HostProfile, ProbeCommand, TermuxBackend,
+};
+use acowork_platform_contract::HostDescription;
+
+/// The package the harness pretends to be, used for the own-package root in probe item 12.
+/// Nothing is installed under this name; an absent `/data/data/<pkg>` is simply not reported,
+/// which is the honest answer rather than a fabricated one.
+const DEFAULT_OWN_PACKAGE: &str = "com.acowork.node";
+
+fn main() -> Result<(), Box<dyn Error>> {
+    tokio::runtime::Runtime::new()?.block_on(run())
+}
+
+struct Args {
+    out: Option<PathBuf>,
+    own_package: String,
+    skip_exec: bool,
+}
+
+fn parse_args() -> Result<Args, Box<dyn Error>> {
+    let mut args = Args {
+        out: None,
+        own_package: DEFAULT_OWN_PACKAGE.to_string(),
+        skip_exec: false,
+    };
+    let mut iter = std::env::args().skip(1);
+    while let Some(a) = iter.next() {
+        match a.as_str() {
+            "--out" => args.out = Some(PathBuf::from(iter.next().ok_or("--out needs a path")?)),
+            "--package" => args.own_package = iter.next().ok_or("--package needs a value")?,
+            "--skip-exec" => args.skip_exec = true,
+            other => return Err(format!("unrecognised argument `{other}`").into()),
+        }
+    }
+    Ok(args)
+}
+
+async fn run() -> Result<(), Box<dyn Error>> {
+    let args = parse_args()?;
+
+    let bare = AdbTransport::from_env().ok_or(
+        "no device configured: set ACOWORK_ADB (path to adb) and optionally \
+         ACOWORK_ADB_SERIAL (device serial, see `adb devices`)",
+    )?;
+
+    // Fail before the 17-command probe if adb cannot reach anything.
+    let hello = SpawnInvocation::new("/system/bin/sh", "echo acowork-harness\n");
+    match bare.spawn(hello).await {
+        Ok(out) if out.exit_code == Some(0) => {
+            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if text != "acowork-harness" {
+                return Err(format!("device echoed {text:?}, expected \"acowork-harness\"").into());
+            }
+        }
+        Ok(out) => {
+            return Err(format!(
+                "device reachable but the shell did not run the script: exit {:?}, stderr {}",
+                out.exit_code,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )
+            .into());
+        }
+        Err(e) => return Err(format!("cannot reach a device: {e}").into()),
+    }
+
+    // `$PREFIX` is read once up front: the trait method is synchronous because on the device
+    // it is an environment read, and a remote round trip must not happen inside it.
+    let transport = bare
+        .clone()
+        .with_termux_prefix(bare.read_termux_prefix().await);
+
+    let commands = ProbeCommand::read_only_set();
+    let probe = run_probe(&transport, &commands, &args.own_package).await;
+
+    println!(
+        "── 1. probe ({} commands) ─────────────────────────────",
+        commands.len()
+    );
+    report_probe(&probe);
+
+    if let Some(out) = &args.out {
+        std::fs::write(out, serde_json::to_string_pretty(&probe)?)?;
+        println!("\ncaptured fixture -> {}", out.display());
+    }
+
+    let profile = HostProfile::assemble(&probe, &args.own_package);
+    println!("\n── 2. assembled profile ─────────────────────────────");
+    report_profile(&profile);
+
+    if !args.skip_exec {
+        println!("\n── 3. execution ───────────────────────────────────");
+        report_exec(&profile, &transport).await;
+    }
+
+    Ok(())
+}
+
+fn report_probe(probe: &ProbeOutput) {
+    let field = |name: &str, slot: &Option<CommandOutput>| match slot {
+        None => println!("  {name:<16} not run"),
+        Some(o) => println!(
+            "  {name:<16} exit {:?}{}  {}",
+            o.exit_code,
+            if o.timed_out { " TIMEOUT" } else { "" },
+            excerpt(&o.stdout, &o.stderr),
+        ),
+    };
+    field("id -u", &probe.id);
+    field("getenforce", &probe.getenforce);
+    field("attr/current", &probe.attr_current);
+    field("su", &probe.su);
+    field("bash", &probe.bash_path);
+    field("sh --version", &probe.system_sh_version);
+    field("toybox list", &probe.toybox_list);
+    field("busybox list", &probe.busybox_list);
+    field("mounts", &probe.mount_table);
+    field("build.type", &probe.prop_build_type);
+    field("debuggable", &probe.prop_debuggable);
+    field("veritymode", &probe.prop_veritymode);
+    field("sdk", &probe.prop_sdk);
+    field("abi", &probe.prop_abi);
+    println!("  {:<16} {:?}", "termux $PREFIX", probe.termux_prefix);
+    println!("  {:<16} {} reachable", "fs roots", probe.fs_roots.len());
+    for r in &probe.fs_roots {
+        println!(
+            "    {} {}{}",
+            if r.writable { "rw" } else { "ro" },
+            r.path,
+            if r.own_package { " (own package)" } else { "" }
+        );
+    }
+}
+
+/// First 70 printable characters of a probe answer, preferring stdout.
+fn excerpt(stdout: &str, stderr: &str) -> String {
+    let src = if stdout.trim().is_empty() {
+        stderr
+    } else {
+        stdout
+    };
+    let cut: String = src.chars().filter(|c| *c != '\0').take(70).collect();
+    let flat = cut.replace('\n', " ").trim().to_string();
+    if flat.is_empty() { "(empty)" } else { &flat }.to_string()
+}
+
+fn report_profile(profile: &HostProfile) {
+    println!("  name         : {}", profile.name.as_str());
+    println!("  privilege    : {:?}", profile.privilege);
+    println!(
+        "  selinux      : {:?}  domain {:?}  context {:?}",
+        profile.selinux, profile.domain, profile.context
+    );
+    println!(
+        "  shell        : {:?}  all dialects {:?}",
+        profile.shell, profile.dialects
+    );
+    println!("  su           : {:?}", profile.su);
+    println!(
+        "  applets      : {} (source missing: {})",
+        profile.applets.len(),
+        profile.applets.list_source_missing
+    );
+    println!("  paths        : {:?}", profile.paths);
+    println!("  device       : {:?}", profile.device);
+    println!("  contract lvl : {:?}", HostDescription::privilege(profile));
+    println!(
+        "  R3 conformant: {}",
+        HostDescription::is_r3_conformant(profile)
+    );
+    println!(
+        "  escalation   : {:?}",
+        HostDescription::escalation(profile)
+    );
+
+    let summary = HostDescription::summary(profile);
+    println!(
+        "  summary      : {} / {} / {:?} / {:?}",
+        summary.platform, summary.profile, summary.privilege, summary.capabilities
+    );
+
+    println!("\n  declared:");
+    for id in profile.caps.declared_ids() {
+        let spec = profile
+            .caps
+            .spec(&acowork_platform_contract::HostCapability::parse(id).expect("declared id"));
+        match spec {
+            Some(s) => println!(
+                "    {:<22} {:?} / approval {:?} / {:?}",
+                id, s.effect, s.approval, s.reversibility
+            ),
+            None => println!("    {id}  (declared, no spec)"),
+        }
+    }
+    println!("  not declared, and why:");
+    for cap in Capability::all() {
+        let id = cap.id();
+        if profile.caps.is_declared(&id) {
+            continue;
+        }
+        println!("    {:<22} {}", id.as_str(), profile.explain_absence(&id));
+    }
+}
+
+async fn report_exec(profile: &HostProfile, transport: &AdbTransport) {
+    let backend = match TermuxBackend::with_runner(profile.clone(), transport.clone()) {
+        Ok(b) => b,
+        Err(e) => {
+            println!("  no shell backend for this profile: {e}");
+            return;
+        }
+    };
+    println!(
+        "  backend      : {} ({:?})",
+        backend.name(),
+        backend.dialect()
+    );
+    println!("  shell        : {}", backend.shell_path().display());
+    println!("  base env     : {:?}", backend.base_env());
+
+    let request = ExecRequest::read("echo acowork-harness-ok; id -u; pwd", "harness-session");
+    match backend.exec(request).await {
+        Ok(record) => {
+            println!("  exit         : {:?}", record.exit_code);
+            println!(
+                "  identity     : uid {:?}  context {:?}",
+                record.uid, record.context
+            );
+            println!(
+                "  timed out    : {}   truncated: {}",
+                record.timed_out, record.truncated
+            );
+            println!("  duration     : {}ms", record.duration_ms);
+            println!("  stdout       : {}", record.stdout.trim());
+            if !record.stderr.trim().is_empty() {
+                println!("  stderr       : {}", record.stderr.trim());
+            }
+            if !record.selinux_denials.is_empty() {
+                println!("  denials      : {:?}", record.selinux_denials);
+            }
+        }
+        Err(e) => println!("  failed       : {e}"),
+    }
+}

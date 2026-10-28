@@ -31,3 +31,21 @@ serde = { workspace = true, features = ["std"] }
 serde_json.workspace = true
 tokio.workspace = true
 
+[features]
+# The device harness: an `adb`-backed `SpawnRunner` and `ProbeRunner` that run this crate's
+# real types against a physical device from the machine attached to it.
+#
+# On by default because this crate is Android-only — it already carries `std` and `tokio`,
+# so the harness costs nothing in the shipped build — and because a verification module whose
+# tests only run when someone remembers a flag is a module that rots. `--no-default-features`
+# yields the lean runtime build with no host-side transport in it.
+default = ["device"]
+device = []
+
+# The harness example drives `host::adb`, which only exists with `device` on. Cargo builds
+# examples regardless of features unless told otherwise, so without this gate
+# `--no-default-features` — the very configuration the lean-build check exists to prove —
+# fails for a reason that has nothing to do with what that check is measuring.
+[[example]]
+name = "device_probe"
+required-features = ["device"]

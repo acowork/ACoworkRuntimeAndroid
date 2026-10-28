@@ -12,17 +12,17 @@
 //!     F --> PR["profile<br/>HostProfile aggregate"]
 //!     PR --> C["capability<br/>facts → capabilities"]
 //!     C --> PR
-//!     PR --> B["backend<br/>ExecutionBackend  gate"]
+//!     PR --> B["backend<br/>ExecutionBackend + gate"]
 //!     B --> D["denial<br/>stderr → next step"]
 //! ```
 //!
 //! | Layer | Module | Responsibility | Purity |
 //! |---|---|---|---|
 //! | Data model | [`facts`] | One type per probed fact, plus its text parser | Pure — no I/O |
-//! | Collection | [`probe`] | Which commands to run, the budget, routing results | Contract  routing |
+//! | Collection | [`probe`] | Which commands to run, the budget, routing results | Contract + routing |
 //! | Aggregate | [`profile`] | Assemble facts into the session-immutable `HostProfile` | Pure |
 //! | Derivation | [`capability`] | Capabilities as a function of facts, never of config | Pure |
-//! | Contract | [`backend`] | `ExecutionBackend`, and the gate that composes both authorities | Pure gate  async trait |
+//! | Contract | [`backend`] | `ExecutionBackend`, and the gate that composes both authorities | Pure gate + async trait |
 //! | Feedback | [`denial`] | `avc: denied` → an actionable next step | Pure, plus a session ledger |
 //!
 //! Keeping the parsers pure is not tidiness for its own sake: it is what makes the
@@ -45,6 +45,7 @@
 //!   listed in android-host-probe.md §6.
 
 pub mod backend;
+pub mod backends;
 pub mod capability;
 pub mod denial;
 pub mod facts;
@@ -53,11 +54,17 @@ pub mod profile;
 pub mod script;
 pub mod spawn;
 
+#[cfg(feature = "device")]
+pub mod adb;
+
+#[cfg(feature = "device")]
+pub use adb::{AdbTransport, CANDIDATE_ROOTS, RemoteArg};
 pub use backend::{
     ApprovalToken, BackendError, ContractBackend, DEFAULT_OUTPUT_CAP, DEFAULT_READ_TIMEOUT,
     ExecRecord, ExecRequest, ExecutionBackend, SessionLockOutcome, SessionWriteLock,
     WRITE_LOCK_TTL,
 };
+pub use backends::{AppSandboxBackend, RootShellBackend, TermuxBackend};
 pub use capability::{
     Capability, PLATFORM, android_vocabulary, derive_claims, explain_absence, lookup,
 };

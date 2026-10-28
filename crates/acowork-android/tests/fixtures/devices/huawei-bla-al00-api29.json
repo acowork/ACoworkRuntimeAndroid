@@ -1,0 +1,148 @@
+{
+  "id": {
+    "stdout": "2000\n",
+    "stderr": "",
+    "exit_code": 0,
+    "timed_out": false
+  },
+  "getenforce": {
+    "stdout": "Enforcing\n",
+    "stderr": "",
+    "exit_code": 0,
+    "timed_out": false
+  },
+  "attr_current": {
+    "stdout": "u:r:shell:s0\u0000",
+    "stderr": "",
+    "exit_code": 0,
+    "timed_out": false
+  },
+  "su": {
+    "stdout": "",
+    "stderr": "/system/bin/sh: su: inaccessible or not found\n",
+    "exit_code": 127,
+    "timed_out": false
+  },
+  "bash_path": {
+    "stdout": "",
+    "stderr": "",
+    "exit_code": 1,
+    "timed_out": false
+  },
+  "system_sh_version": {
+    "stdout": "KSH=@(#)MIRBSD KSH R57 2019/03/01 Android\nBASH=\n",
+    "stderr": "",
+    "exit_code": 0,
+    "timed_out": false
+  },
+  "toybox_list": {
+    "stdout": "acpi base64 basename bc blkid blockdev cal cat chattr chcon chgrp\nchmod chown chroot chrt cksum clear cmp comm cp cpio cut date dd devmem\ndf diff dirname dmesg dos2unix du echo egrep env expand expr fallocate\nfalse fgrep file find flock fmt free freeramdisk fsfreeze fsync getconf\ngetenforce getfattr grep groups gunzip gzip head help hostname hwclock\ni2cdetect i2cdump i2cget i2cset iconv id ifconfig inotifyd insmod\ninstall ionice iorenice iotop kill killall ln load_policy log logname\nlosetup ls lsattr lsmod lsof lspci lsusb makedevs md5sum microcom\nmkdir mkfifo mknod mkswap mktemp modinfo modprobe more mount mountpoint\nmv nbd-client netstat nice nl nohup nproc nsenter od partprobe paste\npatch pgrep pidof ping ping6 pivot_root pkill pmap printenv printf\nprlimit ps pwd pwdx readlink realpath renice restorecon rev rfkill\nrm rmdir rmmod runcon sed sendevent seq setenforce setfattr setprop\nsetsid sha1sum sha224sum sha256sum sha384sum sha512sum sleep sort\nsplit start stat stop strings stty swapoff swapon sync sysctl tac\ntail tar taskset tee time timeout top touch tr traceroute traceroute6\ntrue truncate tty tunctl ulimit umount uname uniq unix2dos unlink\nunshare uptime usleep uudecode uuencode uuidgen vconfig vmstat watch\nwc which whoami xargs xxd yes zcat \n",
+    "stderr": "",
+    "exit_code": 0,
+    "timed_out": false
+  },
+  "busybox_list": {
+    "stdout": "",
+    "stderr": "/system/bin/sh: busybox: inaccessible or not found\n",
+    "exit_code": 127,
+    "timed_out": false
+  },
+  "applet_spot_checks": {},
+  "mount_table": {
+    "stdout": "/dev/block/dm-7 / erofs ro,seclabel,relatime,user_xattr,lz4asm 0 0\ntmpfs /dev tmpfs rw,seclabel,nosuid,relatime,size=2874280k,nr_inodes=718570,mode=755 0 0\ndevpts /dev/pts devpts rw,seclabel,relatime,mode=600,ptmxmode=000 0 0\nproc /proc proc rw,relatime,gid=3009,hidepid=2 0 0\nsysfs /sys sysfs rw,seclabel,relatime 0 0\nselinuxfs /sys/fs/selinux selinuxfs rw,relatime 0 0\ntmpfs /mnt tmpfs rw,seclabel,nosuid,nodev,noexec,relatime,size=2874280k,nr_inodes=718570,mode=755,gid=1000 0 0\ntmpfs /apex tmpfs rw,seclabel,nosuid,nodev,noexec,relatime,size=2874280k,nr_inodes=718570,mode=755 0 0\n/dev/block/dm-5 /patch_hw erofs ro,seclabel,relatime,user_xattr,lz4asm 0 0\n/dev/block/dm-8 /cust erofs ro,seclabel,relatime,user_xattr,lz4asm 0 0\n/dev/block/dm-9 /hw_product erofs ro,seclabel,relatime,user_xattr,lz4asm 0 0\n/dev/block/dm-10 /odm erofs ro,seclabel,relatime,user_xattr,lz4asm 0 0\n/dev/block/dm-11 /preload erofs ro,seclabel,relatime,user_xattr,lz4asm 0 0\n/dev/block/dm-12 /prets erofs ro,seclabel,relatime,user_xattr,lz4asm 0 0\n/dev/block/dm-13 /pretvs erofs ro,seclabel,relatime,user_xattr,lz4asm 0 0\n/dev/block/dm-14 /vendor erofs ro,seclabel,relatime,user_xattr,lz4asm 0 0\n/dev/block/dm-15 /vendor/preavs erofs ro,seclabel,relatime,user_xattr,lz4asm 0 0\n/dev/block/dm-16 /version erofs ro,seclabel,relatime,user_xattr,lz4asm 0 0\nnone /dev/blkio cgroup rw,nosuid,nodev,noexec,relatime,blkio 0 0\nnone /dev/cg2_bpf cgroup2 rw,nosuid,nodev,noexec,relatime 0 0\nnone /dev/cpuctl cgroup rw,nosuid,nodev,noexec,relatime,cpu 0 0\nnone /acct cgroup rw,nosuid,nodev,noexec,relatime,cpuacct 0 0\nnone /dev/cpuset cgroup rw,nosuid,nodev,noexec,relatime,cpuset,noprefix,release_agent=/sbin/cpuset_release_agent 0 0\nnone /dev/memcg cgroup rw,nosuid,nodev,noexec,relatime,memory 0 0\nnone /dev/stune cgroup rw,nosuid,nodev,noexec,relatime,schedtune 0 0\ndebugfs /sys/kernel/debug debugfs rw,seclabel,relatime 0 0\nnone /config configfs rw,nosuid,nodev,noexec,relatime 0 0\nbpf /sys/fs/bpf bpf rw,nosuid,nodev,noexec,relatime 0 0\npstore /sys/fs/pstore pstore rw,seclabel,nosuid,nodev,noexec,relatime 0 0\nnone /dev/iolimit cgroup rw,relatime,iolimit 0 0\noverlay /system/lib64 overlay ro,seclabel,relatime,lowerdir=/patch_hw/overlay/system/lib64:/system/lib64 0 0\nnone /mnt/update_engine tmpfs rw,seclabel,nosuid,nodev,relatime,size=2874280k,nr_inodes=718570,mode=700 0 0\nnone /dev/workingset cgroup rw,nosuid,nodev,noexec,relatime,workingset 0 0\nadb /dev/usb-ffs/adb functionfs rw,relatime 0 0\nhdb /dev/usb-ffs/hdb functionfs rw,relatime 0 0\nnone /dev/frz cgroup rw,relatime,freezer 0 0\n/dev/block/bootdevice/by-name/secure_storage /sec_storage ext4 rw,context=u:object_r:teecd_data_file:s0,nosuid,nodev,noatime,discard,nodelalloc,data=journal 0 0\ntracefs /sys/kernel/debug/tracing tracefs rw,seclabel,relatime 0 0\n/dev/block/by-name/splash2 /splash2 ext4 rw,context=u:object_r:splash2_data_file:s0,nosuid,nodev,noatime,data=ordered 0 0\n/dev/block/by-name/userdata /data f2fs rw,seclabel,nosuid,nodev,noatime,background_gc=on,discard,no_heap,user_xattr,inline_xattr,acl,inline_data,inline_dentry,extent_cache,mode=adaptive,inline_encrypt,sdp_encrypt,active_logs=6,alloc_mode=default,fsync_mode=posix 0 0\n/dev/block/dm-17 /preas erofs ro,seclabel,relatime,user_xattr,lz4asm 0 0\n/dev/block/by-name/cache /cache ext4 rw,seclabel,nosuid,nodev,noatime,data=ordered 0 0\n/dev/block/by-name/hisee_fs /mnt/hisee_fs ext4 ro,context=u:object_r:hisee_data_file:s0,relatime,data=ordered 0 0\noverlay /system/product/priv-app overlay ro,seclabel,relatime,lowerdir=/preas/priv-app:/system/product/priv-app 0 0\noverlay /system/product/app overlay ro,seclabel,relatime,lowerdir=/preas/app:/system/product/app 0 0\noverlay /system/product/etc/permissions overlay ro,seclabel,relatime,lowerdir=/preas/china/permissions:/system/product/etc/permissions 0 0\n/dev/block/by-name/modem_secure /mnt/modem/modem_secure ext4 rw,context=u:object_r:modem_secure_file:s0,nosuid,nodev,noatime,noauto_da_alloc,data=ordered 0 0\n/dev/block/by-name/modem_om /modem_log ext4 rw,context=u:object_r:modem_log_file:s0,nosuid,nodev,noatime,noauto_da_alloc,data=ordered 0 0\n/dev/block/by-name/modem_fw /vendor/modem/modem_fw ext4 ro,context=u:object_r:modem_fw_file:s0,relatime,data=ordered 0 0\n/dev/block/by-name/modemnvm_img /mnt/modem/mnvm2:0 ext4 rw,context=u:object_r:modem_nv_file:s0,nosuid,nodev,noatime,noauto_da_alloc,data=ordered 0 0\ntmpfs /storage tmpfs rw,seclabel,nosuid,nodev,noexec,relatime,size=2874280k,nr_inodes=718570,mode=755,gid=1000 0 0\n/dev/block/loop3 /apex/com.android.apex.cts.shim@1 ext4 ro,dirsync,seclabel,nodev,noatime 0 0\n/dev/block/loop3 /apex/com.android.apex.cts.shim ext4 ro,dirsync,seclabel,nodev,noatime 0 0\n/dev/block/loop4 /apex/com.android.conscrypt@300000000 ext4 ro,dirsync,seclabel,nodev,noatime 0 0\n/dev/block/loop4 /apex/com.android.conscrypt ext4 ro,dirsync,seclabel,nodev,noatime 0 0\n/dev/block/loop5 /apex/com.android.media@300000000 ext4 ro,dirsync,seclabel,nodev,noatime 0 0\n/dev/block/loop5 /apex/com.android.media ext4 ro,dirsync,seclabel,nodev,noatime 0 0\n/dev/block/loop6 /apex/com.android.media.swcodec@300000000 ext4 ro,dirsync,seclabel,nodev,noatime 0 0\n/dev/block/loop6 /apex/com.android.media.swcodec ext4 ro,dirsync,seclabel,nodev,noatime 0 0\n/dev/block/loop7 /apex/com.android.resolv@300000000 ext4 ro,dirsync,seclabel,nodev,noatime 0 0\n/dev/block/loop7 /apex/com.android.resolv ext4 ro,dirsync,seclabel,nodev,noatime 0 0\n/dev/block/loop8 /apex/com.android.runtime@1 ext4 ro,dirsync,seclabel,nodev,noatime 0 0\n/dev/block/loop8 /apex/com.android.runtime ext4 ro,dirsync,seclabel,nodev,noatime 0 0\n/dev/block/loop9 /apex/com.android.tzdata@300000000 ext4 ro,dirsync,seclabel,nodev,noatime 0 0\n/dev/block/loop9 /apex/com.android.tzdata ext4 ro,dirsync,seclabel,nodev,noatime 0 0\nnone /sys/fs/cgroup tmpfs rw,seclabel,relatime,size=2874280k,nr_inodes=718570,mode=750,gid=1000 0 0\nnone /sys/fs/cgroup/pids cgroup rw,relatime,pids 0 0\n/dev/block/dm-7 /data/app/com.huawei.hwdiagnosis-iYMSj7k0a3BV3Sw0S1NPtA==/PluginFoundation.apk erofs ro,seclabel,relatime,user_xattr,lz4asm 0 0\n/dev/block/dm-7 /data/app/com.huawei.hwdiagnosis-iYMSj7k0a3BV3Sw0S1NPtA==/PhoneEntry.apk erofs ro,seclabel,relatime,user_xattr,lz4asm 0 0\n/dev/block/dm-7 /data/app/com.huawei.hwdiagnosis-iYMSj7k0a3BV3Sw0S1NPtA==/smartnotify.apk erofs ro,seclabel,relatime,user_xattr,lz4asm 0 0\n/dev/block/dm-7 /data/app/com.huawei.hwdiagnosis-iYMSj7k0a3BV3Sw0S1NPtA==/PluginUpdateUi.apk erofs ro,seclabel,relatime,user_xattr,lz4asm 0 0\n/dev/block/by-name/userdata /data/app/com.huawei.hiai-1zckEHFa9vkWfwI4-XPYzg==/HwHiAiEngine.apk f2fs rw,seclabel,nosuid,nodev,noatime,background_gc=on,discard,no_heap,user_xattr,inline_xattr,acl,inline_data,inline_dentry,extent_cache,mode=adaptive,inline_encrypt,sdp_encrypt,active_logs=6,alloc_mode=default,fsync_mode=posix 0 0\n/dev/block/by-name/userdata /data/app/com.huawei.hiai-1zckEHFa9vkWfwI4-XPYzg==/asr.apk f2fs rw,seclabel,nosuid,nodev,noatime,background_gc=on,discard,no_heap,user_xattr,inline_xattr,acl,inline_data,inline_dentry,extent_cache,mode=adaptive,inline_encrypt,sdp_encrypt,active_logs=6,alloc_mode=default,fsync_mode=posix 0 0\n/dev/block/by-name/userdata /data/app/com.huawei.hiai-1zckEHFa9vkWfwI4-XPYzg==/awareness-auxiliary.apk f2fs rw,seclabel,nosuid,nodev,noatime,background_gc=on,discard,no_heap,user_xattr,inline_xattr,acl,inline_data,inline_dentry,extent_cache,mode=adaptive,inline_encrypt,sdp_encrypt,active_logs=6,alloc_mode=default,fsync_mode=posix 0 0\n/dev/block/by-name/userdata /data/app/com.huawei.hiai-1zckEHFa9vkWfwI4-XPYzg==/compatible-china-release.apk f2fs rw,seclabel,nosuid,nodev,noatime,background_gc=on,discard,no_heap,user_xattr,inline_xattr,acl,inline_data,inline_dentry,extent_cache,mode=adaptive,inline_encrypt,sdp_encrypt,active_logs=6,alloc_mode=default,fsync_mode=posix 0 0\n/dev/block/by-name/userdata /data/app/com.huawei.hiai-1zckEHFa9vkWfwI4-XPYzg==/visionplugin-aestheticsfull-common-china-release.apk f2fs rw,seclabel,nosuid,nodev,noatime,background_gc=on,discard,no_heap,user_xattr,inline_xattr,acl,inline_data,inline_dentry,extent_cache,mode=adaptive,inline_encrypt,sdp_encrypt,active_logs=6,alloc_mode=default,fsync_mode=posix 0 0\n/dev/block/by-name/userdata /data/app/com.huawei.hiai-1zckEHFa9vkWfwI4-XPYzg==/visionplugin-barcode-common-china-release.apk f2fs rw,seclabel,nosuid,nodev,noatime,background_gc=on,discard,no_heap,user_xattr,inline_xattr,acl,inline_data,inline_dentry,extent_cache,mode=adaptive,inline_encrypt,sdp_encrypt,active_logs=6,alloc_mode=default,fsync_mode=posix 0 0\n/dev/block/by-name/userdata /data/app/com.huawei.hiai-1zckEHFa9vkWfwI4-XPYzg==/visionplugin-carddetect-kirin970-china-release.apk f2fs rw,seclabel,nosuid,nodev,noatime,background_gc=on,discard,no_heap,user_xattr,inline_xattr,acl,inline_data,inline_dentry,extent_cache,mode=adaptive,inline_encrypt,sdp_encrypt,active_logs=6,alloc_mode=default,fsync_mode=posix 0 0\n/dev/block/by-name/userdata /data/app/com.huawei.hiai-1zckEHFa9vkWfwI4-XPYzg==/visionplugin-docrefine-common-china-release.apk f2fs rw,seclabel,nosuid,nodev,noatime,background_gc=on,discard,no_heap,user_xattr,inline_xattr,acl,inline_data,inline_dentry,extent_cache,mode=adaptive,inline_encrypt,sdp_encrypt,active_logs=6,alloc_mode=default,fsync_mode=posix 0 0\n/dev/block/by-name/userdata /data/app/com.huawei.hiai-1zckEHFa9vkWfwI4-XPYzg==/visionplugin-faceattribute-common-china-release.apk f2fs rw,seclabel,nosuid,nodev,noatime,background_gc=on,discard,no_heap,user_xattr,inline_xattr,acl,inline_data,inline_dentry,extent_cache,mode=adaptive,inline_encrypt,sdp_encrypt,active_logs=6,alloc_mode=default,fsync_mode=posix 0 0\n/dev/block/by-name/userdata /data/app/com.huawei.hiai-1zckEHFa9vkWfwI4-XPYzg==/visionplugin-facecluster-common-china-release.apk f2fs rw,seclabel,nosuid,nodev,noatime,background_gc=on,discard,no_heap,user_xattr,inline_xattr,acl,inline_data,inline_dentry,extent_cache,mode=adaptive,inline_encrypt,sdp_encrypt,active_logs=6,alloc_mode=default,fsync_mode=posix 0 0\n/dev/block/by-name/userdata /data/app/com.huawei.hiai-1zckEHFa9vkWfwI4-XPYzg==/visionplugin-facecompare-common-china-release.apk f2fs rw,seclabel,nosuid,nodev,noatime,background_gc=on,discard,no_heap,user_xattr,inline_xattr,acl,inline_data,inline_dentry,extent_cache,mode=adaptive,inline_encrypt,sdp_encrypt,active_logs=6,alloc_mode=default,fsync_mode=posix 0 0\n/dev/block/by-name/userdata /data/app/com.huawei.hiai-1zckEHFa9vkWfwI4-XPYzg==/visionplugin-facedetect-common-china-release.apk f2fs rw,seclabel,nosuid,nodev,noatime,background_gc=on,discard,no_heap,user_xattr,inline_xattr,acl,inline_data,inline_dentry,extent_cache,mode=adaptive,inline_encrypt,sdp_encrypt,active_logs=6,alloc_mode=default,fsync_mode=posix 0 0\n/dev/block/by-name/userdata /data/app/com.huawei.hiai-1zckEHFa9vkWfwI4-XPYzg==/visionplugin-facelandmark-kirin970-china-release.apk f2fs rw,seclabel,nosuid,nodev,noatime,background_gc=on,discard,no_heap,user_xattr,inline_xattr,acl,inline_data,inline_dentry,extent_cache,mode=adaptive,inline_encrypt,sdp_encrypt,active_logs=6,alloc_mode=default,fsync_mode=posix 0 0\n/dev/block/by-name/userdata /data/app/com.huawei.hiai-1zckEHFa9vkWfwI4-XPYzg==/dm-ondeviceai.apk f2fs rw,seclabel,nosuid,nodev,noatime,background_gc=on,discard,no_heap,user_xattr,inline_xattr,acl,inline_data,inline_dentry,extent_cache,mode=adaptive,inline_encrypt,sdp_encrypt,active_logs=6,alloc_mode=default,fsync_mode=posix 0 0\n/dev/block/by-name/userdata /data/app/com.huawei.hiai-1zckEHFa9vkWfwI4-XPYzg==/visionplugin-focusocr-kirin970-china-release.apk f2fs rw,seclabel,nosuid,nodev,noatime,background_gc=on,discard,no_heap,user_xattr,inline_xattr,acl,inline_data,inline_dentry,extent_cache,mode=adaptive,inline_encrypt,sdp_encrypt,active_logs=6,alloc_mode=default,fsync_mode=posix 0 0\n/dev/block/by-name/userdata /data/app/com.huawei.hiai-1zckEHFa9vkWfwI4-XPYzg==/visionplugin-headpose-kirin970-china-release.apk f2fs rw,seclabel,nosuid,nodev,noatime,background_gc=on,discard,no_heap,user_xattr,inline_xattr,acl,inline_data,inline_dentry,extent_cache,mode=adaptive,inline_encrypt,sdp_encrypt,active_logs=6,alloc_mode=default,fsync_mode=posix 0 0\n/dev/block/by-name/userdata /data/app/com.huawei.hiai-1zckEHFa9vkWfwI4-XPYzg==/visionplugin-labeldetect-common-china-release.apk f2fs rw,seclabel,nosuid,nodev,noatime,background_gc=on,discard,no_heap,user_xattr,inline_xattr,acl,inline_data,inline_dentry,extent_cache,mode=adaptive,inline_encrypt,sdp_encrypt,active_logs=6,alloc_mode=default,fsync_mode=posix 0 0\n/dev/block/by-name/userdata /data/app/com.huawei.hiai-1zckEHFa9vkWfwI4-XPYzg==/visionplugin-screenshotocr-common-china-release.apk f2fs rw,seclabel,nosuid,nodev,noatime,background_gc=on,discard,no_heap,user_xattr,inline_xattr,acl,inline_data,inline_dentry,extent_cache,mode=adaptive,inline_encrypt,sdp_encrypt,active_logs=6,alloc_mode=default,fsync_mode=posix 0 0\n/dev/block/by-name/userdata /data/app/com.huawei.hiai-1zckEHFa9vkWfwI4-XPYzg==/visionplugin-portraitseg-kirin970-china-release.apk f2fs rw,seclabel,nosuid,nodev,noatime,background_gc=on,discard,no_heap,user_xattr,inline_xattr,acl,inline_data,inline_dentry,extent_cache,mode=adaptive,inline_encrypt,sdp_encrypt,active_logs=6,alloc_mode=default,fsync_mode=posix 0 0\n/dev/block/by-name/userdata /data/app/com.huawei.hiai-1zckEHFa9vkWfwI4-XPYzg==/visionplugin-segsemantic-kirin970-china-release.apk f2fs rw,seclabel,nosuid,nodev,noatime,background_gc=on,discard,no_heap,user_xattr,inline_xattr,acl,inline_data,inline_dentry,extent_cache,mode=adaptive,inline_encrypt,sdp_encrypt,active_logs=6,alloc_mode=default,fsync_mode=posix 0 0\n/dev/block/by-name/userdata /data/app/com.huawei.hiai-1zckEHFa9vkWfwI4-XPYzg==/visionplugin-sisr-kirin970-china-release.apk f2fs rw,seclabel,nosuid,nodev,noatime,background_gc=on,discard,no_heap,user_xattr,inline_xattr,acl,inline_data,inline_dentry,extent_cache,mode=adaptive,inline_encrypt,sdp_encrypt,active_logs=6,alloc_mode=default,fsync_mode=posix 0 0\n/dev/block/by-name/userdata /data/app/com.huawei.hiai-1zckEHFa9vkWfwI4-XPYzg==/visionplugin-txtimagesr-kirin970-china-release.apk f2fs rw,seclabel,nosuid,nodev,noatime,background_gc=on,discard,no_heap,user_xattr,inline_xattr,acl,inline_data,inline_dentry,extent_cache,mode=adaptive,inline_encrypt,sdp_encrypt,active_logs=6,alloc_mode=default,fsync_mode=posix 0 0\n/dev/block/by-name/userdata /data/app/com.huawei.hiai-1zckEHFa9vkWfwI4-XPYzg==/visionplugin-videoanalysis-common-china-release.apk f2fs rw,seclabel,nosuid,nodev,noatime,background_gc=on,discard,no_heap,user_xattr,inline_xattr,acl,inline_data,inline_dentry,extent_cache,mode=adaptive,inline_encrypt,sdp_encrypt,active_logs=6,alloc_mode=default,fsync_mode=posix 0 0\n/dev/block/by-name/userdata /data/app/com.huawei.hiai-1zckEHFa9vkWfwI4-XPYzg==/visionplugin-videomulti-common-china-release.apk f2fs rw,seclabel,nosuid,nodev,noatime,background_gc=on,discard,no_heap,user_xattr,inline_xattr,acl,inline_data,inline_dentry,extent_cache,mode=adaptive,inline_encrypt,sdp_encrypt,active_logs=6,alloc_mode=default,fsync_mode=posix 0 0\n/dev/block/by-name/userdata /data/app/com.huawei.hiai-1zckEHFa9vkWfwI4-XPYzg==/visionplugin-videosemantic-common-china-release.apk f2fs rw,seclabel,nosuid,nodev,noatime,background_gc=on,discard,no_heap,user_xattr,inline_xattr,acl,inline_data,inline_dentry,extent_cache,mode=adaptive,inline_encrypt,sdp_encrypt,active_logs=6,alloc_mode=default,fsync_mode=posix 0 0\n/dev/block/by-name/userdata /data/app/com.huawei.hiai-1zckEHFa9vkWfwI4-XPYzg==/translation.apk f2fs rw,seclabel,nosuid,nodev,noatime,background_gc=on,discard,no_heap,user_xattr,inline_xattr,acl,inline_data,inline_dentry,extent_cache,mode=adaptive,inline_encrypt,sdp_encrypt,active_logs=6,alloc_mode=default,fsync_mode=posix 0 0\n/dev/block/dm-7 /data/app/com.huawei.behaviorauth-FQo86Fq4QsY-S0YcDlEj6Q==/HwBehaviorAuth.apk erofs ro,seclabel,relatime,user_xattr,lz4asm 0 0\n/data/media /mnt/runtime/default/emulated sdcardfs rw,nosuid,nodev,noexec,noatime,fsuid=1023,fsgid=1023,gid=1015,multiuser,mask=6,derive_gid,default_normal,reserved=20MB,unshared_obb 0 0\n/data/media /storage/emulated sdcardfs rw,nosuid,nodev,noexec,noatime,fsuid=1023,fsgid=1023,gid=1015,multiuser,mask=6,derive_gid,default_normal,reserved=20MB,unshared_obb 0 0\n/data/media /mnt/runtime/read/emulated sdcardfs rw,nosuid,nodev,noexec,noatime,fsuid=1023,fsgid=1023,gid=9997,multiuser,mask=23,derive_gid,default_normal,reserved=20MB,unshared_obb 0 0\n/data/media /mnt/runtime/write/emulated sdcardfs rw,nosuid,nodev,noexec,noatime,fsuid=1023,fsgid=1023,gid=9997,multiuser,mask=7,derive_gid,default_normal,reserved=20MB,unshared_obb 0 0\n/data/media /mnt/runtime/full/emulated sdcardfs rw,nosuid,nodev,noexec,noatime,fsuid=1023,fsgid=1023,gid=9997,multiuser,mask=7,derive_gid,default_normal,reserved=20MB,unshared_obb 0 0\n/data/misc_ce/0/kdfs/storage /mnt/mdfs/.hmdfs hmdfs rw,relatime,sensitive,merge_enable,ra_pages=128,account=761281879110605528,recv_uid=1023,cache_dir=/data/misc_ce/0/kdfs/cache/16448759908547494974,real_dst=/mnt/mdfs/.hmdfs,offline_stash,dentry_cache 0 0\n/data/misc_ce/0/kdfs/storage /mnt/mdfs/account_trust hmdfs rw,relatime,sensitive,merge_enable,ra_pages=128,account=761281879110605528,recv_uid=1023,cache_dir=/data/misc_ce/0/kdfs/cache/16448759908547494974,real_dst=/mnt/mdfs/.hmdfs,offline_stash,dentry_cache 0 0\n/data/media/0 /mnt/mdfs/sdcard hmdfs rw,relatime,insensitive,merge_disable,ra_pages=128,account=761281879110605528,recv_uid=1023,cache_dir=/data/misc_ce/0/kdfs/cache/16448759910518911873,real_dst=/mnt/mdfs/sdcard,offline_stash,dentry_cache 0 0\n/mnt/media_rw /mnt/mdfs/external_storage hmdfs rw,relatime,insensitive,merge_disable,ra_pages=128,account=761281879110605528,recv_uid=1023,cache_dir=/data/misc_ce/0/kdfs/cache/14998924782874330279,real_dst=/mnt/mdfs/external_storage,no_offline_stash,dentry_cache,external_storage 0 0\n/data/misc_ce/0/kdfs/storage /mnt/mdfs/761281879110605528 hmdfs rw,relatime,sensitive,merge_enable,ra_pages=128,account=761281879110605528,recv_uid=1023,cache_dir=/data/misc_ce/0/kdfs/cache/16448759908547494974,real_dst=/mnt/mdfs/.hmdfs,offline_stash,dentry_cache 0 0\nmdfs /mnt/mdfs/groups fuse rw,nosuid,nodev,relatime,user_id=0,group_id=0,allow_other 0 0\n",
+    "stderr": "",
+    "exit_code": 0,
+    "timed_out": false
+  },
+  "system_remount": null,
+  "prop_build_type": {
+    "stdout": "user\n",
+    "stderr": "",
+    "exit_code": 0,
+    "timed_out": false
+  },
+  "prop_debuggable": {
+    "stdout": "0\n",
+    "stderr": "",
+    "exit_code": 0,
+    "timed_out": false
+  },
+  "prop_secure": {
+    "stdout": "1\n",
+    "stderr": "",
+    "exit_code": 0,
+    "timed_out": false
+  },
+  "prop_adb_secure": {
+    "stdout": "1\n",
+    "stderr": "",
+    "exit_code": 0,
+    "timed_out": false
+  },
+  "prop_veritymode": {
+    "stdout": "enforcing\n",
+    "stderr": "",
+    "exit_code": 0,
+    "timed_out": false
+  },
+  "prop_sdk": {
+    "stdout": "29\n",
+    "stderr": "",
+    "exit_code": 0,
+    "timed_out": false
+  },
+  "prop_abi": {
+    "stdout": "arm64-v8a\n",
+    "stderr": "",
+    "exit_code": 0,
+    "timed_out": false
+  },
+  "termux_prefix": null,
+  "fs_roots": [
+    {
+      "path": "/data/local/tmp",
+      "writable": true,
+      "own_package": false
+    },
+    {
+      "path": "/sdcard",
+      "writable": true,
+      "own_package": false
+    },
+    {
+      "path": "/storage/self/primary",
+      "writable": true,
+      "own_package": false
+    },
+    {
+      "path": "/data",
+      "writable": false,
+      "own_package": false
+    },
+    {
+      "path": "/data/data",
+      "writable": false,
+      "own_package": false
+    },
+    {
+      "path": "/system",
+      "writable": false,
+      "own_package": false
+    },
+    {
+      "path": "/vendor",
+      "writable": false,
+      "own_package": false
+    },
+    {
+      "path": "/product",
+      "writable": false,
+      "own_package": false
+    },
+    {
+      "path": "/",
+      "writable": false,
+      "own_package": false
+    }
+  ]
+}
