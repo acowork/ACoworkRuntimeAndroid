@@ -1,0 +1,54 @@
+android: enforce §4.4's auto-pass on script content, not on the label
+
+`ExecRequest::read()` is a self-declaration. The gate saw a capability ID
+and an envelope — contract rule R12 keeps script text out of what it
+evaluates — so `android:shell:read`'s approval-free path was guarded by
+nothing but the caller's honesty. A request labelled `read` that ran
+`setprop persist.acowork.on 1`, or `mount -o remount,rw /system`, passed
+the gate and reached the device with no human in the loop. ADR-AND-001
+§4.4 auto-passes that tier *because the commands under it cannot change
+the device*; the ruling described a property of the content and the
+implementation checked a property of the label.
+
+Adds `host/commands.rs`: a fail-closed classifier that answers which
+capability running a script actually exercises.
+
+- §4.4's read list verbatim (getprop / dumpsys / logcat / ps / df / mount
+  / getenforce), plus what this crate's own startup probe already runs
+  unattended, plus pure text filters.
+- Flags and subcommands that flip a read into a write, because the command
+  name alone is not the fact: `logcat -c` clears the buffer, `logcat -r`
+  writes a file, `sed -i` edits in place, `mount` lists and
+  `mount -o remount,rw` does not, `pm list` reads and `pm install` does
+  not, `screencap <path>` writes a capture.
+- §4.6.3's hard-ban list: `dd of=/dev/block/*`, `rm -r` against a partition
+  root, `fastboot`, `flash`, `mkfs`, `wipe-data` — refused at every tier,
+  and the refusal does not offer a capability to request, because that
+  would send the caller looking for a tier that does not exist.
+- Multiplexers resolve one level (`toybox rm` is `rm`), and absolute paths
+  normalise to their basename, because the backends spell `/system/bin/…`
+  out for a child that starts with a cleared environment.
+- Anything unanalysable is refused rather than allowed: `$(…)`, backquotes,
+  control flow, backgrounding, here-documents, an unknown command word,
+  and the runners-of-other-commands (`sh -c`, `eval`, `env <cmd>`,
+  `command <cmd>`). `env` and `command` are on the read list for their
+  reporting forms, so without this they were a hole with a friendly name.
+
+Enforcement sits in `run_script`, the one path every shell backend takes,
+before anything is assembled or spawned. Coverage is measured by rank, not
+by equality: a `shell:write` label does authorise the reads that come with
+it, so comparing capabilities for equality would have named `getprop` as
+the offender in a correctly labelled write. Over-claiming is allowed — the
+dangerous direction is under-claiming.
+
+`backends.rs`' module doc said a backend re-checking permission would be
+"a second copy of a rule". It is not, and the doc now says why: the gate
+cannot evaluate this rule at all, because R12 gives it no script text.
+
+Verified on the Huawei BLA-AL00, not only in unit tests: `getprop
+ro.build.type` runs (exit 0); `settings put global airplane_mode_on 1`
+under a read label is refused naming `settings put` and
+`android:shell:write`; a multiplexed `rm` against `/data` is refused even
+under a write label. 382 tests green (24 classifier + 5 backend
+enforcement), clippy clean on both feature sets, bare-metal target
+unaffected.

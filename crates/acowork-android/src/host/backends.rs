@@ -8,12 +8,22 @@
 //!
 //! # What a backend is allowed to decide
 //!
-//! Nothing about permission. By the time [`ExecutionBackend::exec`] is called the gate has
-//! already run and refused anything it did not like, so a backend that re-checked capabilities
-//! would be a second copy of a rule — and two copies drift, which is how a port ends up with
-//! a check that passes on one path and fails on the other.
+//! Nothing about **authorisation**. By the time [`ExecutionBackend::exec`] is called the gate
+//! has already run, and a backend that re-decided registration, approval, reversibility or
+//! attribution would be a second copy of a rule — two copies drift, which is how a port ends
+//! up with a check that passes on one path and fails on the other.
 //!
-//! What a backend *does* decide is everything the gate cannot know:
+//! There is one thing a backend decides that looks like permission from the outside, and it
+//! is not a second copy because the gate cannot evaluate it at all: whether the script's
+//! *content* matches the capability the caller labelled it with. Contract rule R12 keeps
+//! script text out of the envelope the gate sees, so the gate is handed `android:shell:read`
+//! as an assertion about the commands and has no way to test it. ADR-AND-001 §4.4 auto-passes
+//! that tier precisely because those commands cannot change the device, so the assertion is
+//! the whole of the safety argument, and [`commands::check`](super::commands::check) is where
+//! it stops being taken on trust. It runs in [`run_script`], the one path every shell backend
+//! takes, before anything is assembled or spawned.
+//!
+//! What a backend *also* decides is everything else the gate cannot know:
 //!
 //! - which binary to exec, and with what arguments;
 //! - what environment a cleared process starts with;
@@ -47,6 +57,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 
 use super::backend::{BackendError, ExecRecord, ExecRequest, ExecutionBackend};
+use super::commands;
 use super::denial::parse_denials;
 use super::facts::{ShellDialect, su_helper_missing, su_prompt_denied};
 use super::profile::HostProfile;
@@ -201,6 +212,13 @@ async fn run_script<R: SpawnRunner>(
     base_env: &BTreeMap<String, String>,
     helper: Option<&str>,
 ) -> Result<ExecRecord, BackendError> {
+    // Content before mechanism: the script is checked against the capability it claims
+    // *before* anything is assembled or spawned, so a mislabelled request never reaches the
+    // device. This is the one choke point every shell backend goes through.
+    if let Err(refusal) = commands::check(&request.script, request.android_capability()) {
+        return Err(BackendError::Refused(refusal.to_string()));
+    }
+
     let prepared = script::prepare(&request.script, request.cwd.as_deref(), &request.env)
         .map_err(|e| BackendError::Backend(e.to_string()))?;
 
@@ -1248,6 +1266,102 @@ mod tests {
         assert!(
             backend.runner.invocations().is_empty(),
             "nothing should have run"
+        );
+    }
+
+    // ── content versus claim (ADR-AND-001 §4.4) ──────────────────────────────
+
+    #[tokio::test]
+    async fn a_write_labelled_as_read_never_reaches_the_device() {
+        // The hole §4.4 was supposed to close and didn't: `read()` is a self-declaration, so
+        // without a content check the auto-pass tier is one careless label away from running
+        // `setprop` unattended. The refusal has to happen before the spawn, not after.
+        let runner = FakeShell::app().into_runner();
+        let backend = ShellBackend::with_runner(termux_profile(), runner).unwrap();
+
+        let request = ExecRequest::read("setprop persist.acowork.on 1", "session-1");
+        let err = backend.exec(request).await.unwrap_err();
+
+        assert!(matches!(err, BackendError::Refused(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains("setprop"), "{text}");
+        assert!(
+            text.contains(&Capability::ShellWrite.id().to_string()),
+            "the refusal must name the capability that would authorise it: {text}"
+        );
+        assert!(
+            backend.runner.invocations().is_empty(),
+            "a refused request must not touch the device"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_remount_labelled_as_read_is_refused_by_the_privileged_backend_too() {
+        let runner = FakeShell::root().into_runner();
+        let backend = RootShellBackend::with_runner(rooted_profile(), runner).unwrap();
+
+        let request = ExecRequest::read("mount -o remount,rw /system", "session-1");
+        let err = backend.exec(request).await.unwrap_err();
+        assert!(matches!(err, BackendError::Refused(_)), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains(&Capability::FsSystem.id().to_string()),
+            "{err}"
+        );
+        assert!(backend.runner.invocations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_hard_banned_command_is_refused_under_a_label_that_would_otherwise_pass() {
+        // §4.6.3 item 3. The write label is the one an agent with approval would carry, so
+        // this is where the ban has to bite — raising the tier must not be the answer.
+        let runner = FakeShell::root().into_runner();
+        let backend = RootShellBackend::with_runner(rooted_profile(), runner).unwrap();
+
+        let request = ExecRequest::new(Capability::ShellWrite, "rm -rf /data", "session-1");
+        let err = backend.exec(request).await.unwrap_err();
+        assert!(matches!(err, BackendError::Refused(_)), "{err:?}");
+        assert!(err.to_string().contains("human"), "{err}");
+        assert!(backend.runner.invocations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_tiers_that_match_their_content_still_run() {
+        // The check must not become a tax on correct requests: the read tier keeps its
+        // approval-free path, and a write under its own label still gets to the device.
+        let runner = FakeShell::app().into_runner();
+        let backend = ShellBackend::with_runner(termux_profile(), runner).unwrap();
+        let record = backend.exec(read_request()).await.unwrap();
+        assert_eq!(record.exit_code, Some(0));
+        assert_eq!(backend.runner.invocations().len(), 1);
+
+        let runner = FakeShell::root().into_runner();
+        let backend = RootShellBackend::with_runner(rooted_profile(), runner).unwrap();
+        let record = backend.exec(write_request()).await.unwrap();
+        assert_eq!(record.uid, Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_refusal_keeps_its_reason_through_the_contract_projection() {
+        // The caller on the other side of the port sees `ExecutionError`, so the named
+        // capability and the next step have to survive the trip.
+        let runner = FakeShell::app().into_runner();
+        let backend = ShellBackend::with_runner(termux_profile(), runner).unwrap();
+        let err = backend
+            .exec(ExecRequest::read("setprop a b", "session-1"))
+            .await
+            .unwrap_err();
+        let contract = err.to_contract();
+        assert!(
+            matches!(
+                contract,
+                acowork_platform_contract::ExecutionError::Rejected(_)
+            ),
+            "{contract:?}"
+        );
+        assert!(
+            contract.to_string().contains("setprop"),
+            "projected text must still name the command: {contract}"
         );
     }
 

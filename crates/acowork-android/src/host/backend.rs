@@ -318,6 +318,17 @@ pub enum BackendError {
     },
     /// The backend itself broke: spawn failure, I/O error.
     Backend(String),
+    /// The port declined to start this script, before the device was touched.
+    ///
+    /// This is the ADR-AND-001 §4.4 auto-pass being enforced on the *content* rather than
+    /// on the label: `android:shell:read` is cheap because the commands under it cannot
+    /// change the device, and a request labelled `read` that runs `setprop` does not belong
+    /// to it. See [`commands`](super::commands).
+    ///
+    /// Distinct from [`BackendError::Backend`]: nothing is broken, and re-sending the same
+    /// request unchanged will fail identically. The caller's options are to drop the command
+    /// or to re-send it under the capability it names.
+    Refused(String),
 }
 
 impl BackendError {
@@ -334,7 +345,9 @@ impl BackendError {
                 "privilege was asked for but not granted: ran as uid {observed_uid:?} in \
                  context {observed_context:?}"
             )),
-            BackendError::Backend(why) => ExecutionError::Rejected(why.clone()),
+            BackendError::Backend(why) | BackendError::Refused(why) => {
+                ExecutionError::Rejected(why.clone())
+            }
         }
     }
 }
@@ -355,6 +368,7 @@ impl std::fmt::Display for BackendError {
                  must not be treated as a privileged one"
             ),
             BackendError::Backend(why) => write!(f, "execution backend failed: {why}"),
+            BackendError::Refused(why) => write!(f, "the port refused to run this: {why}"),
         }
     }
 }
