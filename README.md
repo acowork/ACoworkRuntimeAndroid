@@ -20,10 +20,11 @@
 > **Status: early development.** The design docs are in place, and two crates ship as buildable, tested
 > Rust libraries: the platform-neutral contract layer (`acowork-platform-contract`) and the Android host
 > layer (`acowork-android`, the P0 slice — HostProfile probe, script assembly, process spawn and
-> `ExecutionBackend` implementations, and the §4.4 read-tier guardrail). 382 tests pass, the contract
-> layer also builds for a bare-metal RISC-V target, and the chain has been run against a physical
-> device — a Huawei BLA-AL00 over adb: 18 read-only probes → `HostProfile` → real commands, exit 0
-> in ~120 ms, including `logcat`, which only works because the probe spot-checks for it. **No node binary exists yet** (the
+> `ExecutionBackend` implementations, the §4.4 read-tier guardrail and the §4.5 tool
+> descriptions). 395 tests pass, the contract layer also builds for a bare-metal RISC-V
+> target, and the chain has been run against a physical device — a Huawei BLA-AL00 over adb:
+> 18 read-only probes → `HostProfile` → real commands, exit 0 in ~120 ms, including `logcat`,
+> which only works because the probe spot-checks for it. **No node binary exists yet** (the
 > runnable thing today is that device harness), and nothing here is ready for production use.
 >
 > ⚠️ **Partially synced with [README.zh.md](README.zh.md).** The repository layout, roadmap, and build
@@ -202,7 +203,7 @@ itself — is the artifact a second port should copy.
 | 5b | Execution stack: script assembly, the `SpawnRunner` seam, `ShellBackend` / `RootShellBackend` / `AppSandboxBackend`, and an adb transport | ✅ **Delivered and verified on hardware** — `cargo run --example device_probe` drives a real device end to end; reconciling its answers against the fixtures corrected five things the fixtures had invented (see [the ground-truth suite](crates/acowork-android/tests/device_ground_truth.rs)) |
 | 6 | Battery / doze tuning and long-run stability testing | ⬜ Planned |
 | 7 | Release artifacts (Termux package + signed APK) | ⬜ Planned (depends on #2/#4; the NDK pipeline can reuse upstream `apps/acowork-mobile`) |
-| 8 | `root-shell` profile, **read-only capabilities** (`logcat` / `dumpsys` / `getprop`) | 🚧 **Mostly delivered** — the read tier is now enforced on script content, not on the caller's label ([`host/commands.rs`](crates/acowork-android/src/host/commands.rs)), and the commands it covers are probed rather than assumed (item 6c); verified end to end on a BLA-AL00. Remaining: the dynamic tool description (§4.5) and `RootShellBackend` on a rooted device — it has never been run against a real `su` |
+| 8 | `root-shell` profile, **read-only capabilities** (`logcat` / `dumpsys` / `getprop`) | 🚧 **Mostly delivered** — the read tier is now enforced on script content, not on the caller's label ([`host/commands.rs`](crates/acowork-android/src/host/commands.rs)), and the commands it covers are probed rather than assumed (item 6c); verified end to end on a BLA-AL00. Remaining: `RootShellBackend` on a rooted device — it has never been run against a real `su` |
 | 9 | Android debugging toolset (screencap, ANR / tombstone / bugreport capture) + command audit log | ⬜ Planned (depends on #8) — `ExecRecord` already carries every field §4.6 item 1 asks for; what is missing is a sink |
 | 10 | Write capabilities: approval gating, per-device write lock, prop / file auto-rollback | ⛔ **Blocked (B1)** — ADR §7.4's owner conjunct conflicts with upstream ADR-087 D1/D5; the gate is implemented per the two-authority decomposition and awaits upstream confirmation |
 | 11 | Magisk-module form factor for always-on debug fleets — **only if that need is real** | ⬜ Deferred |
@@ -224,7 +225,7 @@ Both crates are plain Rust libraries with no platform-specific code, so they bui
 
 ```bash
 cargo build                                        # build
-cargo test                                         # 382 tests (android unit 208 + contract 83 + contract integration 23 + rule conformance 43 + real-process 12 + device ground truth 13)
+cargo test                                         # 395 tests (android unit 221 + contract 83 + contract integration 23 + rule conformance 43 + real-process 12 + device ground truth 13)
 cargo clippy --all-targets -- -D warnings          # upstream CI convention; must be warning-free
 cargo fmt --check
 ```

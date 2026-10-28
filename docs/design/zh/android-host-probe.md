@@ -120,7 +120,8 @@ SELinux 是**运行时按 (scontext, tcontext, tclass) 判定**的，静态探�
 
 ### 5.1 工具注册
 
-- `shell` 类工具按 `ShellDialect` 注册为**独立工具**（沿用上游 Windows 上 bash / powershell 双注册的范式）：`bash`（Termux）、`ash`（`/system/bin/sh`）。描述由 `applets` 动态生成，例如「本机 `/system/bin/sh` 为 mksh，命令由 toybox 提供，`sed -i` 需空参数、`find -printf` 不可用」。
+- `shell` 类工具按 `ShellDialect` 注册为**独立工具**（沿用上游 Windows 上 bash / powershell 双注册的范式）：`bash`（`command -v bash` 解析到了才注册）、`ash`（有 shell 真正执行过就注册，绑定 `/system/bin/sh`）。**已实现**：[`host/tools.rs`](../../crates/acowork-android/src/host/tools.rs) 由 `HostProfile` 纯函数生成描述文本，内容是「方言是什么、§4.4 的哪些命令实测存在、哪些位置被 `touch` 证实可写、跑在哪个 uid 与 SELinux 模式下」。
+  本文早期版本举的例子（「`sed -i` 需空参数、`find -printf` 不可用」）**没有进入实现**：那是 Android 传闻而非本机测量，错一次的代价是模型据此拒绝一条本来能跑的命令，或依赖一条本来不存在的限制。探测答不上来的，描述里就写「不知道」——例如 shell 跑成功了但方言没被认出（busybox ash 两个变量都不设），仍然注册 `ash`，只是写「探测未能识别方言」。
 - 未进入 `caps` 的能力对应工具**不注册**，模型看不到即不会调用（与上游「LLM 只能看到当前平台可用的工具」一致）。
 
 ### 5.2 System Prompt 注入

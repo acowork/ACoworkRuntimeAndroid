@@ -3,7 +3,7 @@
 - **状态**：**部分 Accepted** —— §1–§6（宿主档位、一个引擎、工具级提权、`ExecutionBackend` 契约）有效并已落地 P0；档位由三档扩到四档，见 §4.3；⚠️ **§7.1 与 §7.4 待与上游对齐**，二者被晚于本 ADR 的上游文档推翻，详见下方「上游冲突」与 [开发就绪度评估](../../review/zh/2026-10-28-readiness-assessment.md) B1/B2。
 - **日期**：2026-10-20（原标 `2026-05-15` 有误：正文引用了 2026-09-13 才创建的 ADR-075、2026-10-05 的 ADR-087、2026-10-09 的 ADR-090，该日期不可能成立）
 - **相关**：[README.md](../../../README.md)、上游 `docs/design/zh/12-tool-system.md`（平台支持矩阵与运行时平台检测）、上游 `core/acowork-runtime/src/tools/builtin/shell.rs`（多 shell 注册范式）、上游 ADR-087（node/agent 归属与门控）、上游 `docs/design/zh/30-runtime-protocol-and-pluggable-engine.md`（能力注册表与可插拔引擎，**v0.2 直接点名本 ADR**）、session 参数 `shellApprovalThreshold` / `approvalTimeoutSecs`
-- **实现**：P0 已交付，并按 [ADR-AND-002](ADR-AND-002-platform-contract-layer.md) 拆成两层 —— 规则在 `crates/acowork-platform-contract/`（平台中立，只依赖 serde，可在裸机 target 编译），Android 的事实与机制在 `crates/acowork-android/src/host/`（探测解析器、capability 取值、`su -c` 包装、`avc` 回灌）。382 测试通过，clippy `-D warnings` 零告警，并在华为 BLA-AL00 上端到端验证。本 ADR §7.1/§7.4 的门控落点已从 `backend.rs` 迁至契约层 `gate.rs`，§4.4 的权限描述已细化为四轴 `CapabilitySpec`——**决策内容不变**，详见 ADR-AND-002 §4
+- **实现**：P0 已交付，并按 [ADR-AND-002](ADR-AND-002-platform-contract-layer.md) 拆成两层 —— 规则在 `crates/acowork-platform-contract/`（平台中立，只依赖 serde，可在裸机 target 编译），Android 的事实与机制在 `crates/acowork-android/src/host/`（探测解析器、capability 取值、`su -c` 包装、`avc` 回灌）。395 测试通过，clippy `-D warnings` 零告警，并在华为 BLA-AL00 上端到端验证。本 ADR §7.1/§7.4 的门控落点已从 `backend.rs` 迁至契约层 `gate.rs`，§4.4 的权限描述已细化为四轴 `CapabilitySpec`——**决策内容不变**，详见 ADR-AND-002 §4
 - **EN mirror**：待补 `docs/adr/en/`（上游 `AGENTS.md:142` 要求中英 ADR 同一 commit 更新；本仓库尚未采用该约定，见评估 B7）
 
 > ### ⚠️ 上游冲突（2026-10-28 核对）
@@ -191,7 +191,7 @@ graph TD
 - `bash`：Termux 环境，POSIX + bash 扩展。
 - `ash`：`/system/bin/sh`（mksh），显式声明「无 bash 数组、`[[` 语义差异、命令由 toybox/busybox 提供」。
 
-工具描述由 HostProfile Probe 的探测结果动态生成（哪些 applet 真实存在），而非硬编码。 **现状**：「哪些命令真实存在」已可回答（探测项 6a/6c，`ShellPaths.applets`），动态生成工具描述本身尚未实现——这是 §4.4 只读档落地后 Item #8 剩下的那一半。
+工具描述由 HostProfile Probe 的探测结果动态生成（哪些 applet 真实存在），而非硬编码。 **已实现**（`crates/acowork-android/src/host/tools.rs`）：描述是 `HostProfile` 的纯函数，只写测到的事实——解释器路径与方言、§4.4 读写词汇表里哪些命令实测存在、哪些根目录被 `touch` 证实可写、运行的 uid 与 SELinux 模式。两条注册规则：解析不出路径就不注册（后端清空子进程环境，裸名无法解析）；探测没有答案就写「不知道」，不写 Android 传闻。BLA-AL00 实测生成的 `ash` 描述见 `cargo run --example device_probe` 第 5 节。
 
 ### 4.6 调试场景护栏（rollback-first）
 
