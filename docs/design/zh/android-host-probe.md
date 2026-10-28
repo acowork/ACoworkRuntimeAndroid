@@ -26,10 +26,10 @@ Android 宿主的差异不是「桌面 vs 移动」这种二分，而是连续�
 |---|---|---|---|---|
 | 1 | uid / gid | `id -u` | 0 = 特权进程 | 探测本身失败 → 退回 `apk-sandbox` |
 | 2 | SELinux 模式 | `getenforce` | `Enforcing` / `Permissive` / 命令不存在 | 不存在 → `Selinux::Unknown`，写档能力一律不开放 |
-| 3 | 当前安全域 | `cat /proc/self/attr/current` | 期望 `u:r:untrusted_app:s0` / `u:r:shell:s0` / `u:r:magisk:s0` | 读不到 → 视为受限域 |
+| 3 | 当前安全域 | `cat /proc/self/attr/current` | 期望 `u:r:untrusted_app:s0` / `u:r:shell:s0` / `u:r:magisk:s0`；**输出以 NUL 结尾而非换行**（真机实测 `u:r:shell:s0\0`），`trim()` 与 `is_ascii_whitespace` 都不删 NUL，须经 `facts::normalize_context` 截断 | 读不到 → 视为受限域 |
 | 4 | su 可用性 | `su -c 'id -u; cat /proc/self/attr/current'` | 记录 su 后的 uid **与域**（二者可能不同） | 超时 / 拒绝 → 不提供 `root-shell`；**弹窗被拒不可重试** |
-| 5 | shell 方言 | `/system/bin/sh --version`、`command -v bash` | 区分 mksh / bash / busybox sh | 无可用 shell → 不注册 shell 工具 |
-| 6 | 命令集 | `toybox` / `busybox` + `ls`（applet 列表） | 得到实际存在的 applet 集合 | 两者皆无 → 仅 shell 内建，工具描述需说明 |
+| 5 | shell 方言 | ~~`/system/bin/sh --version`~~ → `sh -c 'echo $KSH_VERSION; echo $BASH_VERSION'`、`command -v bash` | 区分 mksh / bash / busybox sh。`--version` **在真机上直接报错**（`sh: --: unknown option`，BLA-AL00 实测），mksh 的版本只能从内建变量取；变量未设置时输出空串，故两问一起问 | 无可用 shell → 不注册 shell 工具 |
+| 6 | 命令集 | `toybox`（裸）/ `busybox --list` + `ls`（applet 列表） | 得到实际存在的 applet 集合。**两种写法不是一回事**：BLA-AL00 实测裸 `toybox` 返回 194 个**applet 名**，`toybox --list` 返回同样 194 项但带安装路径（`bin/cat`、`usr/bin/acpi`）。解析器要的是名字，改成 `--list` 会把路径当成 applet 名收进集合；输出按终端宽度折行（真机 19 行），须按空白切分而非按行 | 两者皆无 → 仅 shell 内建，工具描述需说明 |
 | 7 | 可写挂载 | `mount` 解析 + `touch` 试探 | `/data` 可写；`/system`、`/` 是否可 remount | 不可写 → 不开放 `android:fs:system` |
 | 8 | 构建类型 | `getprop ro.build.type` | `user` / `userdebug` / `eng` | — |
 | 9 | 可调试性 | `getprop ro.debuggable`、`ro.secure`、`ro.adb.secure` | `ro.debuggable=1` 是调试档的强信号 | — |
@@ -149,7 +149,8 @@ SELinux 是**运行时按 (scontext, tcontext, tclass) 判定**的，静态探�
 | 层级 | 方式 |
 |---|---|
 | 单元 | 用伪造的探测输出（含缺失命令、超时、畸形 `mount` 文本）断言 `caps` 推导；探测解析器必须对「命令不存在」健壮 |
-| 契约 | 三档 profile 各产出一份 `HostProfile` 快照，作为回归基线（真机：user 版 + Termux；userdebug + Magisk root；APK 沙箱） |
+| 契约 | 四档 profile 各产出一份 `HostProfile` 快照，作为回归基线（`root-shell`：userdebug + Magisk root；`termux`：user 版 + Termux；`system-shell`：user 版 `adb shell`，uid 2000 / mksh / 无 su；`apk-sandbox`：APK 沙箱内无 shell） |
+| 地面实况 | `tests/fixtures/devices/huawei-bla-al00-api29.json` 是**真机逐字回包**（含 `attr/current` 的 NUL），`tests/device_ground_truth.rs` 用它逐字段对账。伪造 fixture 只能证明解析器自洽，证明不了它对上了任何一台设备——本文件的 §5 三处修正全部来自这次对账 |
 | 集成 | 断言 root-shell 档下**无常驻 root 进程**（`ps -Z` 检查 Runtime 自身域仍为 `untrusted_app`） |
 | 故障注入 | su 弹窗被拒、`getenforce` 不存在、toybox/busybox 双缺失、`/system` remount 失败 —— 均须降级而非 panic，且错误信息可执行 |
 

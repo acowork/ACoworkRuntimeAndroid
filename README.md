@@ -19,9 +19,11 @@
 
 > **Status: early development.** The design docs are in place, and two crates ship as buildable, tested
 > Rust libraries: the platform-neutral contract layer (`acowork-platform-contract`) and the Android host
-> layer (`acowork-android`, the P0 slice — HostProfile probe + `ExecutionBackend` contract). 249 tests
-> pass, and the contract layer also builds for a bare-metal RISC-V target. **No runnable binary exists
-> yet**, and nothing here is ready for production use.
+> layer (`acowork-android`, the P0 slice — HostProfile probe, script assembly, process spawn and
+> `ExecutionBackend` implementations). 342 tests pass, the contract layer also builds for a bare-metal
+> RISC-V target, and the chain has been run against a physical device — a Huawei BLA-AL00 over adb:
+> 16 probes → `HostProfile` → one real command, exit 0 in 139 ms. **No node binary exists yet** (the
+> runnable thing today is that device harness), and nothing here is ready for production use.
 >
 > ⚠️ **Partially synced with [README.zh.md](README.zh.md).** The repository layout, roadmap, and build
 > sections below were brought in line on 2026-10-29. The Chinese version remains authoritative for the
@@ -195,7 +197,8 @@ itself — is the artifact a second port should copy.
 | 3 | CLI build running under Termux, enrolling with a real Gateway | ⬜ Planned (depends on #2) |
 | 4 | APK build: foreground service, scoped storage, keep-alive | ⛔ **Blocked (B4)** — collides with upstream `apps/acowork-mobile` (Tauri v2 Android APK, design 25 / ADR-086): same form factor, opposite purpose, ownership unresolved |
 | 5 | `ExecutionBackend` trait + startup HostProfile probe | ✅ **Delivered** (P0) — `crates/acowork-android/src/host/` |
-| 5a | **Platform-neutral contract layer** `acowork-platform-contract`: rules R1–R13 plus a per-rule conformance suite (the template for ESP32-class ports) | ✅ **Delivered** — 249 tests, builds for a bare-metal target; see [ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md) |
+| 5a | **Platform-neutral contract layer** `acowork-platform-contract`: rules R1–R13 plus a per-rule conformance suite (the template for ESP32-class ports) | ✅ **Delivered** — builds for a bare-metal target; see [ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md) |
+| 5b | Execution stack: script assembly, the `SpawnRunner` seam, `ShellBackend` / `RootShellBackend` / `AppSandboxBackend`, and an adb transport | ✅ **Delivered and verified on hardware** — `cargo run --example device_probe` drives a real device end to end; reconciling its answers against the fixtures corrected five things the fixtures had invented (see [the ground-truth suite](crates/acowork-android/tests/device_ground_truth.rs)) |
 | 6 | Battery / doze tuning and long-run stability testing | ⬜ Planned |
 | 7 | Release artifacts (Termux package + signed APK) | ⬜ Planned (depends on #2/#4; the NDK pipeline can reuse upstream `apps/acowork-mobile`) |
 | 8 | `root-shell` profile, **read-only capabilities** (`logcat` / `dumpsys` / `getprop`) | 🚧 **Ready to start** — contract and gate are in place; needs the two backend implementations plus on-device verification |
@@ -220,7 +223,7 @@ Both crates are plain Rust libraries with no platform-specific code, so they bui
 
 ```bash
 cargo build                                        # build
-cargo test                                         # 249 tests (contract 82 + android unit 101 + contract 23 + rule conformance 43)
+cargo test                                         # 342 tests (android unit 170 + contract 83 + contract integration 23 + rule conformance 43 + real-process 12 + device ground truth 11)
 cargo clippy --all-targets -- -D warnings          # upstream CI convention; must be warning-free
 cargo fmt --check
 ```
@@ -239,6 +242,26 @@ extension, hence no atomics — making it the stricter test. The cost is that `R
 there via `target_has_atomic = "ptr"`; R11's semantics remain mandatory, but a single-core target without
 atomics supplies exclusion from a critical section it already has. See
 [ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md) §5.2.
+
+### Against a real device
+
+Every test above argues with a model of a device. `device_probe` argues with one:
+
+```bash
+ACOWORK_ADB=/path/to/adb ACOWORK_ADB_SERIAL=<serial> cargo run --example device_probe
+```
+
+It runs the 16 read-only probes over `adb shell`, assembles the `HostProfile`, builds the backend that
+profile implies, and executes one real command through it. It needs no root and changes nothing on the
+device beyond the `echo` it runs.
+
+Its output is committed as `tests/fixtures/devices/huawei-bla-al00-api29.json` and reconciled field by
+field by `tests/device_ground_truth.rs`. That reconciliation is not decoration: it is where the five
+fabrications in roadmap #5b were found, because a fixture can only ever prove the parser agrees with
+itself.
+
+`--no-default-features` builds the crate without the adb transport (`device` feature), and the example
+is gated off with it so the lean-build check stays meaningful.
 
 Toolchain mirrors upstream `core/Cargo.toml`: edition 2024, rust-version 1.95, Apache-2.0.
 

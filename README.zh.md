@@ -17,8 +17,10 @@
 
 ---
 
-> **状态：早期开发。** 设计文档齐备，P0 切片（HostProfile 探测 + `ExecutionBackend` 契约）已交付为
-> 可构建、可测试的 Rust 库。**仍无任何可运行的二进制产物**，不适合用于生产环境。
+> **状态：早期开发。** 设计文档齐备，P0 切片（HostProfile 探测、脚本装配、进程生成、
+> `ExecutionBackend` 实现）已交付为可构建、可测试的 Rust 库，342 个测试通过，且整条链路已在真机上
+> 跑通过一次（华为 BLA-AL00，经 adb：16 条探测 → `HostProfile` → 一条真实命令，139ms / exit 0）。
+> **仍无 node 二进制产物**——目前唯一可运行的东西就是那个真机 harness——不适合用于生产环境。
 >
 > 下文标注 🚧 / ⬜ / ⛔ 的内容均为设计意图。三条 ⛔ 是「本仓库裁定 vs 上游权威」的冲突，
 > 需上游或产品裁定，详见[开发就绪度评估](docs/review/zh/2026-10-28-readiness-assessment.md)。
@@ -191,7 +193,8 @@ graph TD
 | 3 | 命令行版本在 Termux 下运行，并注册到真实 Gateway | ⬜ 计划中（依赖 #2） |
 | 4 | App 版本：前台服务、受作用域存储、保活 | ⛔ **阻塞（B4）** —— 与上游 `apps/acowork-mobile`（Tauri v2 Android APK，design 25 / ADR-086）形态撞车而定位相反，归属未裁定 |
 | 5 | `ExecutionBackend` trait + 启动时 HostProfile 能力探测 | ✅ **已交付**（P0）—— `crates/acowork-android/src/host/` |
-| 5a | **平台中立契约层** `acowork-platform-contract`：R1–R13 规则 + 逐条一致性测试（为 ESP32 等后续端口打样） | ✅ **已交付** —— 249 测试通过，裸机 target 编译通过，见 [ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md) |
+| 5a | **平台中立契约层** `acowork-platform-contract`：R1–R13 规则 + 逐条一致性测试（为 ESP32 等后续端口打样） | ✅ **已交付** —— 裸机 target 编译通过，见 [ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md) |
+| 5b | 执行栈：脚本装配、`SpawnRunner` 平台接缝、`ShellBackend` / `RootShellBackend` / `AppSandboxBackend`、adb 传输层 | ✅ **已交付并在真机上验证** —— `cargo run --example device_probe` 端到端驱动真机；把它的回包与 fixture 逐字段对账后，修正了 5 处 fixture 编造出来的事实（见[地面实况测试](crates/acowork-android/tests/device_ground_truth.rs)） |
 | 6 | 电池 / Doze 调优与长跑稳定性测试 | ⬜ 计划中 |
 | 7 | 发布产物（Termux 包 + 签名 APK） | ⬜ 计划中（依赖 #2/#4；NDK 管线可复用上游 `apps/acowork-mobile`） |
 | 8 | `root-shell` 宿主档，**仅只读能力**（`logcat` / `dumpsys` / `getprop`） | 🚧 **可开工** —— 契约与门控已就绪，待两个 backend 实现 + 真机验证 |
@@ -214,7 +217,7 @@ graph TD
 
 ```bash
 cargo build                                        # 构建
-cargo test                                         # 249 个测试（契约层 82 + Android 单元 101 + 契约 23 + 规则一致性 43）
+cargo test                                         # 342 个测试（Android 单元 170 + 契约层 83 + 契约集成 23 + 规则一致性 43 + 真进程 12 + 真机地面实况 11）
 cargo clippy --all-targets -- -D warnings          # 上游 CI 约定，须零告警
 cargo fmt --check
 ```
@@ -228,6 +231,25 @@ cargo clippy -p acowork-platform-contract --no-default-features --target riscv32
 ```
 
 选 `imc` 而非 ESP32 实际的 `imac`，是因为它**少一项设施**（无 `a` 扩展 → 无原子指令），因而是更严格的检验。代价是 `ResourceLock` 在该 target 上按 `target_has_atomic = "ptr"` 条件编译掉——R11 的语义仍是强制的，只是无原子的单核目标由端口自带临界区。详见 [ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md) §5.2。
+
+### 接真机跑
+
+上面的测试都在跟「设备的模型」讲道理；`device_probe` 跟设备本身讲：
+
+```bash
+ACOWORK_ADB=/path/to/adb ACOWORK_ADB_SERIAL=<serial> cargo run --example device_probe
+```
+
+它经 `adb shell` 跑完 16 条只读探测，装配出 `HostProfile`，按该 profile 构建对应后端，再通过它执行
+一条真实命令。不需要 root，除它自己 `echo` 的那一下之外不改动设备上任何东西。
+
+它的输出被固化为 `tests/fixtures/devices/huawei-bla-al00-api29.json`，由
+`tests/device_ground_truth.rs` 逐字段对账。这个对账不是装饰——路线图 #5b 里那 5 处编造就是它找出来的：
+fixture 永远只能证明解析器与自己自洽，证明不了它对上了任何一台真机。
+
+`--no-default-features` 会构建出不含 adb 传输层的精简版本（`device` feature），example 也一并被门掉，
+这样「精简构建」这项检查仍然有意义。
+
 
 工具链对齐上游 `core/Cargo.toml`：edition 2024、rust-version 1.95、license Apache-2.0。
 

@@ -259,7 +259,11 @@ pub struct ProbeOutput {
     pub su: Option<CommandOutput>,
     /// Item 5a — `command -v bash`.
     pub bash_path: Option<CommandOutput>,
-    /// Item 5b — `/system/bin/sh --version`.
+    /// Item 5b — the dialect variables read out of `/system/bin/sh`.
+    ///
+    /// Not `--version`: on the device this was verified against, that is an error
+    /// (`sh: --: unknown option`), so the version has to be read from mksh's own
+    /// `$KSH_VERSION`. See `ProbeCommand::command()` for the exact script.
     pub system_sh_version: Option<CommandOutput>,
     /// Item 6a — the `toybox` applet listing.
     pub toybox_list: Option<CommandOutput>,

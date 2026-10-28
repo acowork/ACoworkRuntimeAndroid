@@ -1,6 +1,6 @@
 # ADR-AND-001: Android Host Profiles 与 ExecutionBackend（含高权限调试档）
 
-- **状态**：**部分 Accepted** —— §1–§6（三档宿主、一个引擎、工具级提权、`ExecutionBackend` 契约）有效并已落地 P0；⚠️ **§7.1 与 §7.4 待与上游对齐**，二者被晚于本 ADR 的上游文档推翻，详见下方「上游冲突」与 [开发就绪度评估](../../review/zh/2026-10-28-readiness-assessment.md) B1/B2。
+- **状态**：**部分 Accepted** —— §1–§6（宿主档位、一个引擎、工具级提权、`ExecutionBackend` 契约）有效并已落地 P0；档位由三档扩到四档，见 §4.3；⚠️ **§7.1 与 §7.4 待与上游对齐**，二者被晚于本 ADR 的上游文档推翻，详见下方「上游冲突」与 [开发就绪度评估](../../review/zh/2026-10-28-readiness-assessment.md) B1/B2。
 - **日期**：2026-10-20（原标 `2026-05-15` 有误：正文引用了 2026-09-13 才创建的 ADR-075、2026-10-05 的 ADR-087、2026-10-09 的 ADR-090，该日期不可能成立）
 - **相关**：[README.md](../../../README.md)、上游 `docs/design/zh/12-tool-system.md`（平台支持矩阵与运行时平台检测）、上游 `core/acowork-runtime/src/tools/builtin/shell.rs`（多 shell 注册范式）、上游 ADR-087（node/agent 归属与门控）、上游 `docs/design/zh/30-runtime-protocol-and-pluggable-engine.md`（能力注册表与可插拔引擎，**v0.2 直接点名本 ADR**）、session 参数 `shellApprovalThreshold` / `approvalTimeoutSecs`
 - **实现**：P0 已交付，并按 [ADR-AND-002](ADR-AND-002-platform-contract-layer.md) 拆成两层 —— 规则在 `crates/acowork-platform-contract/`（平台中立，只依赖 serde，可在裸机 target 编译），Android 的事实与机制在 `crates/acowork-android/src/host/`（探测解析器、capability 取值、`su -c` 包装、`avc` 回灌）。248 测试通过，clippy `-D warnings` 零告警。本 ADR §7.1/§7.4 的门控落点已从 `backend.rs` 迁至契约层 `gate.rs`，§4.4 的权限描述已细化为四轴 `CapabilitySpec`——**决策内容不变**，详见 ADR-AND-002 §4
@@ -136,27 +136,36 @@ graph TD
     end
     Loop --> Gate --> Iface
     Probe -.->|"注入可用工具列表与 shell 方言"| Loop
-    Iface --> P1["TermuxBackend: app uid, bash, PREFIX"]
+    Iface --> P1["ShellBackend: app uid; bash+PREFIX (termux) or mksh (system-shell)"]
     Iface --> P2["AppSandboxBackend: scoped storage, 无 shell"]
     Iface --> P3["RootShellBackend: su -c mksh + toybox/busybox"]
     P3 --> Broker["提权 helper：su -c（无状态）"]
     P3 --> Tools["Android 调试工具集 logcat / dumpsys / prop / screencap"]
 ```
 
-依赖方向：三个 backend 实现依赖 `ExecutionBackend` 契约；引擎不依赖任何具体 backend。
+依赖方向：backend 实现依赖 `ExecutionBackend` 契约；引擎不依赖任何具体 backend。
 这与上游「接口优先的依赖方向」以及 README 中「平台相关代码收敛在 trait 之后，保留干净的上游回流路径」一致。
 
 ### 4.3 能力矩阵
 
-| 能力 | apk-sandbox | termux（现状） | root-shell（新增） |
-|---|:---:|:---:|:---:|
-| shell 执行 | ❌ | ✅ bash | ✅ mksh + toybox/busybox |
-| 文件范围 | app 私有目录 | `$PREFIX` + 用户授权 SAF | `/data` 全域；`/system` 需 remount |
-| 跨 app 数据（`/data/data/*`） | ❌ | ❌ | ✅（SELinux 允许时） |
-| logcat 全量 | ❌ | 仅本 app | ✅ |
-| setprop / am / pm / input / screencap | ❌ | ❌ | ✅ |
-| 绕过 Doze | ❌（FGS 受限） | 依赖 Termux wake-lock | ✅（需显式策略与审批） |
-| 风险等级 | 低 | 中 | **高（可 brick）** |
+| 能力 | apk-sandbox | system-shell（新增） | termux | root-shell（新增） |
+|---|:---:|:---:|:---:|:---:|
+| shell 执行 | ❌ | ✅ mksh（`/system/bin/sh`） | ✅ bash | ✅ mksh + toybox/busybox |
+| 文件范围 | app 私有目录 | 探测证实可写的根（真机：`/data/local/tmp`、`/sdcard`、`/storage/self/primary`） | `$PREFIX` + 用户授权 SAF | `/data` 全域；`/system` 需 remount |
+| 跨 app 数据（`/data/data/*`） | ❌ | ❌（uid 2000，Enforcing） | ❌ | ✅（SELinux 允许时） |
+| logcat 全量 | ❌ | 未验证 | 仅本 app | ✅ |
+| setprop / am / pm / input / screencap | ❌ | ❌（无 su） | ❌ | ✅ |
+| 绕过 Doze | ❌（FGS 受限） | 未验证 | 依赖 Termux wake-lock | ✅（需显式策略与审批） |
+| 风险等级 | 低 | 中 | 中 | **高（可 brick）** |
+
+> `system-shell` 这一档是接了真机之后加上的：一台 user 版、无 Termux、无 root、但 `adb shell`
+> 可用的设备（uid 2000 / mksh / Enforcing）。在此之前它被归进 `termux`，于是
+> `HostSummary.profile` 对上游声称了一个装了 Termux 的环境——而探测项 5a（`command -v bash`）
+> 与 13（`$PREFIX`）都没有观察到它。**档位名不是装饰**，它进每一条 exec 记录；声称一台设备
+> "不是"什么，和编造一个不存在的路径是同一类错误。
+>
+> 标"未验证"的两行是诚实的空位：这台机器上 `logcat` 与 Doze 行为尚未实测，能力推导也不读
+> 它们——列在此处只说明"矩阵里哪些格是量出来的、哪些还是推的"。
 
 ### 4.4 权限模型：把 root 拆成可审批的 capability
 
@@ -233,7 +242,7 @@ exec {
 
 | 阶段 | 范围 | 验证方式 |
 |---|---|---|
-| P0 | `ExecutionBackend` trait + HostProfile Probe | 单元测试用伪造 probe 输出；真机三档（user / userdebug+root / Termux）快照对比 |
+| P0 | `ExecutionBackend` trait + HostProfile Probe | 单元测试用伪造 probe 输出；真机四档（user 版 adb shell / user 版 + Termux / userdebug+root / APK 沙箱）快照对比；已实测的是第一档，见 `tests/fixtures/devices/` |
 | P1 | `RootShellBackend` 只读档（`android:shell:read`） | 真机跑通 getprop / dumpsys / logcat；断言无 root 进程常驻 |
 | P2 | Android 调试工具集 + 审计日志 | 结构化日志可复现每条命令的 capability 与上下文 |
 | P3 | 写档 + 审批 + DeviceWriteLock + 自动回滚 | 故障注入：会话中断后 prop 回滚生效；并发双 Agent 争锁不互相污染 |

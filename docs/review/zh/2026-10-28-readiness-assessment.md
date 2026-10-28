@@ -148,9 +148,11 @@ ADR §4.5 要求注册 `bash` 与 `ash` **两个独立工具**，但 §3 契约�
 
 ### B9 —— 宿主档优先级未定义
 
-两份文档都没说三档如何判定。已裁定优先级 `RootShell > Termux > ApkSandbox`，且**分界线是「是否有 shell 真的执行成功」**而非「`PREFIX` 是否存在」。
+两份文档都没说档位如何判定。已裁定优先级 `RootShell > Termux > SystemShell > ApkSandbox`，其中**「有没有 shell 真的执行」决定 shell 档与 ApkSandbox 的分界**，`bash` / `$PREFIX` 是否存在决定 Termux 与 SystemShell 的分界。
 
-理由：以 `$PREFIX` 为判据会把 `adb shell` 宿主（uid 2000、mksh、无 Termux、无 su）误判为 ApkSandbox，同时仍从探测到的 shell 推出 `android:shell:read`——得到一个自相矛盾的 profile。以「shell 是否真的执行」为判据后，不变量变成结构性的：**ApkSandbox ⟺ 未声明 shell 能力**，`assemble` 里用 `debug_assert_eq!` 钉住，并在 `host_profile_contract.rs` 里以 release 模式跨三档复验。
+理由：以 `$PREFIX` 为判据会把 `adb shell` 宿主（uid 2000、mksh、无 Termux、无 su）误判为 ApkSandbox，同时仍从探测到的 shell 推出 `android:shell:read`——得到一个自相矛盾的 profile。以「shell 是否真的执行」为判据后，不变量变成结构性的：**ApkSandbox ⟺ 未声明 shell 能力**，`assemble` 里用 `debug_assert_eq!` 钉住，并在 `host_profile_contract.rs` 里以 release 模式跨各档复验。
+
+**SystemShell 是后加的第四档**，来自真机对账：BLA-AL00（user 版、无 Termux、无 root）此前落进 `Termux`，于是 `HostSummary.profile` 对上游声称了一个装 Termux 的环境，而探测项 5a 与 13 都没观察到它。判据换成「probed `bash` 或 `$PREFIX` 存在」之后，这台设备落在 `system-shell`，能力结论不变（`shell:read` 有、`shell:write` 无），变的是它不再声称自己没见过的东西。
 
 ### B10 —— probe §4 与 §3 自相矛盾：observed-denials 存哪
 
@@ -189,10 +191,11 @@ ADR §7.4 只裁定了 `fs:system` 与 `selinux:permissive` 两条需要 owner �
 
 **契约测试**（[host_profile_contract.rs](../../../crates/acowork-android/tests/host_profile_contract.rs)）覆盖 probe §7 要求的两项：
 
-- 三档快照基线：user 版 + Termux、userdebug + Magisk root、APK 沙箱
+- 档位快照基线（现为四档，见 B9）：user 版 `adb shell`、user 版 + Termux、userdebug + Magisk root、APK 沙箱
+- 真机地面实况：`tests/fixtures/devices/huawei-bla-al00-api29.json` 是一台 BLA-AL00 的逐字回包，`tests/device_ground_truth.rs` 用它逐字段对账 —— 上面那些快照是**我们以为设备会给出的值**，这一份是**设备实际给出的值**，两者不一致时以后者为准（首次对账就发现三处不一致）
 - 四项故障注入：su 弹窗被拒、`getenforce` 不存在、toybox/busybox 双缺失、`/system` remount 失败 —— 均降级而非 panic
 - 外加 ADR §6 P1 的不变量：root-shell 档下 Runtime 自身 privilege 恒 `< Root`
-- 外加 ADR §7.1 红线：Gateway 摘要在三档上均不泄漏 SELinux context / fs_roots 路径 / ABI / build type
+- 外加 ADR §7.1 红线：Gateway 摘要在每一档上均不泄漏 SELinux context / fs_roots 路径 / ABI / build type
 
 ### 测试发现的 6 个真实缺陷
 
@@ -221,12 +224,31 @@ ADR §7.4 只裁定了 `fs:system` 与 `selinux:permissive` 两条需要 owner �
 | P0 | 修正 ADR 日期、把 §7.1/§7.4 标注为待对齐 | 本仓库 | ✅ 已完成 |
 | P1 | 与 mobile app 负责人对齐 B4 的 APK 形态归属 | 需产品 | ⬜ 未开始 |
 | P1 | 回写 probe §3（B8 `dialects`、B12 shell 前置条件）与 §4（B10 ledger） | 本仓库 | ✅ 已完成（2026-10-29） |
-| — | 抽出平台中立契约层，使规则不绑在 Android 上（规避 B3、为第二个端口打样） | 本仓库 | ✅ 已完成 —— [ADR-AND-002](../../adr/zh/ADR-AND-002-platform-contract-layer.md)，248 测试 |
+| — | 抽出平台中立契约层，使规则不绑在 Android 上（规避 B3、为第二个端口打样） | 本仓库 | ✅ 已完成 —— [ADR-AND-002](../../adr/zh/ADR-AND-002-platform-contract-layer.md)，342 测试 |
 | — | 在真实嵌入式 target 上验证 R12（ESP32-C3 `riscv32imac-unknown-none-elf` 或 `riscv32imac-esp-espidf`） | 本仓库 | ⚠️ 部分 —— 已在更严格的 `riscv32imc`（无原子）上编译通过；`imac` 与 ESP-IDF 的 rust-std 组件下载被网络策略阻断 |
-| P2 | 实现 `TermuxBackend` + `RootShellBackend`（P1 只读档），真机跑通 getprop / dumpsys / logcat | 本仓库，不被阻塞 | ⬜ 未开始 |
+| P2 | 实现只读档 backend（`ShellBackend` / `RootShellBackend` / `AppSandboxBackend`）+ adb 传输层 + 真机 harness | 本仓库，不被阻塞 | ✅ 已完成（2026-10-30）—— 16 条探测 + `assemble` + 一条真实命令在 BLA-AL00 上跑通，139ms / exit 0 / uid 2000。**getprop 与 mount 已实测；dumpsys / logcat 未实测**，它们不在 16 条探测里 |
 | P2 | 补 B5 的上游平台矩阵改动、B6 的 spawn 契约方案 | 需上游 | ⬜ 未开始 |
 | P3 | 写档（依赖 B1 裁定） | 阻塞中 | ⬜ 阻塞中 |
 
-**可以立刻继续的**：P1 只读档的两个 backend 实现。它不触及 owner 门控（B1 只影响写档）、不触及 Gateway 契约（只读命令本地放行）、不依赖引擎归属（B3 已被零依赖设计规避，且现在是结构保证而非约定）。
+**已经做完并接着做了下一步**：P1 只读档的 backend 实现、`SpawnRunner` 平台接缝、adb 传输层与真机 harness。它们不触及 owner 门控（B1 只影响写档）、不触及 Gateway 契约（只读命令本地放行）、不依赖引擎归属（B3 已被零依赖设计规避，且现在是结构保证而非约定）。
+
+**真机对账换来的东西比功能本身多**：把 16 条探测在设备上跑一遍、与 fixture 逐字段比对，暴露出五个问题——
+`sh --version` 在真机上直接报错、`attr/current` 以 NUL 结尾、"有 shell"被当成"shell 执行过"、无 Termux
+时注入 `$PREFIX`、无 Termux 的设备被标成 `termux` 档。五条已全部修掉并在真机上复验：前两条在解析层，
+第三条是判据，后两条是档位模型在编造事实。
+
+值得记下来的是，这五条同时存在时整套测试是 **316 个全绿**的。其中四条只有真机能推翻——伪造 fixture
+只能证明解析器与自己自洽，证明不了它对上了任何一台设备；第五条（注入 `$PREFIX`）是写后端时读代码
+发现的。
+
+**还欠着的**（`ShellPaths.su` 那条本地就能补，其余需要设备或上游）：
+
+| 缺口 | 现状 | 需要什么 |
+|---|---|---|
+| `su` 拒绝措辞 | `parse_su_probe` 认 `denied` / `permission denied` / `not allowed` / `rejected` / `cancelled` 五种，全部是推断；`su_prompt_denied` 与 `su_helper_missing` 的分类表同理 | 一台装了 Magisk / KernelSU 的设备，实测弹窗拒绝与 helper 缺失各自的 stderr |
+| `ShellPaths.su` | 探测只试了固定路径（`/system/bin/su`、`/system/xbin/su`、`/sbin/su`），没有 `command -v su` 式的动态解析；`PATH` 上有 su 的设备会被漏掉 | 有 root 的设备上对比两种解析的结果 |
+| 孤儿进程 | 超时只 `kill` 直接子进程。`logcat &` 这类脚本会留下孙进程继续跑——采集侧已有界排空不会因此挂起，但**设备侧的孤儿没被停掉**，在手机上这是耗电问题 | `killpg`（`std` 没有），需要 `nix`/`libc` 或设备侧 `pkill`；先确认哪些工具脚本会后台化 |
+| `dumpsys` / `logcat` | 未列入 16 条探测，因此其真实可用性未实测 | 真机各跑一次，确认 shell uid 在这台 user 版上能读到什么 |
+| 第四档命名 | `system-shell` 描述的是"无 Termux 的普通 shell"，与 adb 无关（adb 只是这次到达它的方式） | 若上游摘要要按档位做调度，命名需与上游对齐 |
 
 **新增的一条**：`crates/acowork-android/tests/rules_conformance.rs` 是第二个端口的**模板**，不是普通测试文件。任何新平台接入时应复制它、保留 `r1_*`…`r13_*` 命名、替换 fixture；某条规则在该平台不适用时要显式说明而非删除。详见 ADR-AND-002 §3。
