@@ -281,23 +281,28 @@ mod tests {
         );
         // R13, checked against the actual wire form: the summary has five fields and
         // none of them can hold an identifier or raw probe output.
+        //
+        // Compared as a set. The invariant is "no field appeared or disappeared"; the order
+        // the serialiser emitted them in is a property of serde_json — it depends on whether
+        // the `preserve_order` feature is on — so asserting it here would let a dependency
+        // feature flip decide whether R13 holds.
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let keys: Vec<&str> = value
+        let mut keys: Vec<&str> = value
             .as_object()
             .unwrap()
             .keys()
             .map(String::as_str)
             .collect();
-        assert_eq!(
-            keys,
-            vec![
-                "platform",
-                "profile",
-                "privilege",
-                "escalation",
-                "capabilities"
-            ]
-        );
+        keys.sort_unstable();
+        let mut want = vec![
+            "capabilities",
+            "escalation",
+            "platform",
+            "privilege",
+            "profile",
+        ];
+        want.sort_unstable();
+        assert_eq!(keys, want, "summary shape changed: {json}");
     }
 
     #[test]

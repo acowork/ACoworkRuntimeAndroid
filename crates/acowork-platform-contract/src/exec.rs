@@ -31,7 +31,7 @@
 //! because `no_std` targets have no wall clock and a lock that cannot be tested
 //! deterministically is a lock nobody will test.
 
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::future::Future;
 // The lock below is the only part of this crate that needs target atomics, so the
@@ -169,6 +169,40 @@ pub enum ExecutionError {
     Rejected(String),
 }
 
+impl core::fmt::Display for ExecutionError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // The wording lives here, not inside `ExecOutcome::failed`, for two reasons. R9
+        // requires a refusal to name the missing condition *and* the next step, and a port
+        // that constructs `Err(error)` directly — keeping the partial output it did get —
+        // would otherwise have no way to produce that text at all. And `failed` is not the
+        // only path: the same reason has to read the same way wherever it surfaces.
+        match self {
+            // No next step is offered because there is none on the device: the caller's
+            // options are to raise the budget or to stop the command, both of which are its
+            // decision rather than this crate's.
+            ExecutionError::TimedOut => f.write_str(
+                "the invocation exceeded its time budget; the partial output is whatever the \
+                 command managed before it was killed",
+            ),
+            // Not an identifier leak: the capability ID is already in the reported summary,
+            // so the model is allowed to see it.
+            ExecutionError::CapabilityUnavailable(cap) => f.write_fmt(format_args!(
+                "capability `{cap}` is not available on this device; re-probe the host or pick \
+                 a tool that does not need it",
+            )),
+            ExecutionError::BackendUnavailable(what) => {
+                f.write_fmt(format_args!("execution backend unavailable: {what}"))
+            }
+            ExecutionError::Rejected(why) => {
+                f.write_fmt(format_args!("the device refused this invocation: {why}"))
+            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for ExecutionError {}
+
 /// The result of one invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecOutcome {
@@ -184,25 +218,7 @@ impl ExecOutcome {
     /// An outcome for a backend-level failure, with the reason as stderr text so the
     /// model sees something actionable (R9).
     pub fn failed(error: ExecutionError) -> ExecOutcome {
-        // Build the message first, then move `error` into the result. Matching on
-        // `&error` and returning `Err(error)` from inside the arms would move a
-        // borrowed value.
-        let message = match &error {
-            ExecutionError::TimedOut => {
-                alloc::string::String::from("the invocation exceeded its time budget")
-            }
-            // Not an identifier leak: the capability ID is already in the reported
-            // summary, so the model is allowed to see it.
-            ExecutionError::CapabilityUnavailable(cap) => {
-                alloc::format!("capability `{cap}` is not available on this device")
-            }
-            ExecutionError::BackendUnavailable(what) => {
-                alloc::format!("execution backend unavailable: {what}")
-            }
-            ExecutionError::Rejected(why) => {
-                alloc::format!("the device refused this invocation: {why}")
-            }
-        };
+        let message = error.to_string();
         ExecOutcome {
             result: Err(error),
             stdout: ExecOutput::default(),
@@ -498,6 +514,45 @@ mod tests {
 
         let out = ExecOutcome::failed(ExecutionError::TimedOut);
         assert!(out.stderr.as_text().contains("time budget"));
+    }
+
+    #[test]
+    fn every_execution_error_reads_as_a_reason_and_a_next_step() {
+        // R9 applied to the whole enum rather than to the two variants `failed` happened to
+        // be tested with. The discipline is the one that found the `AttributionDenied` gap on
+        // the Android side: iterate the variants, assert each one names what is missing *and*
+        // what to do, and assert none of them degenerates to a bare discriminant.
+        let cap = HostCapability::parse("esp32:gpio:write").unwrap();
+        let cases = [
+            (
+                ExecutionError::TimedOut.to_string(),
+                "time budget",
+                "partial output",
+            ),
+            (
+                ExecutionError::CapabilityUnavailable(cap).to_string(),
+                "esp32:gpio:write",
+                "re-probe",
+            ),
+            (
+                ExecutionError::BackendUnavailable("no su binary".into()).to_string(),
+                "no su binary",
+                "backend unavailable",
+            ),
+            (
+                ExecutionError::Rejected("approval missing".into()).to_string(),
+                "approval missing",
+                "refused",
+            ),
+        ];
+        for (text, reason, next_step) in cases {
+            assert!(text.contains(reason), "reason missing from: {text}");
+            assert!(text.contains(next_step), "no {next_step:?} in: {text}");
+            assert!(
+                !text.starts_with("ExecutionError::"),
+                "rendered as a debug discriminant, which is actionable for nobody: {text}"
+            );
+        }
     }
 
     // Everything below exercises `ResourceLock`, which exists only where the target
