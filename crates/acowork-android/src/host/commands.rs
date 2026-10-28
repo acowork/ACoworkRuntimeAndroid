@@ -252,7 +252,7 @@ impl core::fmt::Display for Refusal {
             Refusal::Banned { command, why } => write!(
                 f,
                 "`{command}` is not runnable at any tier: {why}. This needs a human \
-                 operating the device directly — there is no capability to request."
+                 operating the device directly."
             ),
             Refusal::Opaque { command, why } => write!(
                 f,
@@ -802,7 +802,7 @@ fn effect_of(head: &str, args: &[String]) -> Finding {
                 return Finding::new(
                     head,
                     Effect::ShellWrite,
-                    "-c clears the log buffer, destroying evidence other readers need",
+                    "-c clears the log buffer, destroying evidence other readers rely on",
                 );
             }
             if flag("r") || flag("f") {

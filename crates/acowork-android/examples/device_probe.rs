@@ -25,6 +25,7 @@ use acowork_android::host::probe::{CommandOutput, ProbeOutput, run_probe};
 use acowork_android::host::spawn::{SpawnInvocation, SpawnRunner};
 use acowork_android::host::{
     AdbTransport, ExecRequest, ExecutionBackend, HostProfile, ProbeCommand, ShellBackend,
+    check_script,
 };
 use acowork_platform_contract::HostDescription;
 
@@ -116,6 +117,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
     if !args.skip_exec {
         println!("\n── 3. execution ───────────────────────────────────");
         report_exec(&profile, &transport).await;
+        println!("\n── 4. §4.4 guardrails ──────────────────────────────");
+        report_guardrails(&profile, &transport).await;
     }
 
     Ok(())
@@ -269,5 +272,50 @@ async fn report_exec(profile: &HostProfile, transport: &AdbTransport) {
             }
         }
         Err(e) => println!("  failed       : {e}"),
+    }
+}
+
+/// §4.4's auto-pass is a claim about the script, not about the label on the request, so the
+/// harness shows both halves: what the classifier decides for representative scripts, and
+/// whether the read tier actually runs on the device a command that only exists because
+/// probe item 6c went and looked for it.
+async fn report_guardrails(profile: &HostProfile, transport: &AdbTransport) {
+    let backend = match ShellBackend::with_runner(profile.clone(), transport.clone()) {
+        Ok(b) => b,
+        Err(e) => {
+            println!("  no shell backend for this profile: {e}");
+            return;
+        }
+    };
+
+    for (script, claim) in [
+        ("getprop ro.build.type", Capability::ShellRead),
+        ("logcat -d -t 3", Capability::ShellRead),
+        (
+            "settings put system airplane_mode_on 1",
+            Capability::ShellRead,
+        ),
+        ("logcat -c", Capability::ShellRead),
+        ("toybox rm -rf /data", Capability::ShellWrite),
+    ] {
+        print!("  {:<42} {:<14}", script, format!("{claim:?}"));
+        match check_script(script, Some(claim)) {
+            Ok(verdict) => println!("-> {:?}, allowed", verdict.strongest()),
+            Err(refusal) => println!("-> refused: {refusal}"),
+        }
+    }
+
+    // `logcat` is not a toybox applet on this device; the read tier only works because
+    // item 6c proved it is there. Run it for real.
+    let request = ExecRequest::read("logcat -d -t 3", "harness-session");
+    match backend.exec(request).await {
+        Ok(record) => println!(
+            "  logcat on device: exit {:?} uid {:?} {}ms  {}",
+            record.exit_code,
+            record.uid,
+            record.duration_ms,
+            record.stdout.lines().next().unwrap_or("").trim(),
+        ),
+        Err(e) => println!("  logcat on device: failed {e}"),
     }
 }

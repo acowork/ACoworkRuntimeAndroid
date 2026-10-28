@@ -38,3 +38,6 @@ Thumbs.db
 *.log
 .env
 .env.local
+
+# Scratch commit messages
+COMMIT_MSG.tmp
