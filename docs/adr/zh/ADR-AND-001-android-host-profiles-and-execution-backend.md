@@ -153,7 +153,7 @@ graph TD
 | shell 执行 | ❌ | ✅ mksh（`/system/bin/sh`） | ✅ bash | ✅ mksh + toybox/busybox |
 | 文件范围 | app 私有目录 | 探测证实可写的根（真机：`/data/local/tmp`、`/sdcard`、`/storage/self/primary`） | `$PREFIX` + 用户授权 SAF | `/data` 全域；`/system` 需 remount |
 | 跨 app 数据（`/data/data/*`） | ❌ | ❌（uid 2000，Enforcing） | ❌ | ✅（SELinux 允许时） |
-| logcat 全量 | ❌ | 未验证 | 仅本 app | ✅ |
+| logcat 全量 | ❌ | ✅（实测：shell uid 在 user 版上读到的是全量缓冲区，含其他进程的日志行） | 仅本 app | ✅ |
 | setprop / am / pm / input / screencap | ❌ | ❌（无 su） | ❌ | ✅ |
 | 绕过 Doze | ❌（FGS 受限） | 未验证 | 依赖 Termux wake-lock | ✅（需显式策略与审批） |
 | 风险等级 | 低 | 中 | 中 | **高（可 brick）** |
@@ -164,8 +164,9 @@ graph TD
 > 与 13（`$PREFIX`）都没有观察到它。**档位名不是装饰**，它进每一条 exec 记录；声称一台设备
 > "不是"什么，和编造一个不存在的路径是同一类错误。
 >
-> 标"未验证"的两行是诚实的空位：这台机器上 `logcat` 与 Doze 行为尚未实测，能力推导也不读
-> 它们——列在此处只说明"矩阵里哪些格是量出来的、哪些还是推的"。
+> 标"未验证"的那一行是诚实的空位：Doze 行为在这台机器上没有实测过。`logcat` 一行原本是同样的
+> 空位，后来在设备上量过了——结论比预想的宽（shell uid 读到的是全量缓冲区），所以这一格现在是
+> 实测值而不是推断。列在此处的意义不在于填满，而在于说明**哪些格是量出来的、哪些还是推的**。
 
 ### 4.4 权限模型：把 root 拆成可审批的 capability
 

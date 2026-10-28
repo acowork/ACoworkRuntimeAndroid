@@ -20,9 +20,9 @@
 > **Status: early development.** The design docs are in place, and two crates ship as buildable, tested
 > Rust libraries: the platform-neutral contract layer (`acowork-platform-contract`) and the Android host
 > layer (`acowork-android`, the P0 slice — HostProfile probe, script assembly, process spawn and
-> `ExecutionBackend` implementations). 342 tests pass, the contract layer also builds for a bare-metal
+> `ExecutionBackend` implementations). 344 tests pass, the contract layer also builds for a bare-metal
 > RISC-V target, and the chain has been run against a physical device — a Huawei BLA-AL00 over adb:
-> 16 probes → `HostProfile` → one real command, exit 0 in 139 ms. **No node binary exists yet** (the
+> 17 probes → `HostProfile` → one real command, exit 0 in 139 ms. **No node binary exists yet** (the
 > runnable thing today is that device harness), and nothing here is ready for production use.
 >
 > ⚠️ **Partially synced with [README.zh.md](README.zh.md).** The repository layout, roadmap, and build
@@ -223,7 +223,7 @@ Both crates are plain Rust libraries with no platform-specific code, so they bui
 
 ```bash
 cargo build                                        # build
-cargo test                                         # 342 tests (android unit 170 + contract 83 + contract integration 23 + rule conformance 43 + real-process 12 + device ground truth 11)
+cargo test                                         # 344 tests (android unit 172 + contract 83 + contract integration 23 + rule conformance 43 + real-process 12 + device ground truth 11)
 cargo clippy --all-targets -- -D warnings          # upstream CI convention; must be warning-free
 cargo fmt --check
 ```

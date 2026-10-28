@@ -28,6 +28,7 @@ Android 宿主的差异不是「桌面 vs 移动」这种二分，而是连续�
 | 2 | SELinux 模式 | `getenforce` | `Enforcing` / `Permissive` / 命令不存在 | 不存在 → `Selinux::Unknown`，写档能力一律不开放 |
 | 3 | 当前安全域 | `cat /proc/self/attr/current` | 期望 `u:r:untrusted_app:s0` / `u:r:shell:s0` / `u:r:magisk:s0`；**输出以 NUL 结尾而非换行**（真机实测 `u:r:shell:s0\0`），`trim()` 与 `is_ascii_whitespace` 都不删 NUL，须经 `facts::normalize_context` 截断 | 读不到 → 视为受限域 |
 | 4 | su 可用性 | `su -c 'id -u; cat /proc/self/attr/current'` | 记录 su 后的 uid **与域**（二者可能不同） | 超时 / 拒绝 → 不提供 `root-shell`；**弹窗被拒不可重试** |
+| 4a | su 位置 | `command -v su` | 与 5a 同形：exit 0 且 stdout 非空才算存在。**必须是探测而不是 `stat`**：`RootShellBackend` 没有绝对路径就无法构造（子进程环境被清空，裸名解析不出来），而固定路径清单会漏掉 `PATH` 上的安装位置；harness 跑在手机上而非手机里时，本地 `stat` 问的还是错的文件系统 | 找不到 → `paths.su = None`，root 档不可用；**不得回落成一个"常见路径"** |
 | 5 | shell 方言 | ~~`/system/bin/sh --version`~~ → `sh -c 'echo $KSH_VERSION; echo $BASH_VERSION'`、`command -v bash` | 区分 mksh / bash / busybox sh。`--version` **在真机上直接报错**（`sh: --: unknown option`，BLA-AL00 实测），mksh 的版本只能从内建变量取；变量未设置时输出空串，故两问一起问 | 无可用 shell → 不注册 shell 工具 |
 | 6 | 命令集 | `toybox`（裸）/ `busybox --list` + `ls`（applet 列表） | 得到实际存在的 applet 集合。**两种写法不是一回事**：BLA-AL00 实测裸 `toybox` 返回 194 个**applet 名**，`toybox --list` 返回同样 194 项但带安装路径（`bin/cat`、`usr/bin/acpi`）。解析器要的是名字，改成 `--list` 会把路径当成 applet 名收进集合；输出按终端宽度折行（真机 19 行），须按空白切分而非按行 | 两者皆无 → 仅 shell 内建，工具描述需说明 |
 | 7 | 可写挂载 | `mount` 解析 + `touch` 试探 | `/data` 可写；`/system`、`/` 是否可 remount | 不可写 → 不开放 `android:fs:system` |

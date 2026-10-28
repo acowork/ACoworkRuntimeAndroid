@@ -18,8 +18,8 @@
 ---
 
 > **状态：早期开发。** 设计文档齐备，P0 切片（HostProfile 探测、脚本装配、进程生成、
-> `ExecutionBackend` 实现）已交付为可构建、可测试的 Rust 库，342 个测试通过，且整条链路已在真机上
-> 跑通过一次（华为 BLA-AL00，经 adb：16 条探测 → `HostProfile` → 一条真实命令，139ms / exit 0）。
+> `ExecutionBackend` 实现）已交付为可构建、可测试的 Rust 库，344 个测试通过，且整条链路已在真机上
+> 跑通过一次（华为 BLA-AL00，经 adb：17 条探测 → `HostProfile` → 一条真实命令，139ms / exit 0）。
 > **仍无 node 二进制产物**——目前唯一可运行的东西就是那个真机 harness——不适合用于生产环境。
 >
 > 下文标注 🚧 / ⬜ / ⛔ 的内容均为设计意图。三条 ⛔ 是「本仓库裁定 vs 上游权威」的冲突，
@@ -217,7 +217,7 @@ graph TD
 
 ```bash
 cargo build                                        # 构建
-cargo test                                         # 342 个测试（Android 单元 170 + 契约层 83 + 契约集成 23 + 规则一致性 43 + 真进程 12 + 真机地面实况 11）
+cargo test                                         # 344 个测试（Android 单元 172 + 契约层 83 + 契约集成 23 + 规则一致性 43 + 真进程 12 + 真机地面实况 11）
 cargo clippy --all-targets -- -D warnings          # 上游 CI 约定，须零告警
 cargo fmt --check
 ```

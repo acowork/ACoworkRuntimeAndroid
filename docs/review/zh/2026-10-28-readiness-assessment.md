@@ -224,15 +224,15 @@ ADR §7.4 只裁定了 `fs:system` 与 `selinux:permissive` 两条需要 owner �
 | P0 | 修正 ADR 日期、把 §7.1/§7.4 标注为待对齐 | 本仓库 | ✅ 已完成 |
 | P1 | 与 mobile app 负责人对齐 B4 的 APK 形态归属 | 需产品 | ⬜ 未开始 |
 | P1 | 回写 probe §3（B8 `dialects`、B12 shell 前置条件）与 §4（B10 ledger） | 本仓库 | ✅ 已完成（2026-10-29） |
-| — | 抽出平台中立契约层，使规则不绑在 Android 上（规避 B3、为第二个端口打样） | 本仓库 | ✅ 已完成 —— [ADR-AND-002](../../adr/zh/ADR-AND-002-platform-contract-layer.md)，342 测试 |
+| — | 抽出平台中立契约层，使规则不绑在 Android 上（规避 B3、为第二个端口打样） | 本仓库 | ✅ 已完成 —— [ADR-AND-002](../../adr/zh/ADR-AND-002-platform-contract-layer.md)，344 测试 |
 | — | 在真实嵌入式 target 上验证 R12（ESP32-C3 `riscv32imac-unknown-none-elf` 或 `riscv32imac-esp-espidf`） | 本仓库 | ⚠️ 部分 —— 已在更严格的 `riscv32imc`（无原子）上编译通过；`imac` 与 ESP-IDF 的 rust-std 组件下载被网络策略阻断 |
-| P2 | 实现只读档 backend（`ShellBackend` / `RootShellBackend` / `AppSandboxBackend`）+ adb 传输层 + 真机 harness | 本仓库，不被阻塞 | ✅ 已完成（2026-10-30）—— 16 条探测 + `assemble` + 一条真实命令在 BLA-AL00 上跑通，139ms / exit 0 / uid 2000。**getprop 与 mount 已实测；dumpsys / logcat 未实测**，它们不在 16 条探测里 |
+| P2 | 实现只读档 backend（`ShellBackend` / `RootShellBackend` / `AppSandboxBackend`）+ adb 传输层 + 真机 harness | 本仓库，不被阻塞 | ✅ 已完成（2026-10-30）—— 17 条探测 + `assemble` + 一条真实命令在 BLA-AL00 上跑通，139ms / exit 0 / uid 2000。**getprop 与 mount 已实测**；`logcat` 与 `dumpsys -l` 也在同一设备上手工实测可读（见下表），但它们不属于探测集 |
 | P2 | 补 B5 的上游平台矩阵改动、B6 的 spawn 契约方案 | 需上游 | ⬜ 未开始 |
 | P3 | 写档（依赖 B1 裁定） | 阻塞中 | ⬜ 阻塞中 |
 
 **已经做完并接着做了下一步**：P1 只读档的 backend 实现、`SpawnRunner` 平台接缝、adb 传输层与真机 harness。它们不触及 owner 门控（B1 只影响写档）、不触及 Gateway 契约（只读命令本地放行）、不依赖引擎归属（B3 已被零依赖设计规避，且现在是结构保证而非约定）。
 
-**真机对账换来的东西比功能本身多**：把 16 条探测在设备上跑一遍、与 fixture 逐字段比对，暴露出五个问题——
+**真机对账换来的东西比功能本身多**：把 17 条探测在设备上跑一遍、与 fixture 逐字段比对，暴露出五个问题——
 `sh --version` 在真机上直接报错、`attr/current` 以 NUL 结尾、"有 shell"被当成"shell 执行过"、无 Termux
 时注入 `$PREFIX`、无 Termux 的设备被标成 `termux` 档。五条已全部修掉并在真机上复验：前两条在解析层，
 第三条是判据，后两条是档位模型在编造事实。
@@ -241,14 +241,14 @@ ADR §7.4 只裁定了 `fs:system` 与 `selinux:permissive` 两条需要 owner �
 只能证明解析器与自己自洽，证明不了它对上了任何一台设备；第五条（注入 `$PREFIX`）是写后端时读代码
 发现的。
 
-**还欠着的**（`ShellPaths.su` 那条本地就能补，其余需要设备或上游）：
+**还欠着的**（除命名一条外，都需要设备或上游）：
 
 | 缺口 | 现状 | 需要什么 |
 |---|---|---|
 | `su` 拒绝措辞 | `parse_su_probe` 认 `denied` / `permission denied` / `not allowed` / `rejected` / `cancelled` 五种，全部是推断；`su_prompt_denied` 与 `su_helper_missing` 的分类表同理 | 一台装了 Magisk / KernelSU 的设备，实测弹窗拒绝与 helper 缺失各自的 stderr |
-| `ShellPaths.su` | 探测只试了固定路径（`/system/bin/su`、`/system/xbin/su`、`/sbin/su`），没有 `command -v su` 式的动态解析；`PATH` 上有 su 的设备会被漏掉 | 有 root 的设备上对比两种解析的结果 |
+| `ShellPaths.su` | **已补**：新增探测项 4a（`command -v su`），`assemble()` 从此填充 `paths.su`。此前该项恒为 `None`，而 `RootShellBackend` 没有它就不肯构造——root 档只能从手写 profile 到达。本机实测 4a 与固定路径探测一致（exit 1、空输出，`PATH` 上六个目录都没有） | 仍需在**有 root 的设备**上对比两种解析：固定路径清单没有覆盖 `/vendor/xbin`、`/debug_ramdisk` 之外的位置，而 `command -v` 会 |
 | 孤儿进程 | 超时只 `kill` 直接子进程。`logcat &` 这类脚本会留下孙进程继续跑——采集侧已有界排空不会因此挂起，但**设备侧的孤儿没被停掉**，在手机上这是耗电问题 | `killpg`（`std` 没有），需要 `nix`/`libc` 或设备侧 `pkill`；先确认哪些工具脚本会后台化 |
-| `dumpsys` / `logcat` | 未列入 16 条探测，因此其真实可用性未实测 | 真机各跑一次，确认 shell uid 在这台 user 版上能读到什么 |
+| `dumpsys` / `logcat` | 在同一设备上手工实测：shell uid 在 user 版上 `logcat -d` **读到的是全量缓冲区**（拿到了别的进程的日志行），`dumpsys -l` 能列服务。二者都不属于探测集——它们不是"这台机器是什么"，而是"这台机器能干什么" | 单个 service 的转储（`dumpsys package` 等）未逐项验证；若要作为工具开放，需按工具而非按档位来记 |
 | 第四档命名 | `system-shell` 描述的是"无 Termux 的普通 shell"，与 adb 无关（adb 只是这次到达它的方式） | 若上游摘要要按档位做调度，命名需与上游对齐 |
 
 **新增的一条**：`crates/acowork-android/tests/rules_conformance.rs` 是第二个端口的**模板**，不是普通测试文件。任何新平台接入时应复制它、保留 `r1_*`…`r13_*` 命名、替换 fixture；某条规则在该平台不适用时要显式说明而非删除。详见 ADR-AND-002 §3。
