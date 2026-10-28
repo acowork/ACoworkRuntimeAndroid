@@ -267,6 +267,16 @@ impl ShellDialect {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppletSet {
     names: BTreeSet<String>,
+    /// Every name the `command -v` spot check (probe item 6c) was *asked* about, whether or
+    /// not it found it.
+    ///
+    /// Held apart from `names` because the two questions are not the same question and a tool
+    /// description that answers the second with the first is lying by omission:
+    /// `contains("bugreportz") == false` means either "this device has no such command" or
+    /// "nobody asked", and only the first one licenses telling an agent to stop looking for
+    /// it. Item 6c exists precisely because the applet listings cannot see some of these
+    /// names, so "not in the set" is not evidence of absence for them.
+    spot_checked: BTreeSet<String>,
     /// True when neither `toybox` nor `busybox` reported a list. The shell then
     /// has builtins only, and the tool description must say so
     /// (android-host-probe.md §2 item 6).
@@ -333,15 +343,30 @@ impl AppletSet {
     /// Merge another listing into this one (toybox ∪ busybox ∪ spot checks).
     pub fn merge(&mut self, other: &AppletSet) {
         self.names.extend(other.names.iter().cloned());
+        self.spot_checked.extend(other.spot_checked.iter().cloned());
         // A union is only "no list source" when *both* sides had none.
         self.list_source_missing &= other.list_source_missing;
     }
 
     /// Record a single `command -v` spot check as present.
+    ///
+    /// Also records it as *asked*, so a caller that asks both questions ("is it there?",
+    /// "did we look?") gets them from one place.
     pub fn insert_confirmed(&mut self, name: &str) {
         if is_applet_name(name) {
+            self.spot_checked.insert(name.to_string());
             self.names.insert(name.to_string());
         }
+    }
+
+    /// Record that item 6c asked about a name, without claiming anything about the answer.
+    pub fn record_spot_check(&mut self, name: &str) {
+        self.spot_checked.insert(name.to_string());
+    }
+
+    /// Whether the spot check ever answered about this name.
+    pub fn was_spot_checked(&self, name: &str) -> bool {
+        self.spot_checked.contains(name)
     }
 }
 

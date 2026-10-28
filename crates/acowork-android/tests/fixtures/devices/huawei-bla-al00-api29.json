@@ -4,28 +4,28 @@
     "stderr": "",
     "exit_code": 0,
     "timed_out": false,
-    "duration_ms": 42
+    "duration_ms": 63
   },
   "getenforce": {
     "stdout": "Enforcing\n",
     "stderr": "",
     "exit_code": 0,
     "timed_out": false,
-    "duration_ms": 50
+    "duration_ms": 57
   },
   "attr_current": {
     "stdout": "u:r:shell:s0\u0000",
     "stderr": "",
     "exit_code": 0,
     "timed_out": false,
-    "duration_ms": 53
+    "duration_ms": 49
   },
   "su": {
     "stdout": "",
     "stderr": "/system/bin/sh: su: inaccessible or not found\n",
     "exit_code": 127,
     "timed_out": false,
-    "duration_ms": 34
+    "duration_ms": 29
   },
   "su_path": {
     "stdout": "",
@@ -39,32 +39,39 @@
     "stderr": "",
     "exit_code": 1,
     "timed_out": false,
-    "duration_ms": 29
+    "duration_ms": 33
   },
   "system_sh_version": {
     "stdout": "KSH=@(#)MIRBSD KSH R57 2019/03/01 Android\nBASH=\n",
     "stderr": "",
     "exit_code": 0,
     "timed_out": false,
-    "duration_ms": 42
+    "duration_ms": 49
   },
   "toybox_list": {
     "stdout": "acpi base64 basename bc blkid blockdev cal cat chattr chcon chgrp\nchmod chown chroot chrt cksum clear cmp comm cp cpio cut date dd devmem\ndf diff dirname dmesg dos2unix du echo egrep env expand expr fallocate\nfalse fgrep file find flock fmt free freeramdisk fsfreeze fsync getconf\ngetenforce getfattr grep groups gunzip gzip head help hostname hwclock\ni2cdetect i2cdump i2cget i2cset iconv id ifconfig inotifyd insmod\ninstall ionice iorenice iotop kill killall ln load_policy log logname\nlosetup ls lsattr lsmod lsof lspci lsusb makedevs md5sum microcom\nmkdir mkfifo mknod mkswap mktemp modinfo modprobe more mount mountpoint\nmv nbd-client netstat nice nl nohup nproc nsenter od partprobe paste\npatch pgrep pidof ping ping6 pivot_root pkill pmap printenv printf\nprlimit ps pwd pwdx readlink realpath renice restorecon rev rfkill\nrm rmdir rmmod runcon sed sendevent seq setenforce setfattr setprop\nsetsid sha1sum sha224sum sha256sum sha384sum sha512sum sleep sort\nsplit start stat stop strings stty swapoff swapon sync sysctl tac\ntail tar taskset tee time timeout top touch tr traceroute traceroute6\ntrue truncate tty tunctl ulimit umount uname uniq unix2dos unlink\nunshare uptime usleep uudecode uuencode uuidgen vconfig vmstat watch\nwc which whoami xargs xxd yes zcat \n",
     "stderr": "",
     "exit_code": 0,
     "timed_out": false,
-    "duration_ms": 44
+    "duration_ms": 51
   },
   "busybox_list": {
     "stdout": "",
     "stderr": "/system/bin/sh: busybox: inaccessible or not found\n",
     "exit_code": 127,
     "timed_out": false,
-    "duration_ms": 25
+    "duration_ms": 32
   },
   "applet_spot_checks": {
     "am": {
       "stdout": "/system/bin/am",
+      "stderr": "",
+      "exit_code": 0,
+      "timed_out": false,
+      "duration_ms": null
+    },
+    "bugreportz": {
+      "stdout": "/system/bin/bugreportz",
       "stderr": "",
       "exit_code": 0,
       "timed_out": false,
@@ -139,7 +146,7 @@
     "stderr": "",
     "exit_code": 0,
     "timed_out": false,
-    "duration_ms": 53
+    "duration_ms": 56
   },
   "system_remount": null,
   "prop_build_type": {
@@ -147,80 +154,80 @@
     "stderr": "",
     "exit_code": 0,
     "timed_out": false,
-    "duration_ms": 43
+    "duration_ms": 44
   },
   "prop_debuggable": {
     "stdout": "0\n",
     "stderr": "",
     "exit_code": 0,
     "timed_out": false,
-    "duration_ms": 43
+    "duration_ms": 44
   },
   "prop_secure": {
     "stdout": "1\n",
     "stderr": "",
     "exit_code": 0,
     "timed_out": false,
-    "duration_ms": 42
+    "duration_ms": 44
   },
   "prop_adb_secure": {
     "stdout": "1\n",
     "stderr": "",
     "exit_code": 0,
     "timed_out": false,
-    "duration_ms": 43
+    "duration_ms": 47
   },
   "prop_veritymode": {
     "stdout": "enforcing\n",
     "stderr": "",
     "exit_code": 0,
     "timed_out": false,
-    "duration_ms": 41
+    "duration_ms": 43
   },
   "prop_sdk": {
     "stdout": "29\n",
     "stderr": "",
     "exit_code": 0,
     "timed_out": false,
-    "duration_ms": 45
+    "duration_ms": 44
   },
   "prop_abi": {
     "stdout": "arm64-v8a\n",
     "stderr": "",
     "exit_code": 0,
     "timed_out": false,
-    "duration_ms": 45
+    "duration_ms": 44
   },
   "evidence_surface": {
     "stdout": "EVID /data/anr exists=0 list=0 count=3 read=1\nEVID /data/tombstones exists=1 list=1 count=0 read=2\nEVID /data/system/dropbox exists=1 list=1 count=0 read=2\n",
     "stderr": "",
     "exit_code": 0,
     "timed_out": false,
-    "duration_ms": 268
+    "duration_ms": 243
   },
   "dumpsys_inventory": {
     "stdout": "Currently running services:\n  AGPService\n  BastetService\n  Binder.Pged\n  CommunicationManager\n  DdmpDataBusService\n  DdmpDeviceMonitorService\n  DdmpDistributedData\n  DisplayEngineExService\n  DisplayEngineService\n  DockObserver\n  DubaiService\n  EmcomManager\n  HiMPEngineService\n  HiViewBinderService\n  HsmStat\n  HwCommBoosterService\n  HwFileMonitorService\n  Hwmedia.monitor\n  IAwareCMSService\n  IAwareSdkService\n  IDistributedGatewayService\n  IDistributedNetworkService\n  ITeecService\n  ITouchservice\n  SecGuardDataMgr\n  SelfbuildIRService\n  SurfaceFlinger\n  accessibility\n  account\n  activity\n  activity_task\n  adb\n  alarm\n  android.security.keystore\n  aod_service\n  app_binding\n  app_prediction\n  appassistant\n  appops\n  appwidget\n  aps_service\n  ashmem_device_service\n  audio\n  authentication_service\n  autofill\n  backup\n  battery\n  batteryproperties\n  batterystats\n  binder_calls_stats\n  biometric\n  bluetooth_manager\n  bugreport\n  carrier_config\n  chr_service\n  clipboard\n  color_display\n  com.huawei.harassmentinterception.service.HarassmentInterceptionService\n  com.huawei.mdfs.DistributedFileDaemon\n  com.huawei.netassistant.service.netassistantservice\n  com.huawei.permissionmanager.service.holdservice\n  com.huawei.security.IHwKeystoreService\n  com.huawei.securitycenter.mainservice.HwSecService\n  com.huawei.systemmanager.netassistant.netnotify.policy.NatTrafficNotifyService\n  com.huawei.systemmanager.netassistant.netpolicy.NatNetworkPolicyService\n  companiondevice\n  connectivity\n  connmetrics\n  consumer_ir\n  content\n  content_suggestions\n  contexthub\n  country_detector\n  cover\n  cpuinfo\n  crossprofileapps\n  dbinfo\n  device_config\n  device_identifiers\n  device_policy\n  deviceidle\n  deviceinfoex\n  devicestoragemonitor\n  diskstats\n  display\n  displayservice\n  distributedPermission\n  dreams\n  drm.drmManager\n  dropbox\n  dynamic_system\n  ethernet\n  external_vibrator_service\n  facerecognition\n  fido_authenticator\n  fingerprint\n  fusion_search\n  gfxinfo\n  gpu\n  graphicsstats\n  group_authenticate_service\n  hardware_properties\n  higeo_service\n  hisi.vrar\n  hiview\n  hiviewdfx\n  hiviewdfx_faultlogger\n  huawei.android.security.IAppBehaviorDataAnalyzer\n  hwAlarmService\n  hwAntiTheftService\n  hwBootanimExService\n  hwCarrierConfig\n  hwConnectivityExService\n  hwFaultNotifyService\n  hwGeneralService\n  hwPcManager\n  hwSaveDataService\n  hwUsbExService\n  hwaftpolicy\n  hwext_device_service\n  hwfm_service\n  hwservicebusmanager\n  hwsysresmanager\n  hwthermal\n  iGraphicsservice\n  imms\n  ims_config\n  ims_ut\n  incidentcompanion\n  input\n  input_method\n  input_method_secure\n  inputflinger\n  ioinfo\n  ions\n  iphonesubinfo\n  ipsec\n  ircs\n  isms\n  isms_interception\n  isub\n  jank\n  jankshield\n  jobscheduler\n  launcherapps\n  location\n  lock_settings\n  looper_stats\n  media.audio_flinger\n  media.audio_policy\n  media.camera\n  media.camera.proxy\n  media.drm\n  media.extractor\n  media.metrics\n  media.player\n  media.resource_manager\n  media.sound_trigger_hw\n  media_assist\n  media_projection\n  media_resource_monitor\n  media_router\n  media_session\n  meminfo\n  midi\n  mount\n  multi_task\n  netd_listener\n  netpolicy\n  netstats\n  network_management\n  network_score\n  network_stack\n  network_time_update_service\n  network_watchlist\n  nfc\n  notification\n  otadexopt\n  overlay\n  package\n  package_native\n  permission\n  pgservice\n  phone\n  phone_apdu\n  phone_huawei\n  pinner\n  pluginmanager\n  power\n  powergenius\n  print\n  processinfo\n  procstats\n  recovery\n  restrictions\n  role\n  rollback\n  runtime\n  scheduling_policy\n  search\n  sec_key_att_app_id_provider\n  security_server\n  securityserver\n  sensor_privacy\n  sensorservice\n  serial\n  servicediscovery\n  settings\n  shortcut\n  simphonebook\n  slice\n  soundtrigger\n  stats\n  statscompanion\n  statusbar\n  storaged\n  storaged_pri\n  storagestats\n  system.hsmcore\n  system_update\n  telecom\n  telephony.registry\n  testharness\n  textclassification\n  textservices\n  thermalservice\n  time_detector\n  trust\n  trustcircle_manager_service\n  tui\n  uimode\n  updatelock\n  uri_grants\n  usagestats\n  usb\n  user\n  vdecoderservice\n  vibrator\n  voiceinteraction\n  wallpaper\n  webviewupdate\n  wifi\n  wificond\n  wifip2p\n  wifiscanner\n  window\n",
     "stderr": "",
     "exit_code": 0,
     "timed_out": false,
-    "duration_ms": 200
+    "duration_ms": 195
   },
   "costs": [
     [
       "Id",
-      42
+      63
     ],
     [
       "GetEnforce",
-      50
+      57
     ],
     [
       "AttrCurrent",
-      53
+      49
     ],
     [
       "Su",
-      34
+      29
     ],
     [
       "SuPath",
@@ -228,63 +235,63 @@
     ],
     [
       "BashPath",
-      29
+      33
     ],
     [
       "SystemShVersion",
-      42
+      49
     ],
     [
       "ToyboxList",
-      44
+      51
     ],
     [
       "BusyboxList",
-      25
+      32
     ],
     [
       "SpotChecks",
-      45
+      54
     ],
     [
       "MountTable",
-      53
+      56
     ],
     [
       "PropBuildType",
-      43
+      44
     ],
     [
       "PropDebuggable",
-      43
+      44
     ],
     [
       "PropSecure",
-      42
+      44
     ],
     [
       "PropAdbSecure",
-      43
+      47
     ],
     [
       "PropVerityMode",
-      41
+      43
     ],
     [
       "PropSdk",
-      45
+      44
     ],
     [
       "PropAbi",
-      45
+      44
     ],
     [
       "EvidenceSurface",
-      268
+      243
     ],
     [
       "DumpsysInventory",
-      200
+      195
     ]
   ],
   "termux_prefix": null,

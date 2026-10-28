@@ -53,7 +53,7 @@ pub const PROBE_TOTAL_BUDGET: Duration = Duration::from_secs(2);
 /// `ps` and `setprop` stay even though the listing shows them here. A listing is a claim
 /// about a dispatcher's own table; `command -v` is a claim about the filesystem the shell
 /// will actually resolve against, and whether the two agree is a device-dependent accident.
-pub const SPOT_CHECK_APPLETS: [&str; 10] = [
+pub const SPOT_CHECK_APPLETS: [&str; 11] = [
     "logcat",
     "dumpsys",
     "getprop",
@@ -64,6 +64,12 @@ pub const SPOT_CHECK_APPLETS: [&str; 10] = [
     "screencap",
     "settings",
     "ps",
+    // ADR-AND-001 §4.6 item 6 names `bugreportz` as an evidence source, and — measured on
+    // the BLA-AL00 — no applet listing can see it: `/system/bin/bugreportz` is a standalone
+    // binary, absent from the 194 names `toybox` reports. It is therefore exactly the case
+    // this list exists for. Presence is all this asks: a bug report takes the better part of
+    // a minute to generate and is not something a startup probe should trigger.
+    "bugreportz",
 ];
 
 /// The evidence locations ADR-AND-001 §4.6 item 6 names as paths, probed by
@@ -715,13 +721,25 @@ mod tests {
     }
 
     #[test]
-    fn spot_check_list_is_capped_at_ten() {
-        // android-host-probe.md §7.5 item 1. The cap is about how many claims the port
-        // makes about devices in general, not about spawn cost — item 6c runs them in one
-        // shell invocation.
-        assert!(SPOT_CHECK_APPLETS.len() <= 10);
+    fn spot_check_list_is_capped_and_justified() {
+        // android-host-probe.md §7.5 item 1 caps this list — originally at 10, raised to 12
+        // when `bugreportz` was added. The cap bounds how many claims the port makes about
+        // devices in general, not the spawn cost: item 6c runs every name in one shell
+        // invocation, and `command -v` is a builtin.
+        //
+        // Raising a cap is the kind of change that should cost its author an argument, so
+        // the rule is stated here rather than in a comment somewhere else: a name belongs on
+        // this list if (a) the §4.4 vocabulary or the §4.6 item 6 evidence list uses it, and
+        // (b) no other probe item already proves it. `mount` failed (b) and left; `ps` and
+        // `setprop` pass (a) and stay even though the listing does name them, because the
+        // listing is a dispatcher's self-report while `command -v` asks the filesystem.
+        assert!(
+            SPOT_CHECK_APPLETS.len() <= 12,
+            "grown past what the ruling bounds; justify it in android-host-probe.md §8 first"
+        );
         assert!(SPOT_CHECK_APPLETS.contains(&"logcat"));
         assert!(SPOT_CHECK_APPLETS.contains(&"screencap"));
+        assert!(SPOT_CHECK_APPLETS.contains(&"bugreportz"));
     }
 
     #[test]
@@ -767,9 +785,9 @@ mod tests {
 
     #[test]
     fn the_spot_check_asks_for_every_name_in_one_invocation() {
-        // The whole point of batching: probing each name as its own command would be ten
-        // spawns, and over the adb harness ten spawns is ten round trips at startup on a
-        // battery. `command -v` is a builtin, so the loop itself is free.
+        // The whole point of batching: probing each name as its own command would be one
+        // spawn per name, and over the adb harness that is a dozen round trips at startup on
+        // a battery. `command -v` is a builtin, so the loop itself is free.
         let line = ProbeCommand::SpotChecks.command_line();
         assert_eq!(line.matches("command -v").count(), 1);
         assert_eq!(line.matches("for n in ").count(), 1);
@@ -784,8 +802,8 @@ mod tests {
 
     #[test]
     fn spot_checks_confirm_the_commands_an_applet_listing_cannot_see() {
-        // Verbatim from a Huawei BLA-AL00 (API 29) through `adb shell`. Eight of these ten
-        // names do not appear anywhere in that device's 194-applet `toybox` listing, because
+        // Verbatim from a Huawei BLA-AL00 (API 29) through `adb shell`. Nine of these eleven
+        // names do not appear anywhere in that device's 194-name `toybox` listing, because
         // they are standalone `/system/bin` binaries rather than applets. A profile built
         // from the listing alone reports the entire read surface as absent.
         let device_output = "\
@@ -799,6 +817,7 @@ SPOT input rc=0 path=/system/bin/input
 SPOT screencap rc=0 path=/system/bin/screencap
 SPOT settings rc=0 path=/system/bin/settings
 SPOT ps rc=0 path=/system/bin/ps
+SPOT bugreportz rc=0 path=/system/bin/bugreportz
 ";
         let checks = parse_spot_checks(device_output);
         assert_eq!(checks.len(), SPOT_CHECK_APPLETS.len());

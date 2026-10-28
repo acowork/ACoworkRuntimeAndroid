@@ -386,6 +386,7 @@ impl HostProfile {
             // when the applet is absent, so exit code plus non-empty stdout is
             // the presence test. The name comes from the map key, which the
             // runner recorded when it issued the check.
+            applets.record_spot_check(name);
             if out.succeeded() && !out.stdout.trim().is_empty() {
                 applets.insert_confirmed(name);
             }
@@ -822,6 +823,27 @@ mod tests {
                 .applets
                 .contains("logcat"),
             "presence may not be inferred from a listing that never mentioned it"
+        );
+
+        // The third state, which is the one a tool description has to get right: the check ran
+        // and the device said no. `contains` is false for that and for the case above, and only
+        // the provenance distinguishes them — `bugreportz` is the live example, since no applet
+        // listing on any device will ever name it.
+        probe
+            .applet_spot_checks
+            .insert("bugreportz".to_string(), CommandOutput::failed(1, ""));
+        let probed_then_absent = HostProfile::assemble(&probe, "com.example.agent").applets;
+        assert!(
+            probed_then_absent.was_spot_checked("bugreportz"),
+            "an answered-but-negative check is still an answer"
+        );
+        assert!(
+            !probed_then_absent.contains("bugreportz"),
+            "and a negative answer is not a presence claim"
+        );
+        assert!(
+            !probed_then_absent.was_spot_checked("logcat"),
+            "the name whose answer was cleared stays unasked, however many others were asked"
         );
     }
 

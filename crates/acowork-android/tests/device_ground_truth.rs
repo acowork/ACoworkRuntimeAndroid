@@ -193,9 +193,9 @@ fn the_applet_listing_survives_the_real_typography() {
 #[test]
 fn the_read_surface_exists_on_the_device_where_only_item_6c_can_see_it() {
     // ADR-AND-001 §4.4 defines the read allow-list as getprop / dumpsys / logcat / ps / df /
-    // mount / getenforce, and its write row names settings. On this device eight of those
-    // tools are standalone `/system/bin` binaries that appear in none of the 194 listed
-    // applets. Before item 6c the listings
+    // mount / getenforce, and its write row names settings. On this device nine of those
+    // tools — plus §4.6 item 6's `bugreportz` — are standalone `/system/bin` binaries that
+    // appear in none of the 194 listed applets. Before item 6c the listings
     // were the *only* source of command presence, so a profile assembled from this device
     // declared absent the exact surface this port exists to offer — and the hand-written
     // fixtures, which listed `logcat` as an applet, kept the two sources from being told
@@ -218,6 +218,11 @@ fn the_read_surface_exists_on_the_device_where_only_item_6c_can_see_it() {
         "input",
         "screencap",
         "settings",
+        // §4.6 item 6's evidence source. It is in this list because it is the cleanest
+        // example of the trap: a device that has the command, a listing that cannot see it,
+        // and a description that would have silently omitted an evidence source the ADR
+        // tells an agent to collect.
+        "bugreportz",
     ] {
         assert!(
             !listed.contains(name),
@@ -235,6 +240,50 @@ fn the_read_surface_exists_on_the_device_where_only_item_6c_can_see_it() {
     // which is the expected overlap rather than a contradiction.
     assert!(listed.contains("mount") && profile.applets.contains("mount"));
     assert!(listed.contains("ps") && profile.applets.contains("ps"));
+}
+
+#[test]
+fn the_description_a_real_device_generates_names_the_source_no_listing_can_see() {
+    // §4.5 says tool descriptions are generated from what the probe found. The interesting
+    // case is not `getprop`, which any listing reports, but `bugreportz`: the one §4.6 item 6
+    // evidence source that only item 6c can see, and the one whose tier the description must
+    // agree with the gate about. Run against the captured device rather than by eye, because
+    // "I looked at the harness output once" is not a constraint.
+    let profile = HostProfile::assemble(&ground_truth(), OWN_PACKAGE);
+    let text = acowork_android::host::shell_tools(&profile)[0]
+        .description
+        .clone();
+
+    assert!(
+        text.contains("`bugreportz` is installed"),
+        "the device has it and the description must say so: {text}"
+    );
+    assert!(
+        !text.contains("was not asked about") && !text.contains("not installed"),
+        "the spot check answered for it, so neither of the other two states may be claimed"
+    );
+
+    // And the tier it states is the tier the gate will apply — same classifier, same call.
+    let gate = acowork_android::host::commands::check(
+        "bugreportz -p",
+        Some(acowork_android::host::capability::Capability::ShellWrite),
+    );
+    match gate {
+        Ok(verdict) => {
+            let cap = verdict
+                .strongest()
+                .capability()
+                .expect("a runnable command has an authorising capability");
+            assert!(
+                text.contains(&cap.to_string()),
+                "description offers a different tier than `{cap}` requires: {text}"
+            );
+        }
+        Err(refusal) => assert!(
+            text.contains(&refusal.to_string()),
+            "the gate refuses and the description says otherwise: {text}"
+        ),
+    }
 }
 
 #[test]

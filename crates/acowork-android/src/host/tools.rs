@@ -24,7 +24,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::host::commands::{READ_TIER_COMMANDS, WRITE_TIER_COMMANDS};
+use crate::host::commands::{self, READ_TIER_COMMANDS, WRITE_TIER_COMMANDS};
 use crate::host::facts::{Privilege, SelinuxState, ShellDialect};
 use crate::host::profile::HostProfile;
 
@@ -198,7 +198,13 @@ fn writable_block(profile: &HostProfile) -> String {
 fn evidence_block(profile: &HostProfile) -> String {
     use crate::host::facts::EvidencePath;
     if profile.evidence.is_unknown() {
-        return "Evidence: no evidence source was probed, so availability is unknown.".to_string();
+        // The command's state is reported even here: it comes from the spot check, which is a
+        // different probe from the path walk, and an unanswered `/data/anr` says nothing about
+        // whether `bugreportz` is installed.
+        return format!(
+            "Evidence: no evidence source was probed, so availability is unknown.{}",
+            bugreportz_note(profile)
+        );
     }
     let mut parts = Vec::new();
     for path in EvidencePath::ALL {
@@ -215,7 +221,78 @@ fn evidence_block(profile: &HostProfile) -> String {
         ),
         None => " The `dumpsys` service inventory was not answered.".to_string(),
     };
-    format!("Evidence: {}.{}", parts.join("; "), inventory)
+    format!(
+        "Evidence: {}.{}{}",
+        parts.join("; "),
+        inventory,
+        bugreportz_note(profile)
+    )
+}
+
+/// The sixth source in ADR-AND-001 §4.6 item 6, which is a command rather than a path.
+///
+/// `bugreportz` is the one evidence source no applet listing can see: on the BLA-AL00 it is a
+/// standalone `/system/bin` binary, absent from the 194 names `toybox` reports, so the only
+/// thing that knows about it is probe item 6c's `command -v` spot check. It is therefore also
+/// the source a description built from a listing would most confidently get wrong — not by
+/// misdescribing it but by never mentioning it, and an agent that is never told a command
+/// exists does not ask for the approval it needs.
+///
+/// The tier is read back from the classifier rather than written down here, because the two
+/// have different owners: an agent told one thing by a tool description and refused in some
+/// other wording by the gate has been lied to by us twice over, and the second time is the one
+/// that costs it a retry.
+fn bugreportz_note(profile: &HostProfile) -> String {
+    const NAME: &str = "bugreportz";
+    // The invocation §4.6 item 6 means: a partial report. Whether `-p` exists on *this* build
+    // is not something the probe measured, and nothing here claims that it was.
+    const SCRIPT: &str = "bugreportz -p";
+
+    if !profile.applets.was_spot_checked(NAME) {
+        // Not "not installed": nobody asked. Item 6c is the only source that can answer for
+        // this name, and a profile assembled without it has not.
+        return format!(" `{NAME}` was not asked about, so whether this device has it is unknown.");
+    }
+    if !profile.applets.contains(NAME) {
+        return format!(" `{NAME}` is not installed on this device.");
+    }
+    let claimed = Some(crate::host::capability::Capability::ShellWrite);
+    match commands::check(SCRIPT, claimed) {
+        Ok(verdict) => {
+            let effect = verdict.strongest();
+            match effect.capability() {
+                Some(cap) => format!(
+                    " `{NAME}` is installed; it is not an unattended read — the classifier puts it in the `{cap}` tier, approval required."
+                ),
+                // Opaque or banned: no capability to name. Say which, in the classifier's own
+                // words, because "needs approval" would send the agent to ask for an approval
+                // that does not exist.
+                None => format!(
+                    " `{NAME}` is installed but `{SCRIPT}` is {} under any capability, so asking for approval will not unblock it.",
+                    effect_word(effect)
+                ),
+            }
+        }
+        Err(refusal) => format!(" `{NAME}` is installed and this port will not run it: {refusal}"),
+    }
+}
+
+/// [`Effect`](commands::Effect) in the few words a model needs, derived from the enum rather
+/// than restated as prose that can drift from it.
+fn effect_word(effect: commands::Effect) -> &'static str {
+    match effect {
+        commands::Effect::Banned => "hard-banned by §4.6.3 item 3",
+        commands::Effect::Opaque => "unanalysable",
+        // Only the two effects with no capability reach this function. Naming the rest instead
+        // of `unreachable!()` is deliberate: this runs while building a tool description, and
+        // a panic there would take the Runtime's own registration down with it. A new effect
+        // added to the enum lands here as text that is merely imprecise.
+        commands::Effect::ReadOnly => "readable without approval",
+        commands::Effect::ShellWrite => "a write",
+        commands::Effect::FileWrite => "a file write",
+        commands::Effect::SystemWrite => "a system write",
+        commands::Effect::SelinuxChange => "an SELinux change",
+    }
 }
 
 fn boundary_block(profile: &HostProfile) -> String {
@@ -527,6 +604,50 @@ mod tests {
         let text = shell_tools(&system_shell())[0].description.clone();
         assert!(text.contains("no evidence source was probed"), "{text}");
         assert!(!text.contains("/data/anr"), "{text}");
+    }
+
+    #[test]
+    fn bugreportz_is_reported_in_the_state_the_probe_left_it_in() {
+        // Three states, not two: installed, absent, never asked. Folding the third into the
+        // second is how a description tells an agent to stop looking for something this device
+        // may well have — and `bugreportz` is exactly the command where that mistake is
+        // available, because no applet listing reports it either way.
+        let mut p = system_shell();
+        let text = shell_tools(&p)[0].description.clone();
+        assert!(text.contains("was not asked about"), "{text}");
+        assert!(
+            !text.contains("not installed"),
+            "an unanswered spot check must not be described as an absent command"
+        );
+
+        p.applets.record_spot_check("bugreportz");
+        let text = shell_tools(&p)[0].description.clone();
+        assert!(text.contains("not installed on this device"), "{text}");
+
+        p.applets.insert_confirmed("bugreportz");
+        let text = shell_tools(&p)[0].description.clone();
+        assert!(text.contains("`bugreportz` is installed"), "{text}");
+
+        // What the description says about the tier is what the gate will say, read from the
+        // same call rather than restated: the two have different owners, and only one of them
+        // is allowed to be wrong.
+        let gate = commands::check(
+            "bugreportz -p",
+            Some(crate::host::capability::Capability::ShellWrite),
+        );
+        match gate {
+            Ok(v) => match v.strongest().capability() {
+                Some(cap) => assert!(
+                    text.contains(&cap.to_string()) || text.contains("approval"),
+                    "{text}"
+                ),
+                None => assert!(
+                    text.contains("asking for approval will not unblock it"),
+                    "{text}"
+                ),
+            },
+            Err(r) => assert!(text.contains(&r.to_string()), "{text}"),
+        }
     }
 
     #[test]

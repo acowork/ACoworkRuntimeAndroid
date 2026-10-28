@@ -850,6 +850,19 @@ fn device_facts_and_applets_reach_the_tool_description_inputs() {
     assert!(profile.applets.contains("dumpsys"));
     // A command that was never reported must be absent, so the generated
     // description cannot advertise something the device does not have.
-    assert!(!profile.applets.contains("bugreportz"));
+    //
+    // `bugreportz` used to be the sentinel here — it was absent because nothing in the
+    // baseline named it. That stopped being available the moment ADR-AND-001 §4.6 item 6's
+    // evidence source joined `SPOT_CHECK_APPLETS`, which is the same trap the real device
+    // falls into: the baseline answers every name on the list, so a name added to the list is
+    // a name every synthetic device has. The sentinel is now a string that cannot be on any
+    // list, and the provenance API carries the distinction the sentinel used to make by
+    // accident: asked-and-found, asked-and-not-found, never asked.
+    assert!(profile.applets.was_spot_checked("bugreportz"));
+    assert!(profile.applets.contains("bugreportz"));
     assert!(!profile.applets.contains("definitely-not-an-applet"));
+    assert!(
+        !profile.applets.was_spot_checked("definitely-not-an-applet"),
+        "a name nobody asked about must not be recorded as asked"
+    );
 }
