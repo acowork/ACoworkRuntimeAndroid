@@ -18,7 +18,7 @@
 ---
 
 > **状态：早期开发。** 设计文档齐备，P0 切片（HostProfile 探测、脚本装配、进程生成、
-> `ExecutionBackend` 实现、§4.4 只读档护栏、§4.5 动态工具描述）已交付为可构建、可测试的 Rust 库，396 个测试通过，
+> `ExecutionBackend` 实现、§4.4 只读档护栏、§4.5 动态工具描述、§4.6.1 审计日志出口）已交付为可构建、可测试的 Rust 库，414 个测试通过，
 > 且整条链路已在真机上跑通过（华为 BLA-AL00，经 adb：18 条只读探测 → `HostProfile` → 真实命令，
 > ~120ms / exit 0，其中 `logcat` 之所以能跑，是因为探测项 6c 去抽查了它）。
 > **仍无 node 二进制产物**——目前唯一可运行的东西就是那个真机 harness——不适合用于生产环境。
@@ -199,7 +199,7 @@ graph TD
 | 6 | 电池 / Doze 调优与长跑稳定性测试 | ⬜ 计划中 |
 | 7 | 发布产物（Termux 包 + 签名 APK） | ⬜ 计划中（依赖 #2/#4；NDK 管线可复用上游 `apps/acowork-mobile`） |
 | 8 | `root-shell` 宿主档，**仅只读能力**（`logcat` / `dumpsys` / `getprop`） | 🚧 **大部分交付** —— 只读档现在按**脚本内容**放行而非按调用方标签（[`host/commands.rs`](crates/acowork-android/src/host/commands.rs)），且覆盖的命令是被探测出来的而非假定的（探测项 6c）；已在 BLA-AL00 上端到端验证。剩余：`RootShellBackend` 在一台真有 `su` 的设备上跑一次——它至今没碰过真实的 su |
-| 9 | Android 调试工具集（截屏、ANR / tombstone / bugreport 采集）+ 命令审计日志 | ⬜ 计划中（依赖 #8） |
+| 9 | Android 调试工具集（截屏、ANR / tombstone / bugreport 采集）+ 命令审计日志 | 🚧 **交付一半** —— 审计日志已交付（[`host/audit.rs`](crates/acowork-android/src/host/audit.rs)）：`AuditedBackend` 在碰设备**之前**落一条 `attempted`、出结果后落收尾记录；开口记录写不进去就**不执行命令**。调试工具集仍在计划中（依赖 #8） |
 | 10 | 写能力档：审批门控、设备级写锁、prop / 文件自动回滚 | ⛔ **阻塞（B1）** —— ADR §7.4 的 owner 合取项与上游 ADR-087 D1/D5 冲突；门控骨架已按「两权威分解」实现，待上游确认 |
 | 11 | Magisk 模块形态，用于长期挂机的调试设备农场 —— **仅当该需求真实成立** | ⬜ 暂缓 |
 
@@ -218,7 +218,7 @@ graph TD
 
 ```bash
 cargo build                                        # 构建
-cargo test                                         # 396 个测试（Android 单元 221 + 契约层 83 + 契约集成 23 + 规则一致性 43 + 真进程 13 + 真机地面实况 13）
+cargo test                                         # 414 个测试（Android 单元 238 + 契约层 83 + 契约集成 24 + 规则一致性 43 + 真进程 13 + 真机地面实况 13）
 cargo clippy --all-targets -- -D warnings          # 上游 CI 约定，须零告警
 cargo fmt --check
 ```

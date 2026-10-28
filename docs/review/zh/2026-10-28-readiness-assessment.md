@@ -224,7 +224,7 @@ ADR §7.4 只裁定了 `fs:system` 与 `selinux:permissive` 两条需要 owner �
 | P0 | 修正 ADR 日期、把 §7.1/§7.4 标注为待对齐 | 本仓库 | ✅ 已完成 |
 | P1 | 与 mobile app 负责人对齐 B4 的 APK 形态归属 | 需产品 | ⬜ 未开始 |
 | P1 | 回写 probe §3（B8 `dialects`、B12 shell 前置条件）与 §4（B10 ledger） | 本仓库 | ✅ 已完成（2026-10-29） |
-| — | 抽出平台中立契约层，使规则不绑在 Android 上（规避 B3、为第二个端口打样） | 本仓库 | ✅ 已完成 —— [ADR-AND-002](../../adr/zh/ADR-AND-002-platform-contract-layer.md)，396 测试 |
+| — | 抽出平台中立契约层，使规则不绑在 Android 上（规避 B3、为第二个端口打样） | 本仓库 | ✅ 已完成 —— [ADR-AND-002](../../adr/zh/ADR-AND-002-platform-contract-layer.md)，414 测试 |
 | — | 在真实嵌入式 target 上验证 R12（ESP32-C3 `riscv32imac-unknown-none-elf` 或 `riscv32imac-esp-espidf`） | 本仓库 | ⚠️ 部分 —— 已在更严格的 `riscv32imc`（无原子）上编译通过；`imac` 与 ESP-IDF 的 rust-std 组件下载被网络策略阻断 |
 | P2 | 实现只读档 backend（`ShellBackend` / `RootShellBackend` / `AppSandboxBackend`）+ adb 传输层 + 真机 harness | 本仓库，不被阻塞 | ✅ 已完成（2026-10-30）—— 18 条只读探测 + `assemble` + 真实命令在 BLA-AL00 上跑通，~120ms / exit 0 / uid 2000。**getprop 与 mount 已实测**；`logcat` / `dumpsys` 此前是**手工**实测可读、不属于探测集——现已由探测项 6c 收进集合（真机 10 项抽查中 8 项不在任何 `--list` 输出里，含 §4.4 点名却谁都看不见的 `settings`） |
 | P2 | §4.4 只读白名单按**脚本内容**判定（自称 read 的写命令在执行前被拒），§4.6.3 硬禁列表任何档位拒绝 | 本仓库，不被阻塞 | ✅ 已完成（2026-10-31）—— [`host/commands.rs`](../../../crates/acowork-android/src/host/commands.rs)，29 个新测试；BLA-AL00 实测 `settings put` 挂 read 标签被拒并指名 `android:shell:write`，`toybox rm -rf` 设备根在任何档位被拒 |
@@ -249,6 +249,8 @@ ADR §7.4 只裁定了 `fs:system` 与 `selinux:permissive` 两条需要 owner �
 | `su` 拒绝措辞 | `parse_su_probe` 认 `denied` / `permission denied` / `not allowed` / `rejected` / `cancelled` 五种，全部是推断；`su_prompt_denied` 与 `su_helper_missing` 的分类表同理 | 一台装了 Magisk / KernelSU 的设备，实测弹窗拒绝与 helper 缺失各自的 stderr |
 | `ShellPaths.su` | **已补**：新增探测项 4a（`command -v su`），`assemble()` 从此填充 `paths.su`。此前该项恒为 `None`，而 `RootShellBackend` 没有它就不肯构造——root 档只能从手写 profile 到达。本机实测 4a 与固定路径探测一致（exit 1、空输出，`PATH` 上六个目录都没有） | 仍需在**有 root 的设备**上对比两种解析：固定路径清单没有覆盖 `/vendor/xbin`、`/debug_ramdisk` 之外的位置，而 `command -v` 会 |
 | 孤儿进程 | **已修复**：spawn 时 `process_group(0)` 让子进程自成一组，超时先 `kill(-pgid, SIGKILL)` 再补直接子进程。改前先测过——`sleep 30 &` 的孙进程在原实现下确实活满了剩下的 29 秒。`kill_process_group` 里那两条守卫（pgid ≤1 拒绝、已被 reap 的 pid 拒绝）是它存在的全部理由：`0` 会打到我们自己那组，`-1` 会打到本 uid 能达到的每个进程，而回收后的 pid 会打死一个陌生人。范围只在超时路径：正常结束却留下后台任务的脚本仍然会孤儿化，那是 Unix 的 `nohup`/`setsid` 语义，不是缺陷 | 无 |
+| 审计日志 sink | **已实现**（`host/audit.rs`，§4.6.1）：`AuditedBackend` 装饰器 + `AuditSink` trait + 限长 JSONL 文件实现。开口记录写不进就拒绝执行（fail closed），收尾记录写不进只累计失败计数（命令已经跑了，谎报失败会诱导重试一次已发生的改动）。拒绝也记账，且带 `RefusalKind`——硬禁尝试与贴错档位是两类事件 | 节点侧决定落盘目录与保留策略 |
+| SELinux context 经错误文案上线 | **已修复**：`BackendError::to_contract()` 把 `observed_context` 原串拼进过线文案，违反 §7.1；当时的单测还断言着这个泄漏。改为只报 uid + 域的类别（六值固定词表），原串留在本地 `ExecRecord`/`Display`。新增遍历全部错误变体的守门测试 | 无 |
 | `dumpsys` / `logcat` | 在同一设备上手工实测：shell uid 在 user 版上 `logcat -d` **读到的是全量缓冲区**（拿到了别的进程的日志行），`dumpsys -l` 能列服务。**「它们不属于探测集」这句已作废**——探测项 6c 已把两者收进集合，且实测证明必须收：二者都不是 toybox applet，批量列表看不见它们。仍未验证的是单个 service 的转储（`dumpsys package` 等）；若要作为工具开放，需按工具而非按档位来记 | 逐项 service 验证 |
 | 第四档命名 | `system-shell` 描述的是"无 Termux 的普通 shell"，与 adb 无关（adb 只是这次到达它的方式） | 若上游摘要要按档位做调度，命名需与上游对齐 |
 

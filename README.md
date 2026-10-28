@@ -20,8 +20,8 @@
 > **Status: early development.** The design docs are in place, and two crates ship as buildable, tested
 > Rust libraries: the platform-neutral contract layer (`acowork-platform-contract`) and the Android host
 > layer (`acowork-android`, the P0 slice — HostProfile probe, script assembly, process spawn and
-> `ExecutionBackend` implementations, the §4.4 read-tier guardrail and the §4.5 tool
-> descriptions). 396 tests pass, the contract layer also builds for a bare-metal RISC-V
+> `ExecutionBackend` implementations, the §4.4 read-tier guardrail, the §4.5 tool
+> descriptions and the §4.6.1 audit outlet). 414 tests pass, the contract layer also builds for a bare-metal RISC-V
 > target, and the chain has been run against a physical device — a Huawei BLA-AL00 over adb:
 > 18 read-only probes → `HostProfile` → real commands, exit 0 in ~120 ms, including `logcat`,
 > which only works because the probe spot-checks for it. **No node binary exists yet** (the
@@ -204,7 +204,7 @@ itself — is the artifact a second port should copy.
 | 6 | Battery / doze tuning and long-run stability testing | ⬜ Planned |
 | 7 | Release artifacts (Termux package + signed APK) | ⬜ Planned (depends on #2/#4; the NDK pipeline can reuse upstream `apps/acowork-mobile`) |
 | 8 | `root-shell` profile, **read-only capabilities** (`logcat` / `dumpsys` / `getprop`) | 🚧 **Mostly delivered** — the read tier is now enforced on script content, not on the caller's label ([`host/commands.rs`](crates/acowork-android/src/host/commands.rs)), and the commands it covers are probed rather than assumed (item 6c); verified end to end on a BLA-AL00. Remaining: `RootShellBackend` on a rooted device — it has never been run against a real `su` |
-| 9 | Android debugging toolset (screencap, ANR / tombstone / bugreport capture) + command audit log | ⬜ Planned (depends on #8) — `ExecRecord` already carries every field §4.6 item 1 asks for; what is missing is a sink |
+| 9 | Android debugging toolset (screencap, ANR / tombstone / bugreport capture) + command audit log | 🚧 **Half delivered** — the audit log is ([`host/audit.rs`](crates/acowork-android/src/host/audit.rs)): `AuditedBackend` writes an `attempted` record before the device is touched and a terminal one after, and a sink that cannot take the opening record stops the command. The debugging toolset is still planned (depends on #8) |
 | 10 | Write capabilities: approval gating, per-device write lock, prop / file auto-rollback | ⛔ **Blocked (B1)** — ADR §7.4's owner conjunct conflicts with upstream ADR-087 D1/D5; the gate is implemented per the two-authority decomposition and awaits upstream confirmation |
 | 11 | Magisk-module form factor for always-on debug fleets — **only if that need is real** | ⬜ Deferred |
 
@@ -225,7 +225,7 @@ Both crates are plain Rust libraries with no platform-specific code, so they bui
 
 ```bash
 cargo build                                        # build
-cargo test                                         # 396 tests (android unit 221 + contract 83 + contract integration 23 + rule conformance 43 + real-process 13 + device ground truth 13)
+cargo test                                         # 414 tests (android unit 238 + contract 83 + contract integration 24 + rule conformance 43 + real-process 13 + device ground truth 13)
 cargo clippy --all-targets -- -D warnings          # upstream CI convention; must be warning-free
 cargo fmt --check
 ```

@@ -133,6 +133,14 @@ SELinux 是**运行时按 (scontext, tcontext, tclass) 判定**的，静态探�
 **已定案**（见 ADR §7.1）：只上报**能力摘要** —— `profile` 名、`caps` 集合、`shell dialect`、`privilege` 等级。
 **不上报**设备序列号 / 型号、`fs_roots` 具体路径、SELinux context 原字符串、observed-denials 明细。
 
+这条红线有**两个出口**，此前只守住了摘要那一个：错误文案同样是设备本地拼好、原样过线的字符串，而它更
+容易写错——「把原因放进消息里」看起来永远是对的。`BackendError::to_contract()` 曾把 `observed_context`
+原串拼进 `BackendUnavailable`，APK 档下即 `u:r:untrusted_app:s0:c166,c232`，而 MLS 分类是按安装分配的，
+那是设备指纹而不只是策略标签。现在投影只输出 uid（2000 / 0 是平台常量）加域的**类别**（六值固定词表：
+shell / app-sandbox / su-magisk / 未识别 / 不可读 / 未观测），原串留在本地 `ExecRecord`、`Display` 与审计
+日志里。守门测试：`the_exec_error_path_never_leaks_device_detail_either`（遍历所有错误变体 +
+`ExecRecord::to_contract()`）与 `an_mls_category_never_survives_the_contract_projection`。
+
 上报主体是 **Node Agent**（宿主能力是节点属性，与具体 Agent 无关），Gateway 侧仅用于展示与筛选，
 **不作为放行判定的依据** —— 权限判定始终在设备本地完成，避免两处权威漂移。
 
