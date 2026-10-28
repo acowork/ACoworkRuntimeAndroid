@@ -77,7 +77,8 @@ pub use capability::{
     Capability, PLATFORM, android_vocabulary, derive_claims, explain_absence, lookup,
 };
 pub use commands::{
-    Effect, Finding, Refusal, Verdict, check as check_script, classify as classify_script,
+    Effect, Finding, Refusal, RefusalKind, Verdict, check as check_script,
+    classify as classify_script,
 };
 pub use denial::{DenialLedger, SelinuxClassifier, SelinuxDenial, classify, parse_denials};
 pub use facts::{

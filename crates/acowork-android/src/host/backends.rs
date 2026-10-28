@@ -216,7 +216,10 @@ async fn run_script<R: SpawnRunner>(
     // *before* anything is assembled or spawned, so a mislabelled request never reaches the
     // device. This is the one choke point every shell backend goes through.
     if let Err(refusal) = commands::check(&request.script, request.android_capability()) {
-        return Err(BackendError::Refused(refusal.to_string()));
+        return Err(BackendError::Refused {
+            reason: refusal.to_string(),
+            kind: refusal.kind(),
+        });
     }
 
     let prepared = script::prepare(&request.script, request.cwd.as_deref(), &request.env)
@@ -1282,7 +1285,7 @@ mod tests {
         let request = ExecRequest::read("setprop persist.acowork.on 1", "session-1");
         let err = backend.exec(request).await.unwrap_err();
 
-        assert!(matches!(err, BackendError::Refused(_)), "{err:?}");
+        assert!(matches!(err, BackendError::Refused { .. }), "{err:?}");
         let text = err.to_string();
         assert!(text.contains("setprop"), "{text}");
         assert!(
@@ -1302,7 +1305,7 @@ mod tests {
 
         let request = ExecRequest::read("mount -o remount,rw /system", "session-1");
         let err = backend.exec(request).await.unwrap_err();
-        assert!(matches!(err, BackendError::Refused(_)), "{err:?}");
+        assert!(matches!(err, BackendError::Refused { .. }), "{err:?}");
         assert!(
             err.to_string()
                 .contains(&Capability::FsSystem.id().to_string()),
@@ -1320,7 +1323,7 @@ mod tests {
 
         let request = ExecRequest::new(Capability::ShellWrite, "rm -rf /data", "session-1");
         let err = backend.exec(request).await.unwrap_err();
-        assert!(matches!(err, BackendError::Refused(_)), "{err:?}");
+        assert!(matches!(err, BackendError::Refused { .. }), "{err:?}");
         assert!(err.to_string().contains("human"), "{err}");
         assert!(backend.runner.invocations().is_empty());
     }

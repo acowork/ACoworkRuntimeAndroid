@@ -49,6 +49,8 @@
 //! cheap unattended read tier cheap and unattended, and make the tiers that need a human
 //! unreachable by choosing a label.
 
+use serde::{Deserialize, Serialize};
+
 use crate::host::capability::Capability;
 
 /// What running one command would do to the device.
@@ -242,6 +244,44 @@ pub enum Refusal {
         /// The capability the content actually exercises.
         needed: Capability,
     },
+}
+
+/// Which rule refused, as a countable value.
+///
+/// [`Refusal`] itself is a message: its whole design is R9's "say what is missing and what
+/// to do next", which is right for a caller reading one refusal and wrong for a log that
+/// has to answer "how many people tried to brick this device this week". The audit trail
+/// (§4.6.1) needs the *category*, and the categories are not interchangeable:
+///
+/// - [`RefusalKind::Banned`] is someone reaching for a §4.6.3 hard-banned operation. It is
+///   not fixable by re-sending with a higher capability, so it is the one worth alerting on.
+/// - [`RefusalKind::Mismatch`] is a mislabel — usually the model guessing the wrong tier,
+///   and the expected outcome of a re-send under the capability the refusal names.
+/// - [`RefusalKind::Opaque`] is a limitation of the classifier, i.e. ours, not theirs.
+///
+/// Kept separate from `Refusal` rather than derived from it at read time, because the log
+/// outlives any wording change to the messages, and a log entry that has to re-parse English
+/// to be counted is not a log entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalKind {
+    /// §4.6.3 hard ban: no capability authorises this.
+    Banned,
+    /// The label is weaker than the script's content.
+    Mismatch,
+    /// The content could not be analysed, so it was not allowed.
+    Opaque,
+}
+
+impl Refusal {
+    /// The category of this refusal, for the audit trail.
+    pub fn kind(&self) -> RefusalKind {
+        match self {
+            Refusal::Banned { .. } => RefusalKind::Banned,
+            Refusal::Mismatch { .. } => RefusalKind::Mismatch,
+            Refusal::Opaque { .. } => RefusalKind::Opaque,
+        }
+    }
 }
 
 impl core::fmt::Display for Refusal {

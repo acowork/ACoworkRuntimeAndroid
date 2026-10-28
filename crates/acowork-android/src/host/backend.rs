@@ -71,6 +71,7 @@ use acowork_platform_contract::{
 };
 
 use crate::host::capability::Capability;
+use crate::host::commands::RefusalKind;
 use crate::host::denial::SelinuxDenial;
 use crate::host::facts::{SelinuxDomain, ShellDialect};
 use crate::host::profile::HostProfile;
@@ -328,7 +329,15 @@ pub enum BackendError {
     /// Distinct from [`BackendError::Backend`]: nothing is broken, and re-sending the same
     /// request unchanged will fail identically. The caller's options are to drop the command
     /// or to re-send it under the capability it names.
-    Refused(String),
+    Refused {
+        /// The [`Refusal`](super::commands::Refusal)'s message, verbatim — R9's actionable
+        /// text is exactly what a caller on the other side of the port needs.
+        reason: String,
+        /// Which rule refused. The message says what to do next; this says what *happened*,
+        /// and the audit trail (§4.6.1) needs the second one: a hard-ban attempt and a
+        /// mislabel look similar in prose and are opposite incidents in a log.
+        kind: RefusalKind,
+    },
 }
 
 /// Name the *class* of an SELinux domain, never the string it was derived from.
@@ -375,9 +384,11 @@ impl BackendError {
                  (the raw SELinux context stays on the device)",
                 ctx = domain_class(observed_context.as_deref())
             )),
-            BackendError::Backend(why) | BackendError::Refused(why) => {
-                ExecutionError::Rejected(why.clone())
-            }
+            BackendError::Backend(why) => ExecutionError::Rejected(why.clone()),
+            // The kind is dropped here on purpose. It is an audit classification (§4.6.1),
+            // and the caller across the port cannot act on it — the message already names
+            // the next step. It stays in the local record.
+            BackendError::Refused { reason, .. } => ExecutionError::Rejected(reason.clone()),
         }
     }
 }
@@ -403,7 +414,9 @@ impl std::fmt::Display for BackendError {
                  must not be treated as a privileged one"
             ),
             BackendError::Backend(why) => write!(f, "execution backend failed: {why}"),
-            BackendError::Refused(why) => write!(f, "the port refused to run this: {why}"),
+            BackendError::Refused { reason, .. } => {
+                write!(f, "the port refused to run this: {reason}")
+            }
         }
     }
 }

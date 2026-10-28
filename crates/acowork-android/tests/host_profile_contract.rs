@@ -16,8 +16,8 @@
 
 use acowork_android::host::{
     BackendError, Capability, CommandOutput, ExecRecord, ExecRequest, FsRoot, HostProfile,
-    Privilege, ProbeOutput, SelinuxDomain, SelinuxState, SessionWriteLock, ShellDialect,
-    VerityState, parse_denials,
+    Privilege, ProbeOutput, RefusalKind, SelinuxDomain, SelinuxState, SessionWriteLock,
+    ShellDialect, VerityState, parse_denials,
 };
 use acowork_platform_contract::{
     AttributionTier, AttributionVerdict, Gate, GateDecision, HostDescription, LocalReadiness,
@@ -354,7 +354,10 @@ fn the_exec_error_path_never_leaks_device_detail_either() {
             "backend broke",
         ),
         (
-            BackendError::Refused("`setprop` needs android:shell:write".into()),
+            BackendError::Refused {
+                reason: "`setprop` needs android:shell:write".into(),
+                kind: RefusalKind::Mismatch,
+            },
             "content refusal",
         ),
     ];
