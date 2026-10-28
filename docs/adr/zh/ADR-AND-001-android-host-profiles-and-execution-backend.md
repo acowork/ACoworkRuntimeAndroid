@@ -3,7 +3,7 @@
 - **状态**：**部分 Accepted** —— §1–§6（宿主档位、一个引擎、工具级提权、`ExecutionBackend` 契约）有效并已落地 P0；档位由三档扩到四档，见 §4.3；⚠️ **§7.1 与 §7.4 待与上游对齐**，二者被晚于本 ADR 的上游文档推翻，详见下方「上游冲突」与 [开发就绪度评估](../../review/zh/2026-10-28-readiness-assessment.md) B1/B2。
 - **日期**：2026-10-20（原标 `2026-05-15` 有误：正文引用了 2026-09-13 才创建的 ADR-075、2026-10-05 的 ADR-087、2026-10-09 的 ADR-090，该日期不可能成立）
 - **相关**：[README.md](../../../README.md)、上游 `docs/design/zh/12-tool-system.md`（平台支持矩阵与运行时平台检测）、上游 `core/acowork-runtime/src/tools/builtin/shell.rs`（多 shell 注册范式）、上游 ADR-087（node/agent 归属与门控）、上游 `docs/design/zh/30-runtime-protocol-and-pluggable-engine.md`（能力注册表与可插拔引擎，**v0.2 直接点名本 ADR**）、session 参数 `shellApprovalThreshold` / `approvalTimeoutSecs`
-- **实现**：P0 已交付，并按 [ADR-AND-002](ADR-AND-002-platform-contract-layer.md) 拆成两层 —— 规则在 `crates/acowork-platform-contract/`（平台中立，只依赖 serde，可在裸机 target 编译），Android 的事实与机制在 `crates/acowork-android/src/host/`（探测解析器、capability 取值、`su -c` 包装、`avc` 回灌）。414 测试通过，clippy `-D warnings` 零告警，并在华为 BLA-AL00 上端到端验证。本 ADR §7.1/§7.4 的门控落点已从 `backend.rs` 迁至契约层 `gate.rs`，§4.4 的权限描述已细化为四轴 `CapabilitySpec`——**决策内容不变**，详见 ADR-AND-002 §4
+- **实现**：P0 已交付，并按 [ADR-AND-002](ADR-AND-002-platform-contract-layer.md) 拆成两层 —— 规则在 `crates/acowork-platform-contract/`（平台中立，只依赖 serde，可在裸机 target 编译），Android 的事实与机制在 `crates/acowork-android/src/host/`（探测解析器、capability 取值、`su -c` 包装、`avc` 回灌）。442 测试通过，clippy `-D warnings` 零告警，并在华为 BLA-AL00 上端到端验证。本 ADR §7.1/§7.4 的门控落点已从 `backend.rs` 迁至契约层 `gate.rs`，§4.4 的权限描述已细化为四轴 `CapabilitySpec`——**决策内容不变**，详见 ADR-AND-002 §4
 - **EN mirror**：待补 `docs/adr/en/`（上游 `AGENTS.md:142` 要求中英 ADR 同一 commit 更新；本仓库尚未采用该约定，见评估 B7）
 
 > ### ⚠️ 上游冲突（2026-10-28 核对）
@@ -191,17 +191,18 @@ graph TD
 - `bash`：Termux 环境，POSIX + bash 扩展。
 - `ash`：`/system/bin/sh`（mksh），显式声明「无 bash 数组、`[[` 语义差异、命令由 toybox/busybox 提供」。
 
-工具描述由 HostProfile Probe 的探测结果动态生成（哪些 applet 真实存在），而非硬编码。 **已实现**（`crates/acowork-android/src/host/tools.rs`）：描述是 `HostProfile` 的纯函数，只写测到的事实——解释器路径与方言、§4.4 读写词汇表里哪些命令实测存在、哪些根目录被 `touch` 证实可写、运行的 uid 与 SELinux 模式。两条注册规则：解析不出路径就不注册（后端清空子进程环境，裸名无法解析）；探测没有答案就写「不知道」，不写 Android 传闻。BLA-AL00 实测生成的 `ash` 描述见 `cargo run --example device_probe` 第 5 节。
+工具描述由 HostProfile Probe 的探测结果动态生成（哪些 applet 真实存在），而非硬编码。 **已实现**（`crates/acowork-android/src/host/tools.rs`）：描述是 `HostProfile` 的纯函数，只写测到的事实——解释器路径与方言、§4.4 读写词汇表里哪些命令实测存在、哪些根目录被 `touch` 证实可写、§4.6 item 6 的每个证据源实测能拿到什么（`names only` / `not reachable` / `readable` / `empty` / `not probed`，逐源点名，没探的也占一位——悄悄变短的清单会被读成「这台机器没有 dropbox」）、运行的 uid 与 SELinux 模式。两条注册规则：解析不出路径就不注册（后端清空子进程环境，裸名无法解析）；探测没有答案就写「不知道」，不写 Android 传闻。BLA-AL00 实测生成的 `ash` 描述见 `cargo run --example device_probe` 第 5 节。
 
 ### 4.6 调试场景护栏（rollback-first）
 
 1. **审计日志**：每条提权命令记录 `capability / 实际 uid / SELinux 域 / 命令 / exit code / 耗时 / avc 拒绝`。 **已实现**（`crates/acowork-android/src/host/audit.rs`）：字段此前就齐备，缺的是出口，现在出口是一条策略而不只是文件。`AuditedBackend` 装饰器包住任何 `ExecutionBackend`（写进装饰器而非各后端内部，因为三个后端各自记得记账不叫控制；且最值得记的那批拒绝来自共享的内容检查，按后端记会整个漏掉无 shell 的 `AppSandboxBackend`）。每次尝试落**两条**记录：进入后端**之前**写 `attempted`，出结果后写 `completed` / `refused` / `privilege_not_granted` / …。开口记录写不下去时命令**不执行**——那是唯一还来得及拒绝的时刻，可跳过的审计是日志不是护栏；而收尾记录写不下去**不**改写成失败：命令已经跑了，把记账失败说成命令失败会诱导调用方重试一次已经发生的改动，只累计 `failures()`。存储是限长的 JSONL（默认 1 MiB，超限丢最旧的行，在半容量处轮转以免逐行重写）——手机的 /data 不是日志桶。拒绝的分类也补上了：`BackendError::Refused` 原先只带 `to_string()` 的结果，把「有人试图 §4.6.3 硬禁的分区破坏命令」「模型贴错档位」「分类器看不懂脚本」三件性质完全不同的事压成一句话，现在额外携带 `RefusalKind`。真机（BLA-AL00）第 6 节实测：读命令 `attempted`+`completed`（uid 2000 / `u:r:shell:s0`）、误标写 `refused(mismatch)`、硬禁 `refused(banned)`，第四条对着一个拒绝写入的 sink 确实没有到达设备。
-2. **拒绝归类**：从 stderr 抽取 `avc: denied`，转成可执行的下一步提示（「需要 su 域」/「需要显式 permissive 审批」），避免模型盲目重试。
+2. **拒绝归类**：从 stderr 抽取 `avc: denied`，转成可执行的下一步提示（「需要 su 域」/「需要显式 permissive 审批」），避免模型盲目重试。 **部分实现**：抽取已落地并接进 `ExecRecord::selinux_denials`（`backends::to_record`，一处解析、所有后端共享；现在也认 dmesg 的双空格写法，只认单空格会把内核来源的拒绝读成「没有拒绝」，于是被阻断的命令被报成普通非零退出、模型无限重试）；`classify` + `DenialLedger`（同一目标重复命中的检测）已实现并由 `tests/rules_conformance.rs` 的 R9 逐条验证，但**生产调用点还没接上**——端口桥（把 `ExecRecord` 变成契约调用的一方）尚未建立，所以归类目前只在测试里跑。过线文案里现在有的是 `SelinuxDenial::summary` 的脱敏形式（权限集 / 对象类 / 目标类型），它带得动「下一步」但不含「提权」建议：建议提权需要知道这台机器能不能提权，那是 `classify(denial, profile)` 的输入，而投影处没有 profile。
 3. **硬禁列表**：`dd of=/dev/block/*`、`rm -rf /data`、`wipe data`、`fastboot`、分区 `flash` —— 默认拒绝，即使 dangerous-mode 也需人工确认 + 设备指纹匹配。 **已实现**（`commands::Effect::Banned`）：`fastboot` / `flash` / `mkfs` / `format` 与任何含 `wipe-data` 的参数命中即拒；`dd` 看 `of=` 指向、`rm` 看删除目标是否为设备根或分区根、重定向落进分区路径同样判禁——删应用自身目录这类正常写不受影响。拒绝措辞不给出任何可达路径。
 4. **写操作可撤销**：改 prop 前记录旧值，会话结束自动回滚（`persist.*` 需显式声明才保留）；改文件先备份到 Agent 工作区，提供 `restore`。
    **未实现**：闸门已有 `rollback_plan` 轴（缺计划即拒 `RollbackPlanRequired`），但 Android 侧没有任何产生回滚计划的机制——`ExecRequest` 的该字段恒为 `None`。写档真正开放前必须补上。
 5. **DeviceWriteLock**：root 操作作用于**整机全局状态**，多个 Agent 并发调试会互相踩踏。Node Agent 侧新增 per-device 写锁，串行化 mutating 命令（read 类不锁）。锁由 **session 持有**、TTL 10 分钟、拿不到锁立即失败不排队 —— 语义详见 §7.2。这是本决策引入的**新架构件**。
 6. **证据采集**：`logcat -d`（带 buffer / filter）、`screencap`、`dumpsys <service>`、`/data/anr`、`/data/tombstones`、`bugreportz`。这是 root 档的真正价值——把「复现 → 证据 → 关联分析」闭环。
+   **实测校正（探测项 13 / 13b，2026-10-29）**：这一行把六个源写成了并列的「可采集」，实际是六个权限问题，而且答案各不相同。BLA-AL00（`user` 档 / uid 2000 / enforcing / 无 root）：`/data/anr` 能列出 3 个文件名、**一个字节都读不到**（每个 trace 都是 `-rw------- system system`）；`/data/tombstones` 与 `/data/system/dropbox` 连 `stat` 都被拒。所以「这是 root 档的真正价值」这句是对的，但它的反面也要写下来：**无 root 时这六个源里没有一个能取到内容**，能取到的只有「某时刻发生过 ANR」这种索引级事实。`dumpsys <service>` 另有一层：它不是一条命令而是一个每设备列表上的分发器（实测 246 个服务），存在性由 6c 证明，具体某个服务在不在只能问这台机器。工具描述按实测访问级逐源点名（`names only` / `not reachable` / `readable` / `empty` / `not probed`），既不写「available」也不写「unavailable」——前者是谎报，后者会丢掉唯一拿得到的东西。
 
 ### 4.7 提权 helper 契约（窄接口）
 
@@ -267,7 +268,9 @@ exec {
 > ②「上报能力摘要」的词汇表所有权已归上游 design 30 §6.2 的能力注册表，该文档 §9 明确要求本节「**应改为**同一份能力注册表的一个来源」。
 > 「上报什么 / 不上报什么」的隐私红线仍然有效并已落成测试（`gateway_summary_never_leaks_device_detail_on_any_tier`）。
 >
-> ⚠️ **红线有两个出口，此前只守住了一个**：摘要之外，错误文案同样是设备拼好、原样过线的字符串，而它更容易写错——「把原因放进消息里」看起来总是对的。`BackendError::to_contract()` 曾把 `observed_context` 原样插进 `BackendUnavailable` 文案，APK 档下即 `u:r:untrusted_app:s0:c166,c232`（MLS 分类是按安装分配的，那是设备指纹而不只是策略标签）；更糟的是当时有一条单测**断言了这个泄漏**，等于把错误行为钉成了基线。现在投影只输出 uid（2000/0 是平台常量，不是设备细节）加域的**类别**（六个固定取值，不含原串）；原串留在本地 `ExecRecord` 与 `Display`（N3 要真诊断，§7.1 只管离开设备的那一份）。补齐的守门：`the_exec_error_path_never_leaks_device_detail_either` 遍历所有 `BackendError` 变体与 `ExecRecord::to_contract()`，`an_mls_category_never_survives_the_contract_projection` 专门盯 APK 档形状。
+> ⚠️ **红线有三个出口，前两个是修出来的，第三个是量出来的**（2026-10-29 复核）。摘要之外，错误文案同样是设备拼好、原样过线的字符串，而它更容易写错——「把原因放进消息里」看起来总是对的。`BackendError::to_contract()` 曾把 `observed_context` 原样插进 `BackendUnavailable` 文案，APK 档下即 `u:r:untrusted_app:s0:c166,c232`（MLS 分类是按安装分配的，那是设备指纹而不只是策略标签）；更糟的是当时有一条单测**断言了这个泄漏**，等于把错误行为钉成了基线。现在投影只输出 uid（2000/0 是平台常量，不是设备细节）加域的**类别**（六个固定取值，不含原串）；原串留在本地 `ExecRecord` 与 `Display`（N3 要真诊断，§7.1 只管离开设备的那一份）。补齐的守门：`the_exec_error_path_never_leaks_device_detail_either` 遍历所有 `BackendError` 变体与 `ExecRecord::to_contract()`，`an_mls_category_never_survives_the_contract_projection` 专门盯 APK 档形状。
+>
+> **出口三是命令自己的 stdout / stderr**，而它敞在最宽的地方：`to_contract()` 原样搬运两条流。avc 审计记录是内核写进 audit log 的，所以它到达本进程的方式不是「后端出错」，而是**本节 item 6 让 agent 去跑的第一条取证命令的输出**——`logcat -d`。BLA-AL00 实测一次 `logcat -d -b events -t 400`：181 条审计记录（175 `avc: denied` + 6 `avc: granted`），181 处 `u:r:`、234 处 `u:object_r:`、23 处 `s0:c`，外加第三方应用私有目录的完整路径，全部原样过线。守门测试当时**结构上不可能发现这件事**：它断言 `!serde_json::to_string(&outcome).contains("u:r:")`，而 `ExecOutput.bytes` 是 `Vec<u8>`，serde 写成数字数组——任何内容都能通过这个断言。现在先解码再断言，并由 `denial::redact_denials` 在投影处把审计记录重写成「权限集 + 对象类 + 目标类型」（`system_prop` 这类平台 sepolicy 词表，同版本每台设备相同），丢掉 user / role / MLS 区间与路径；非记录行逐字节不动（`ps -Z` 的输出保留：§7.1 禁的是拒绝明细，不是设备能打印的每个标签，agent 来这台机器部分就是为了看进程在哪个域里）。`avc: granted` 参与脱敏但不计入 `parse_denials`——同一对标签，且它不是阻断。细节与三条子决策见 [探测文档 §5.3](../../design/zh/android-host-probe.md)。
 
 - **上报**：`profile` 名 + `caps` 集合 + `shell dialect` + `privilege` 等级。
 - **不上报**：设备序列号 / 型号、`fs_roots` 具体路径、SELinux context 原字符串、`observed-denials` 明细。

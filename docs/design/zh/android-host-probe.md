@@ -37,8 +37,13 @@ Android 宿主的差异不是「桌面 vs 移动」这种二分，而是连续�
 | 10 | verity 状态 | `getprop ro.boot.veritymode`、`dm-verity` 设备节点 | `e`（enforcing）→ 写系统需 disable-verity + 重启 | 未知 → 保守按 enforcing |
 | 11 | API / ABI | `getprop ro.build.version.sdk`、`ro.product.cpu.abi` | 决定二进制与 applet 行为差异 | — |
 | 12 | 存储根 | `$PREFIX`、`/sdcard`、`/data/data/<pkg>` 可达性 | 得到 `fs_roots` 白名单 | — |
+| 13 | 证据源可达性 | `for p in /data/anr /data/tombstones /data/system/dropbox`：`ls -d`（在不在）→ `ls`（能不能列）→ `wc -l`（几条）→ `head -n 1 <首个文件>`（能不能读） | ADR §4.6 item 6 承诺采集这些源，但每一条都是**权限问题而不是存在性问题**，所以四步分别跑、逐条报 exit，而不是问一次「有没有」。**三步以上要合并成一次 shell 调用**：三个路径各四步是 12 次往返，为的是取一个事实，在电池上不划算。**BLA-AL00 实测**（`user` 档 / uid 2000 / enforcing / 无 root）：`/data/anr exists=0 list=0 count=3 read=1` → **文件名拿得到、一个字节都读不到**（三个 trace 全是 `-rw------- system system`）；另两径 `exists=1` → 连 `stat` 都被拒 | 三档都不是「可用」。无 root 时 `readable()` 是空集。写 `available` 是谎报；写 `unavailable` 会丢掉唯一能拿到的东西（ANR 发生过这件事，比 trace 的字节更能改变下一步）。enforcing 域下「没有这个文件」与「不许你看到这个文件」从内部看是同一种观测，`Absent` 因此是一个取值而不是两个 |
+| 13b | `dumpsys` 服务清单 | `dumpsys -l` | `dumpsys <service>` 不是一条命令，是**一个每设备列表上的分发器**：BLA-AL00 实测 246 个服务。§4.4 把 `dumpsys` 当一条只读命令是对的（存在性由 6c 证明），但「这个设备上有没有你要 dump 的那个服务」是逐项的事，静态探测答不了 | 无表头 / 零条目 → `None` 而不是 `Some(0)`：拒答与「本机一个服务都没有」是两回事，而后者在 Android 上不存在 |
 
 **探测预算**：全部探测串行执行应 < 2s；每项独立超时（建议 500ms），单项超时不阻塞整体，降级为 `Unknown`。
+
+**预算的实测状态**（2026-10-29，BLA-AL00 经 adb）：`ProbeCommand::read_only_set()` 展开为 20 条串行调用（写试探 7b 不在只读集里），**没有一项触达自己的超时**——这一条由 `the_probe_budget_was_met_on_real_hardware` 钉住。但「< 2s」这个**总时长**目前没有被证明：`CommandOutput` 只记 stdout / stderr / exit / timed_out，不记耗时，所以现有证据是「都没超时」而不是「总共花了多久」。把前者写成后者，就是拿推断冒充测量。
+
 
 ---
 
@@ -120,7 +125,10 @@ SELinux 是**运行时按 (scontext, tcontext, tclass) 判定**的，静态探�
 
 ### 5.1 工具注册
 
-- `shell` 类工具按 `ShellDialect` 注册为**独立工具**（沿用上游 Windows 上 bash / powershell 双注册的范式）：`bash`（`command -v bash` 解析到了才注册）、`ash`（有 shell 真正执行过就注册，绑定 `/system/bin/sh`）。**已实现**：[`host/tools.rs`](../../crates/acowork-android/src/host/tools.rs) 由 `HostProfile` 纯函数生成描述文本，内容是「方言是什么、§4.4 的哪些命令实测存在、哪些位置被 `touch` 证实可写、跑在哪个 uid 与 SELinux 模式下」。
+- `shell` 类工具按 `ShellDialect` 注册为**独立工具**（沿用上游 Windows 上 bash / powershell 双注册的范式）：`bash`（`command -v bash` 解析到了才注册）、`ash`（有 shell 真正执行过就注册，绑定 `/system/bin/sh`）。**已实现**：[`host/tools.rs`](../../crates/acowork-android/src/host/tools.rs) 由 `HostProfile` 纯函数生成描述文本，内容是「方言是什么、§4.4 的哪些命令实测存在、哪些位置被 `touch` 证实可写、**证据源各能拿到什么**、跑在哪个 uid 与 SELinux 模式下」。
+  证据那一行按 §4.6 item 6 的固定词表逐源点名并给出实测访问级（`/data/anr names only; /data/tombstones not reachable; …`），
+  没探到的写 `not probed` 而不是从列表里消失——悄悄变短的清单会被读成「这台机器没有 dropbox」。
+  BLA-AL00 上这一行的实际输出：`Evidence: /data/anr names only; /data/tombstones not reachable; /data/system/dropbox not reachable. \`dumpsys\` has 246 running services to dump from (each needs its own \`android:shell:read\` approval).`
   本文早期版本举的例子（「`sed -i` 需空参数、`find -printf` 不可用」）**没有进入实现**：那是 Android 传闻而非本机测量，错一次的代价是模型据此拒绝一条本来能跑的命令，或依赖一条本来不存在的限制。探测答不上来的，描述里就写「不知道」——例如 shell 跑成功了但方言没被认出（busybox ash 两个变量都不设），仍然注册 `ash`，只是写「探测未能识别方言」。
 - 未进入 `caps` 的能力对应工具**不注册**，模型看不到即不会调用（与上游「LLM 只能看到当前平台可用的工具」一致）。
 
@@ -133,13 +141,45 @@ SELinux 是**运行时按 (scontext, tcontext, tclass) 判定**的，静态探�
 **已定案**（见 ADR §7.1）：只上报**能力摘要** —— `profile` 名、`caps` 集合、`shell dialect`、`privilege` 等级。
 **不上报**设备序列号 / 型号、`fs_roots` 具体路径、SELinux context 原字符串、observed-denials 明细。
 
-这条红线有**两个出口**，此前只守住了摘要那一个：错误文案同样是设备本地拼好、原样过线的字符串，而它更
-容易写错——「把原因放进消息里」看起来永远是对的。`BackendError::to_contract()` 曾把 `observed_context`
-原串拼进 `BackendUnavailable`，APK 档下即 `u:r:untrusted_app:s0:c166,c232`，而 MLS 分类是按安装分配的，
-那是设备指纹而不只是策略标签。现在投影只输出 uid（2000 / 0 是平台常量）加域的**类别**（六值固定词表：
-shell / app-sandbox / su-magisk / 未识别 / 不可读 / 未观测），原串留在本地 `ExecRecord`、`Display` 与审计
-日志里。守门测试：`the_exec_error_path_never_leaks_device_detail_either`（遍历所有错误变体 +
-`ExecRecord::to_contract()`）与 `an_mls_category_never_survives_the_contract_projection`。
+这条红线有**三个出口**，前两个是修出来的，第三个是量出来的。
+
+**出口一 · 摘要**：`HostDescription` 只带 profile 名、caps、dialect、privilege。
+
+**出口二 · 错误文案**：同样是设备本地拼好、原样过线的字符串，而且更容易写错——「把原因放进消息里」
+看起来永远是对的。`BackendError::to_contract()` 曾把 `observed_context` 原串拼进 `BackendUnavailable`，
+APK 档下即 `u:r:untrusted_app:s0:c166,c232`，而 MLS 分类是按安装分配的，那是设备指纹而不只是策略标签。
+现在投影只输出 uid（2000 / 0 是平台常量）加域的**类别**（六值固定词表：shell / app-sandbox / su-magisk /
+未识别 / 不可读 / 未观测），原串留在本地 `ExecRecord`、`Display` 与审计日志里。
+
+**出口三 · 命令自己的输出**。这个出口此前是敞开的，而且敞在最宽的地方：`ExecRecord::to_contract()`
+把 stdout / stderr 原样搬过线。avc 审计记录是内核写进 audit log 的，所以它到达本进程的方式不是「后端
+出错」，而是**§4.6 item 6 让 agent 去跑的第一条取证命令的 stdout**——`logcat -d`。BLA-AL00 实测一次
+`logcat -d -b events -t 400`：181 条审计记录（175 条 `avc: denied` + 6 条 `avc: granted`），含 181 处
+`u:r:`、234 处 `u:object_r:`、23 处 `s0:c`，另有第三方应用私有目录的完整路径。这些全部原样进了 Gateway。
+
+现在 `denial::redact_denials` 在投影处重写审计记录：保留权限集、对象类与目标的**类型**
+（`system_prop`、`app_data_file`——平台 sepolicy 的词表，同版本每台设备都一样），丢掉 user / role /
+MLS 区间与路径。非记录的行逐字节不动，包括 `ps -Z` 的输出：§7.1 禁的是拒绝明细，不是设备能打印的
+每一个标签，而 agent 待在调试机上的一大目的就是看某个进程在哪个域里。三个细节：
+
+1. `avc: granted` 参与脱敏但不进 `parse_denials`。同一对标签、同样的私有路径，只按「denied」匹配的红actor
+   会自认为清干净了；而它也不是阻断，算进去会让端口去「修」一个策略允许了的访问。
+2. dmesg 的双空格写法（`avc:  denied  {`）必须解析。只认单空格会把内核来源的拒绝读成「这里没有拒绝」，
+   后果不是难看而是错报：`was_blocked_by_selinux()` 把被阻断的命令报成普通非零退出，模型于是无限重试。
+3. 带 `scontext=` 却解析不出记录的行**整行扣下**。不能理解就放行，等于在这条规则唯一要保护的那个字段上
+   fail-open。
+
+**守门测试为什么差点没起作用**（值得单独记一笔）：`the_exec_error_path_never_leaks_device_detail_either`
+当时断言的是 `!serde_json::to_string(&outcome).contains("u:r:")`，而 `ExecOutput.bytes` 是 `Vec<u8>`，
+serde 序列化成数字数组——**任何内容都能通过这个断言**。它一路绿灯地放行了上面那 181 条记录。现在先解码
+再断言（`fn streams`），并补了 `a_denial_that_arrived_on_stdout_is_redacted_there_too`、
+`a_ps_dash_z_row_is_not_a_denial_and_keeps_its_labels`、
+`a_logcat_dump_of_other_processes_denials_is_not_this_runs_block`。教训：对序列化后的字节串做「不含某子串」
+的断言，默认它是无效测试，直到你看见它对错误的内容失败过一次。
+
+`record.selinux_denials` 与脱敏是两个问题，不要合并：前者是「内核拒绝了**这条命令**什么」（读它自己的
+stderr），后者是「过线的字节里不许有标签」。logcat 里别人家的历史拒绝会被脱敏，但不会把这次成功运行
+标成被阻断，也就不会附送一句「需要提权」。
 
 上报主体是 **Node Agent**（宿主能力是节点属性，与具体 Agent 无关），Gateway 侧仅用于展示与筛选，
 **不作为放行判定的依据** —— 权限判定始终在设备本地完成，避免两处权威漂移。
