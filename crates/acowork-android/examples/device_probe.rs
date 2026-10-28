@@ -128,9 +128,50 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
         println!("\n── 6. §4.6.1 audit trail ────────────────────────────");
         report_audit(&profile, &transport).await?;
+        println!("\n── 7. §4.6 item 6 evidence surface ─────────────────");
+        report_evidence(&profile);
     }
 
     Ok(())
+}
+
+/// Print what this uid can actually collect as evidence, per source.
+///
+/// Printed as measured access rather than as a yes/no availability, because the ADR's list
+/// is written yes/no and the device is not: on the BLA-AL00 `/data/anr` lists filenames and
+/// refuses contents, which is neither available nor unavailable.
+fn report_evidence(profile: &HostProfile) {
+    use acowork_android::host::facts::EvidencePath;
+    if profile.evidence.is_unknown() {
+        println!("  nothing was probed");
+        return;
+    }
+    for path in EvidencePath::ALL {
+        let access = profile.evidence.access(path);
+        println!(
+            "  {:<24} {}{}",
+            path.path(),
+            access.describe(),
+            if access.has_contents() {
+                "  <- contents collectable"
+            } else {
+                ""
+            }
+        );
+    }
+    match profile.evidence.dumpsys_services {
+        Some(count) => println!("  dumpsys services         {count} listed"),
+        None => println!("  dumpsys services         not answered"),
+    }
+    println!(
+        "  readable sources         {:?}",
+        profile
+            .evidence
+            .readable()
+            .iter()
+            .map(|p| p.path())
+            .collect::<Vec<_>>()
+    );
 }
 
 fn report_probe(probe: &ProbeOutput) {

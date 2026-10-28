@@ -12,7 +12,7 @@
 //! Guessing is how a probe turns into a false capability declaration, and
 //! android-host-probe.md §4 forbids exactly that.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -738,9 +738,349 @@ pub struct FsRoot {
     pub own_package: bool,
 }
 
+/// One of the evidence sources ADR-AND-001 §4.6 item 6 names.
+///
+/// A closed vocabulary rather than a `String` because these are the paths the ADR commits
+/// to collecting, and a profile that reported an arbitrary path would be reporting something
+/// no consumer asked for. The list is deliberately short: `/data/local/tmp` is already
+/// covered by [`FsRoot`], and `logcat` / `dumpsys` are commands, not paths, so they are
+/// probed as commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum EvidencePath {
+    /// `/data/anr` — ANR traces.
+    Anr,
+    /// `/data/tombstones` — native crash dumps.
+    Tombstones,
+    /// `/data/system/dropbox` — the system event log.
+    Dropbox,
+}
+
+impl EvidencePath {
+    /// Every source the probe asks about, in the order the probe script walks them.
+    pub const ALL: [EvidencePath; 3] = [
+        EvidencePath::Anr,
+        EvidencePath::Tombstones,
+        EvidencePath::Dropbox,
+    ];
+
+    /// The on-device path, as probed and as it appears in a record.
+    pub fn path(&self) -> &'static str {
+        match self {
+            EvidencePath::Anr => "/data/anr",
+            EvidencePath::Tombstones => "/data/tombstones",
+            EvidencePath::Dropbox => "/data/system/dropbox",
+        }
+    }
+}
+
+/// How much of an evidence source this uid can actually get — measured, not assumed.
+///
+/// The ladder exists because the ADR's evidence list is written as though each source is
+/// either available or not, and on a real device it is neither. Measured on a Huawei
+/// BLA-AL00 (`user` build, uid 2000, enforcing, no root): `/data/anr` answered
+/// [`Listable`](Self::Listable) — three trace files by name, every one of them `-rw-------
+/// system system`, so the *index* of a hang is readable and the *trace* is not — while
+/// `/data/tombstones` and `/data/system/dropbox` answered
+/// [`Absent`](Self::Absent): the shell could not even stat them, which is what a SELinux
+/// domain denial looks like from the inside (the kernel will not distinguish "no such file"
+/// from "no such access" when the traverse is refused).
+///
+/// Reporting all three as "unavailable" would lose the one thing an agent can act on: an ANR
+/// happened at 21:37 on 2026-07-28 is a fact worth having even when the bytes are locked,
+/// and it changes what "go look at the traces" should be answered with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EvidenceAccess {
+    /// Not there, or not reachable enough to tell. On a enforcing device the two are the
+    /// same observation, and root is the only way to tell them apart.
+    Absent,
+    /// The directory can be listed but its files cannot be read: names and timestamps are
+    /// evidence, contents are not.
+    Listable,
+    /// At least one file's contents were read.
+    Readable,
+    /// Listable, and empty right now. Says nothing about permissions — a device with no
+    /// crashes yet looks exactly like a device whose crash dir is locked from the inside.
+    Empty,
+    /// The probe did not run, or ran and produced nothing to go on.
+    NotProbed,
+}
+
+impl EvidenceAccess {
+    /// True when contents — not just names — can be collected from this source.
+    pub fn has_contents(&self) -> bool {
+        *self == EvidenceAccess::Readable
+    }
+
+    /// How this source reads in a tool description or a log line.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            EvidenceAccess::Absent => "not reachable",
+            EvidenceAccess::Listable => "names only",
+            EvidenceAccess::Readable => "readable",
+            EvidenceAccess::Empty => "empty",
+            EvidenceAccess::NotProbed => "not probed",
+        }
+    }
+}
+
+/// What the device said about its evidence sources, all of it measured at the uid the
+/// probe ran as.
+///
+/// Two fields because the ADR's evidence list mixes two kinds of claim: "this path holds
+/// the payload" and "this command dumps it". Neither is a capability and neither is a
+/// command presence check — `dumpsys` is in the read vocabulary already, and knowing it
+/// exists says nothing about whether the service an agent wants is running.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceSurface {
+    /// One entry per [`EvidencePath::ALL`], so a source the probe never answered for is
+    /// present with [`EvidenceAccess::NotProbed`] rather than missing. Absent-from-the-map
+    /// and present-but-unknown are the same to a reader that forgets to check, and they are
+    /// not the same fact.
+    pub sources: BTreeMap<EvidencePath, EvidenceAccess>,
+    /// How many services `dumpsys -l` listed. `None` when the probe did not run or the
+    /// answer was not a listing.
+    pub dumpsys_services: Option<usize>,
+}
+
+impl Default for EvidenceSurface {
+    fn default() -> EvidenceSurface {
+        EvidenceSurface {
+            sources: EvidencePath::ALL
+                .iter()
+                .map(|p| (*p, EvidenceAccess::NotProbed))
+                .collect(),
+            dumpsys_services: None,
+        }
+    }
+}
+
+impl EvidenceSurface {
+    /// The access class for one source, `NotProbed` when the map has no answer.
+    pub fn access(&self, path: EvidencePath) -> EvidenceAccess {
+        self.sources
+            .get(&path)
+            .copied()
+            .unwrap_or(EvidenceAccess::NotProbed)
+    }
+
+    /// Sources whose *contents* can be collected, in the fixed path order.
+    ///
+    /// A method rather than a stored field: it is a filter over the map, and storing it
+    /// would create a second answer that can disagree with the first.
+    pub fn readable(&self) -> Vec<EvidencePath> {
+        EvidencePath::ALL
+            .iter()
+            .filter(|p| self.access(**p).has_contents())
+            .copied()
+            .collect()
+    }
+
+    /// True when the probe got no answer about any evidence source.
+    pub fn is_unknown(&self) -> bool {
+        self.sources
+            .values()
+            .all(|a| *a == EvidenceAccess::NotProbed)
+            && self.dumpsys_services.is_none()
+    }
+}
+
+/// Parse the `EVID` lines from [`ProbeCommand::EvidenceSurface`](super::probe::ProbeCommand).
+///
+/// Unparsable lines are skipped rather than guessed at, and a source the device did not
+/// mention comes back [`EvidenceAccess::NotProbed`] — the three states a caller can act on
+/// are "we asked and this is the answer", and "we never got an answer", and they must not
+/// collapse into each other.
+///
+/// The field order is not trusted: a probe script is text, and a future revision that
+/// reorders it should not silently mis-key every value into the wrong field.
+pub fn parse_evidence_surface(stdout: &str) -> Vec<(EvidencePath, EvidenceAccess)> {
+    let mut found: Vec<(EvidencePath, EvidenceAccess)> = Vec::new();
+    for line in stdout.lines() {
+        let Some(rest) = line.strip_prefix("EVID ") else {
+            continue;
+        };
+        let mut words = rest.split_whitespace();
+        let Some(path) = words.next() else { continue };
+        let Some(source) = EvidencePath::ALL.iter().find(|p| p.path() == path) else {
+            continue;
+        };
+        // Key=value in any order; a missing key means we cannot place the source on the
+        // ladder, which is NotProbed rather than a guess at the bottom rung.
+        let pairs: Vec<(&str, &str)> = words.filter_map(|kv| kv.split_once('=')).collect();
+        let get = |key: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == key)
+                .and_then(|(_, v)| v.parse::<i32>().ok())
+        };
+        let (Some(exists), Some(list), Some(count), Some(read)) =
+            (get("exists"), get("list"), get("count"), get("read"))
+        else {
+            continue;
+        };
+        found.push((*source, classify_evidence(exists, list, count, read)));
+    }
+    found
+}
+
+/// The one place the exit-code ladder becomes a fact.
+///
+/// Split out so the ordering is testable without reconstructing probe text.
+pub fn classify_evidence(exists: i32, list: i32, count: i32, read: i32) -> EvidenceAccess {
+    if exists != 0 || list != 0 {
+        EvidenceAccess::Absent
+    } else if count == 0 {
+        EvidenceAccess::Empty
+    } else if read == 0 {
+        EvidenceAccess::Readable
+    } else {
+        EvidenceAccess::Listable
+    }
+}
+
+/// Count the indented service names in a `dumpsys -l` listing.
+///
+/// `None`, not `Some(0)`, when the header is missing or nothing matched: a `dumpsys` that
+/// refused to answer and a device with zero running services are different facts, and the
+/// second one does not exist on Android.
+pub fn parse_dumpsys_inventory(stdout: &str) -> Option<usize> {
+    let mut lines = stdout.lines().peekable();
+    if !lines.peek()?.starts_with("Currently running services") {
+        return None;
+    }
+    let count = lines.filter(|l| l.starts_with("  ")).count();
+    // A header with no services under it is not a device with no services — no Android
+    // device has those — it is a truncated or unexpected listing, which is "no answer".
+    (count > 0).then_some(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_evidence_ladder_separates_names_from_contents() {
+        // Verbatim shape from a Huawei BLA-AL00 (API 29, user build, uid 2000, enforcing,
+        // no root). `/data/anr` lists three traces and refuses every one of their bytes;
+        // the other two sources cannot even be statted, because a refused directory
+        // traverse looks identical to a missing path from outside the domain.
+        let device = "\
+EVID /data/anr exists=0 list=0 count=3 read=1
+EVID /data/tombstones exists=1 list=1 count=0 read=2
+EVID /data/system/dropbox exists=1 list=1 count=0 read=2
+";
+        let parsed = parse_evidence_surface(device);
+        assert_eq!(
+            parsed,
+            vec![
+                (EvidencePath::Anr, EvidenceAccess::Listable),
+                (EvidencePath::Tombstones, EvidenceAccess::Absent),
+                (EvidencePath::Dropbox, EvidenceAccess::Absent),
+            ]
+        );
+        // The distinction the whole type exists for: names are evidence, and a flat
+        // "available / not available" would have thrown the ANR index away.
+        assert!(!parsed[0].1.has_contents());
+        assert!(parsed[0].1 != EvidenceAccess::Absent);
+    }
+
+    #[test]
+    fn root_reads_what_shell_only_lists() {
+        let root = "EVID /data/anr exists=0 list=0 count=3 read=0\n";
+        assert_eq!(
+            parse_evidence_surface(root),
+            vec![(EvidencePath::Anr, EvidenceAccess::Readable)]
+        );
+    }
+
+    #[test]
+    fn an_empty_crash_directory_is_not_a_denial() {
+        // A healthy device and a locked one both answer `count=0`, and collapsing them would
+        // tell an agent "you cannot read traces here" when the truth is "there are none yet".
+        // The difference only shows up once a crash happens, which is exactly when it matters.
+        let empty = "EVID /data/anr exists=0 list=0 count=0 read=2\n";
+        assert_eq!(
+            parse_evidence_surface(empty),
+            vec![(EvidencePath::Anr, EvidenceAccess::Empty)]
+        );
+        assert_eq!(classify_evidence(0, 0, 0, 2), EvidenceAccess::Empty);
+        assert_eq!(classify_evidence(1, 1, 0, 2), EvidenceAccess::Absent);
+    }
+
+    #[test]
+    fn evidence_lines_that_do_not_parse_are_dropped_not_guessed() {
+        // A source the device never mentioned must come back `NotProbed` from the assembler,
+        // not `Absent` — `Absent` is a claim about the filesystem that nothing observed.
+        let junk = "\
+ls: /data/anr: Permission denied
+EVID /data/unknown exists=0 list=0 count=1 read=0
+EVID /data/anr exists=0 list=0
+EVID /data/tombstones exists=abc list=0 count=1 read=0
+EVID /data/system/dropbox exists=0 list=0 count=2 read=1
+";
+        assert_eq!(
+            parse_evidence_surface(junk),
+            vec![(EvidencePath::Dropbox, EvidenceAccess::Listable)],
+            "only the one complete, known line may survive"
+        );
+        assert!(parse_evidence_surface("").is_empty());
+    }
+
+    #[test]
+    fn evidence_fields_are_matched_by_name_not_position() {
+        // The probe script is text and its field order is not a contract. Reading these
+        // positionally would put a `read` rc into the `exists` slot and report a readable
+        // directory as absent.
+        let reordered = "EVID /data/anr read=1 count=3 list=0 exists=0\n";
+        assert_eq!(
+            parse_evidence_surface(reordered),
+            vec![(EvidencePath::Anr, EvidenceAccess::Listable)]
+        );
+    }
+
+    #[test]
+    fn an_unanswered_source_is_present_as_not_probed() {
+        // The map is keyed by the fixed vocabulary, so "we never got an answer" is a value
+        // rather than an absent key. A caller that wrote `.get()` and treated `None` as
+        // "unavailable" would tell an agent the device has no ANR directory when the truth
+        // is that the port never managed to ask.
+        let surface = EvidenceSurface::default();
+        assert_eq!(surface.access(EvidencePath::Anr), EvidenceAccess::NotProbed);
+        assert!(surface.is_unknown());
+        assert!(surface.readable().is_empty());
+
+        let mut surface = EvidenceSurface::default();
+        surface
+            .sources
+            .insert(EvidencePath::Anr, EvidenceAccess::Readable);
+        surface.dumpsys_services = Some(246);
+        assert!(!surface.is_unknown());
+        assert_eq!(surface.readable(), vec![EvidencePath::Anr]);
+        // Order comes from the fixed vocabulary, not from insertion, so a description built
+        // from it is deterministic across devices.
+        surface
+            .sources
+            .insert(EvidencePath::Tombstones, EvidenceAccess::Readable);
+        assert_eq!(
+            surface.readable(),
+            vec![EvidencePath::Anr, EvidencePath::Tombstones]
+        );
+    }
+
+    #[test]
+    fn dumpsys_inventory_requires_its_header() {
+        let device = "Currently running services:\n  SurfaceFlinger\n  activity\n  window\n";
+        assert_eq!(parse_dumpsys_inventory(device), Some(3));
+        // No header: `dumpsys` refused, printed a usage line, or is not on this device.
+        assert_eq!(parse_dumpsys_inventory(""), None);
+        assert_eq!(parse_dumpsys_inventory("Can't find service: -l\n"), None);
+        // Header with nothing under it is not "zero services" — no Android device has those,
+        // so the honest answer is that the listing is not trustworthy.
+        assert_eq!(
+            parse_dumpsys_inventory("Currently running services:\n"),
+            None
+        );
+    }
 
     #[test]
     fn uid_mapping_covers_the_three_privilege_levels() {

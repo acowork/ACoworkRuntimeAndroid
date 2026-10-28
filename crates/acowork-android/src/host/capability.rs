@@ -409,6 +409,7 @@ mod tests {
                     own_package: false,
                 },
             ],
+            evidence: crate::host::facts::EvidenceSurface::default(),
             su: SuProbe {
                 uid: Some(0),
                 context: Some("u:r:magisk:s0".to_string()),

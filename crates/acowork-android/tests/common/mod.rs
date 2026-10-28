@@ -40,6 +40,8 @@ pub fn probe_of(pairs: &[(ProbeCommand, &str)]) -> ProbeOutput {
             ProbeCommand::PropVerityMode => out.prop_veritymode = Some(value),
             ProbeCommand::PropSdk => out.prop_sdk = Some(value),
             ProbeCommand::PropAbi => out.prop_abi = Some(value),
+            ProbeCommand::EvidenceSurface => out.evidence_surface = Some(value),
+            ProbeCommand::DumpsysInventory => out.dumpsys_inventory = Some(value),
         }
     }
     out

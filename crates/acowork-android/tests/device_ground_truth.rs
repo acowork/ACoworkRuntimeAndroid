@@ -360,6 +360,65 @@ fn the_summary_reported_upward_names_the_tier_the_device_actually_is() {
     assert!(HostDescription::is_r3_conformant(&profile));
 }
 
+/// What a shell uid can actually collect for `getEvidence` on a `user` build.
+///
+/// ADR-AND-001 §4.6 item 6 lists these sources as though each were simply available. On the
+/// device that started this file, none of them is: the ADR's own evidence list is a
+/// statement about the platform's *intent*, and the port needs the measured counterweight
+/// before it writes a tool description saying "ANR traces are available here".
+///
+/// The access classes are permission facts and do not drift; the counts do (a device gains
+/// and loses trace files as it crashes), so only the *shape* is pinned here.
+#[test]
+fn no_evidence_source_is_readable_without_root() {
+    let probe = ground_truth();
+    let profile = HostProfile::assemble(&probe, OWN_PACKAGE);
+    use acowork_android::host::facts::{EvidenceAccess, EvidencePath};
+
+    // /data/anr: the shell can stat it, can list it, and cannot open a single file in it —
+    // every trace is `-rw------- system system`. The index of an ANR is collectable; the
+    // trace is not.
+    assert_eq!(
+        profile.evidence.access(EvidencePath::Anr),
+        EvidenceAccess::Listable,
+        "the trace *files* are listed but none is openable at uid 2000"
+    );
+
+    // /data/tombstones and /data/system/dropbox: not even stat-able. A `user` build's
+    // SELinux domain denies the traverse, and the kernel will not tell "no such file" from
+    // "no such access" from inside that denial — which is exactly why `Absent` is one
+    // variant rather than two.
+    for path in [EvidencePath::Tombstones, EvidencePath::Dropbox] {
+        assert_eq!(
+            profile.evidence.access(path),
+            EvidenceAccess::Absent,
+            "{} is unreachable at uid 2000 on this device",
+            path.path()
+        );
+    }
+
+    // The consequence the ADR's evidence row has to be read against: with no root, the
+    // platform collects *no* file contents from any of these paths.
+    assert!(
+        profile.evidence.readable().is_empty(),
+        "a shell uid read something the ADR assumes only root can read: {:?}",
+        profile.evidence.readable()
+    );
+
+    // `dumpsys -l` answers with the service inventory. The count is device state, so what
+    // is pinned is that a listing came back at all: `dumpsys <service>` is the highest
+    // volume read surface on Android, and a profile that could not enumerate it would be
+    // describing a read surface it had not looked at.
+    let services = profile
+        .evidence
+        .dumpsys_services
+        .expect("dumpsys -l must have answered on this device");
+    assert!(
+        services > 100,
+        "a real Android device lists hundreds of services, got {services}"
+    );
+}
+
 #[test]
 fn the_probe_budget_was_met_on_real_hardware() {
     // android-host-probe.md §3 bounds the whole probe. A real device over a real adb link is

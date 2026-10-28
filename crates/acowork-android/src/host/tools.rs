@@ -103,10 +103,10 @@ fn dialect_line(dialect: Option<ShellDialect>) -> String {
 
 /// Build the description for one tool.
 ///
-/// Five lines, in this order: what the tool binds to; which dialect that is; which §4.4
-/// commands exist; where writing is possible; and the trust boundary the model is inside.
-/// Each is stated from a measured field, and each says "not measured" rather than inheriting
-/// a default.
+/// Six lines, in this order: what the tool binds to; which dialect that is; which §4.4
+/// commands exist; where writing is possible; what can be collected as evidence; and the
+/// trust boundary the model is inside. Each is stated from a measured field, and each says
+/// "not measured" rather than inheriting a default.
 fn describe(
     profile: &HostProfile,
     name: &'static str,
@@ -120,6 +120,7 @@ fn describe(
     blocks.push(commands_block(profile));
     blocks.push(writes_block(profile));
     blocks.push(writable_block(profile));
+    blocks.push(evidence_block(profile));
     blocks.push(boundary_block(profile));
     blocks.join("\n")
 }
@@ -185,6 +186,38 @@ fn writable_block(profile: &HostProfile) -> String {
     format!("Writable locations: {}.", writable.join(", "))
 }
 
+/// What `getEvidence` can actually collect here, stated per source.
+///
+/// The ADR's evidence list (§4.6 item 6) reads as six available sources. On a `user` build
+/// they are six permission questions, and the answers differ per path: the BLA-AL00 this
+/// was verified against lists three filenames under `/data/anr` and refuses to open every
+/// one of them, while `/data/tombstones` cannot even be stat'd. So each source is named
+/// with the access class that was measured, and a source the probe never answered for says
+/// so rather than dropping off the list — an agent that reads a silent omission as
+/// "unavailable" will decline to ask for root on a device where the answer was never asked.
+fn evidence_block(profile: &HostProfile) -> String {
+    use crate::host::facts::EvidencePath;
+    if profile.evidence.is_unknown() {
+        return "Evidence: no evidence source was probed, so availability is unknown.".to_string();
+    }
+    let mut parts = Vec::new();
+    for path in EvidencePath::ALL {
+        let access = profile.evidence.access(path);
+        if access == crate::host::facts::EvidenceAccess::NotProbed {
+            parts.push(format!("{} not probed", path.path()));
+        } else {
+            parts.push(format!("{} {}", path.path(), access.describe()));
+        }
+    }
+    let inventory = match profile.evidence.dumpsys_services {
+        Some(count) => format!(
+            " `dumpsys` has {count} running services to dump from (each needs its own `android:shell:read` approval)."
+        ),
+        None => " The `dumpsys` service inventory was not answered.".to_string(),
+    };
+    format!("Evidence: {}.{}", parts.join("; "), inventory)
+}
+
 fn boundary_block(profile: &HostProfile) -> String {
     // Stated from the enum, not from `Privilege::uid()`: that returns a placeholder for app
     // uids (the real one is `u0_aNNN`, which the probe does not measure), and a description
@@ -243,6 +276,7 @@ mod tests {
                     own_package: false,
                 },
             ],
+            evidence: crate::host::facts::EvidenceSurface::default(),
             su: SuProbe {
                 uid: None,
                 context: None,
@@ -406,6 +440,93 @@ mod tests {
             !text.contains("/system,"),
             "/system was not writable and must not appear in the list: {text}"
         );
+    }
+
+    #[test]
+    fn evidence_is_stated_per_source_with_the_access_that_was_measured() {
+        let mut p = system_shell();
+        use crate::host::facts::{EvidenceAccess, EvidencePath};
+        p.evidence
+            .sources
+            .insert(EvidencePath::Anr, EvidenceAccess::Listable);
+        p.evidence
+            .sources
+            .insert(EvidencePath::Tombstones, EvidenceAccess::Absent);
+        p.evidence
+            .sources
+            .insert(EvidencePath::Dropbox, EvidenceAccess::Readable);
+        p.evidence.dumpsys_services = Some(246);
+        let text = shell_tools(&p)[0].description.clone();
+        assert!(text.contains("/data/anr names only"), "{text}");
+        assert!(text.contains("/data/tombstones not reachable"), "{text}");
+        assert!(text.contains("/data/system/dropbox readable"), "{text}");
+        assert!(text.contains("246 running services"), "{text}");
+    }
+
+    #[test]
+    fn a_listable_evidence_source_is_never_described_as_available() {
+        // The failure this guards against is the specific one the BLA-AL00 measured: names
+        // without contents. A description that called that "available" would send an agent
+        // off to read traces it cannot open, and a description that called it "not
+        // reachable" would hide the one fact it could have used.
+        let mut p = system_shell();
+        p.evidence.sources.insert(
+            crate::host::facts::EvidencePath::Anr,
+            crate::host::facts::EvidenceAccess::Listable,
+        );
+        let text = shell_tools(&p)[0].description.clone();
+        assert!(text.contains("names only"), "{text}");
+        for claim in ["available", "readable"] {
+            let anr_line = text
+                .lines()
+                .find(|l| l.contains("/data/anr"))
+                .unwrap_or_default();
+            assert!(
+                !anr_line.contains(claim),
+                "{claim} claimed for a locked source"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unprobed_evidence_source_says_so_instead_of_disappearing() {
+        // Only one of three sources was answered. The other two must still be named, because
+        // a list that silently shortens reads as "this device has no dropbox".
+        let mut p = system_shell();
+        p.evidence.sources.insert(
+            crate::host::facts::EvidencePath::Anr,
+            crate::host::facts::EvidenceAccess::Empty,
+        );
+        let text = shell_tools(&p)[0].description.clone();
+        assert!(text.contains("/data/anr empty"), "{text}");
+        assert!(text.contains("/data/tombstones not probed"), "{text}");
+        assert!(text.contains("/data/system/dropbox not probed"), "{text}");
+    }
+
+    #[test]
+    fn an_unanswered_dumpsys_inventory_is_not_reported_as_zero_services() {
+        // `Some(0)` is not a fact any Android device produces; `None` is "we did not get an
+        // answer". Printing "0 services" would be the same fabrication in the other
+        // direction.
+        let mut p = system_shell();
+        p.evidence.sources.insert(
+            crate::host::facts::EvidencePath::Anr,
+            crate::host::facts::EvidenceAccess::Empty,
+        );
+        p.evidence.dumpsys_services = None;
+        let text = shell_tools(&p)[0].description.clone();
+        assert!(
+            text.contains("service inventory was not answered"),
+            "{text}"
+        );
+        assert!(!text.contains("0 running services"), "{text}");
+    }
+
+    #[test]
+    fn a_device_with_no_evidence_probe_says_availability_is_unknown() {
+        let text = shell_tools(&system_shell())[0].description.clone();
+        assert!(text.contains("no evidence source was probed"), "{text}");
+        assert!(!text.contains("/data/anr"), "{text}");
     }
 
     #[test]

@@ -65,6 +65,14 @@ pub const SPOT_CHECK_APPLETS: [&str; 10] = [
     "ps",
 ];
 
+/// The evidence locations ADR-AND-001 §4.6 item 6 names as paths, probed by
+/// [`ProbeCommand::EvidenceSurface`].
+///
+/// Spelled out here rather than derived from [`EvidencePath`](super::facts::EvidencePath)
+/// because the probe script is a shell string that needs the words; a test pins the two
+/// lists against each other, so they cannot drift.
+pub const EVIDENCE_PATHS: [&str; 3] = ["/data/anr", "/data/tombstones", "/data/system/dropbox"];
+
 /// One probe command, identified so results can be routed without stringly-typed
 /// keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -119,6 +127,28 @@ pub enum ProbeCommand {
     PropSdk,
     /// Item 11 — `getprop ro.product.cpu.abi`.
     PropAbi,
+    /// Item 13 — what this uid can actually collect from the evidence locations
+    /// ADR-AND-001 §4.6 item 6 names.
+    ///
+    /// The ADR lists `/data/anr`, `/data/tombstones` and `/data/system/dropbox` as the
+    /// debugging payload and calls them root-tier value. Measured on a `user` build at uid
+    /// 2000 they are not one thing: the ANR directory lists its traces by name and refuses
+    /// every byte of them, while the other two cannot even be statted. A yes/no probe would
+    /// have reported all three as unavailable and thrown away the index of a hang, which is
+    /// the part an agent can act on.
+    ///
+    /// Batched into one invocation for the same reason as [`Self::SpotChecks`]: three paths
+    /// at four commands each is twelve round trips on a battery.
+    EvidenceSurface,
+    /// Item 13b — how many services `dumpsys` will dump here.
+    ///
+    /// `dumpsys <service>` is the single highest-volume read surface on Android, and the ADR
+    /// treats it as one command. It is not one: it is a dispatcher over a per-device list.
+    /// The readiness assessment's own open item says exactly this — `dumpsys -l` had been
+    /// checked, no individual service had. The inventory is the honest scope: the port can
+    /// say how many services this device exposes, and cannot promise that any one of them
+    /// will not answer with a permission error.
+    DumpsysInventory,
 }
 
 impl ProbeCommand {
@@ -190,6 +220,18 @@ impl ProbeCommand {
             ProbeCommand::PropVerityMode => Cow::Borrowed("getprop ro.boot.veritymode"),
             ProbeCommand::PropSdk => Cow::Borrowed("getprop ro.build.version.sdk"),
             ProbeCommand::PropAbi => Cow::Borrowed("getprop ro.product.cpu.abi"),
+            // Four exit codes per path, and none of them depends on the wording of an error:
+            // `ls` on a directory whose traverse is denied prints a message that varies by
+            // toybox build, while its exit status does not. The same lesson `parse_su_probe`
+            // had to learn the hard way, applied before the fact instead of after.
+            ProbeCommand::EvidenceSurface => Cow::Owned(format!(
+                "for p in {} ; do ls -d \"$p\" >/dev/null 2>&1 ; x=$? ; ls \"$p\" >/dev/null 2>&1 ; \
+                 l=$? ; n=$(ls \"$p\" 2>/dev/null | wc -l) ; r=2 ; f=$(ls \"$p\" 2>/dev/null | head -n 1) ; \
+                 if [ -n \"$f\" ] ; then head -n 1 \"$p/$f\" >/dev/null 2>&1 ; r=$? ; fi ; \
+                 echo \"EVID $p exists=$x list=$l count=$n read=$r\" ; done",
+                EVIDENCE_PATHS.join(" ")
+            )),
+            ProbeCommand::DumpsysInventory => Cow::Borrowed("dumpsys -l 2>/dev/null"),
         }
     }
 
@@ -239,6 +281,8 @@ pub fn all_commands() -> Vec<ProbeCommand> {
         ProbeCommand::PropVerityMode,
         ProbeCommand::PropSdk,
         ProbeCommand::PropAbi,
+        ProbeCommand::EvidenceSurface,
+        ProbeCommand::DumpsysInventory,
     ]
 }
 
@@ -351,6 +395,11 @@ pub struct ProbeOutput {
     pub prop_sdk: Option<CommandOutput>,
     /// Item 11 — `ro.product.cpu.abi`.
     pub prop_abi: Option<CommandOutput>,
+    /// Item 13 — the `EVID` lines describing what this uid can collect from each evidence
+    /// location: listed by name, readable, empty, or unreachable.
+    pub evidence_surface: Option<CommandOutput>,
+    /// Item 13b — `dumpsys -l`, the service inventory.
+    pub dumpsys_inventory: Option<CommandOutput>,
     /// `$PREFIX`, when set and reachable — the Termux marker.
     pub termux_prefix: Option<String>,
     /// Item 12. Produced by the runner rather than parsed from text, because
@@ -377,6 +426,8 @@ impl ProbeOutput {
             && self.busybox_list.is_none()
             && self.mount_table.is_none()
             && self.prop_build_type.is_none()
+            && self.evidence_surface.is_none()
+            && self.dumpsys_inventory.is_none()
     }
 }
 
@@ -547,6 +598,8 @@ fn route(output: &mut ProbeOutput, command: ProbeCommand, result: Option<Command
         ProbeCommand::PropVerityMode => output.prop_veritymode = result,
         ProbeCommand::PropSdk => output.prop_sdk = result,
         ProbeCommand::PropAbi => output.prop_abi = result,
+        ProbeCommand::EvidenceSurface => output.evidence_surface = result,
+        ProbeCommand::DumpsysInventory => output.dumpsys_inventory = result,
     }
 }
 
@@ -606,6 +659,47 @@ mod tests {
         assert!(SPOT_CHECK_APPLETS.len() <= 10);
         assert!(SPOT_CHECK_APPLETS.contains(&"logcat"));
         assert!(SPOT_CHECK_APPLETS.contains(&"screencap"));
+    }
+
+    #[test]
+    fn the_evidence_probe_walks_every_source_the_adr_names_in_one_invocation() {
+        // One spawn, three sources, four exit codes each. The batching is the same argument
+        // as the spot checks: twelve round trips at startup on a phone battery, for a
+        // question a single `for` loop answers.
+        let line = ProbeCommand::EvidenceSurface.command_line();
+        assert_eq!(line.matches("for p in ").count(), 1);
+        for path in EVIDENCE_PATHS {
+            assert!(line.contains(path), "{path} is not probed: {line}");
+        }
+        assert_eq!(
+            line.matches("EVID $p exists=").count(),
+            1,
+            "each source must be reported once, in one echo"
+        );
+        // The classification reads exit codes only. If the script ever starts depending on
+        // the text of an `ls` error, this probe becomes device-version dependent.
+        assert!(
+            !line.contains("Permission") && !line.contains("denied"),
+            "the evidence probe must not classify on error wording: {line}"
+        );
+    }
+
+    #[test]
+    fn the_evidence_path_list_and_the_typed_source_list_agree() {
+        // The probe script asks with strings and the parser answers with an enum. Those two
+        // drift independently, and when they do, a source silently stops being reported —
+        // the profile says `NotProbed` for a directory the device was in fact asked about.
+        use crate::host::facts::EvidencePath;
+        let typed: Vec<&str> = EvidencePath::ALL.iter().map(|p| p.path()).collect();
+        assert_eq!(typed, EVIDENCE_PATHS.to_vec());
+    }
+
+    #[test]
+    fn the_dumpsys_inventory_probe_asks_for_the_list_not_a_dump() {
+        // `dumpsys` with no service argument dumps *everything*, which on this device is
+        // megabytes and seconds. The inventory probe must be the `-l` form only.
+        let line = ProbeCommand::DumpsysInventory.command_line();
+        assert_eq!(line, "dumpsys -l 2>/dev/null");
     }
 
     #[test]

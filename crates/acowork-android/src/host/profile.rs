@@ -40,8 +40,8 @@ use crate::host::capability::{
     Capability, PLATFORM, android_vocabulary, derive_claims, explain_absence,
 };
 use crate::host::facts::{
-    AppletSet, DeviceFacts, FsRoot, Privilege, SelinuxDomain, SelinuxState, ShellDialect, SuProbe,
-    normalize_context,
+    AppletSet, DeviceFacts, EvidenceSurface, FsRoot, Privilege, SelinuxDomain, SelinuxState,
+    ShellDialect, SuProbe, normalize_context,
 };
 use crate::host::probe::{CommandOutput, ProbeOutput};
 
@@ -231,6 +231,16 @@ pub struct HostProfile {
     pub applets: AppletSet,
     /// Reachable filesystem roots with measured writability.
     pub fs_roots: Vec<FsRoot>,
+    /// What this uid can actually collect from the ADR's evidence locations (probe item 13),
+    /// plus the size of the `dumpsys` service inventory (item 13b).
+    ///
+    /// Carried because ADR-AND-001 §4.6 item 6 commits the platform to collecting these
+    /// sources, and because the commitment is written as though each one is simply
+    /// available. On the device this was verified against, `/data/anr` lists three trace
+    /// filenames and refuses to open every one of them. A tool description that said
+    /// "ANR traces are available" would be a lie, and a refusal to look at them would be
+    /// worse.
+    pub evidence: EvidenceSurface,
     /// Result of the `su` probe.
     pub su: SuProbe,
     /// Whether `/system` survived an actual remount probe.
@@ -388,6 +398,22 @@ impl HostProfile {
             .is_some_and(|out| out.exit_code == Some(0));
         let fs_roots = probe.fs_roots.clone();
 
+        // ── Items 13 + 13b: evidence surface ───────────────────────────────
+        // Built from the map rather than from a filtered list, so a source the probe never
+        // answered for arrives as `NotProbed` and not as "absent from the profile".
+        let mut evidence = EvidenceSurface::default();
+        for (path, access) in probe
+            .evidence_surface
+            .iter()
+            .flat_map(|out| crate::host::facts::parse_evidence_surface(&out.stdout))
+        {
+            evidence.sources.insert(path, access);
+        }
+        evidence.dumpsys_services = probe
+            .dumpsys_inventory
+            .as_ref()
+            .and_then(|out| crate::host::facts::parse_dumpsys_inventory(&out.stdout));
+
         // ── Items 8-11: device facts ───────────────────────────────────────
         let device = DeviceFacts {
             build_type: probe
@@ -468,6 +494,7 @@ impl HostProfile {
             dialects,
             applets,
             fs_roots,
+            evidence,
             su,
             system_remountable,
             caps: empty_table(),
@@ -708,6 +735,8 @@ mod tests {
             prop_sdk: Some(out("34\n")),
             prop_abi: Some(out("arm64-v8a\n")),
             prop_veritymode: Some(out("disabled\n")),
+            evidence_surface: None,
+            dumpsys_inventory: None,
             termux_prefix: None,
             fs_roots: vec![
                 FsRoot {
@@ -802,6 +831,8 @@ mod tests {
             su_path: None,
             bash_path: Some(out("/data/data/com.termux/files/usr/bin/bash\n")),
             system_sh_version: Some(out("KSH=@(#)MIRBSD KSH R57 2019-03-01 Android\nBASH=\n")),
+            evidence_surface: None,
+            dumpsys_inventory: None,
             termux_prefix: Some("/data/data/com.termux/files/usr".to_string()),
             prop_veritymode: Some(out("enforcing\n")),
             system_remount: None,
@@ -871,6 +902,8 @@ mod tests {
             su: None,
             su_path: None,
             bash_path: None,
+            evidence_surface: None,
+            dumpsys_inventory: None,
             termux_prefix: None,
             system_sh_version: Some(out("KSH=@(#)MIRBSD KSH R57 2019-03-01 Android\nBASH=\n")),
             prop_veritymode: Some(out("enforcing\n")),
@@ -920,6 +953,8 @@ mod tests {
             su_path: None,
             bash_path: Some(out("")),
             system_sh_version: None,
+            evidence_surface: None,
+            dumpsys_inventory: None,
             termux_prefix: None,
             fs_roots: vec![FsRoot {
                 path: "/data/data/com.example.agent".to_string(),

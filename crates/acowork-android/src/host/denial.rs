@@ -547,6 +547,7 @@ scontext=u:r:shell:s0 tcontext=u:object_r:shell_data_file:s0 tclass=file permiss
                     own_package: true,
                 },
             ],
+            evidence: crate::host::facts::EvidenceSurface::default(),
             su: SuProbe {
                 uid: Some(0),
                 context: Some("u:r:magisk:s0".to_string()),
