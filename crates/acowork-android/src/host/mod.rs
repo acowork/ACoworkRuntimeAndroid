@@ -76,7 +76,7 @@ pub use facts::{
 };
 pub use probe::{
     CommandOutput, PROBE_ITEM_TIMEOUT, PROBE_TOTAL_BUDGET, ProbeCommand, ProbeError, ProbeOutput,
-    ProbeRunner, SPOT_CHECK_APPLETS, all_commands, run_probe,
+    ProbeRunner, SPOT_CHECK_APPLETS, all_commands, parse_spot_checks, run_probe,
 };
 pub use profile::{HostCapabilitySummary, HostProfile, HostProfileName, ShellPaths};
 pub use script::{

@@ -27,6 +27,9 @@ pub fn probe_of(pairs: &[(ProbeCommand, &str)]) -> ProbeOutput {
             ProbeCommand::BashPath => out.bash_path = Some(value),
             ProbeCommand::SystemShVersion => out.system_sh_version = Some(value),
             ProbeCommand::ToyboxList => out.toybox_list = Some(value),
+            ProbeCommand::SpotChecks => {
+                out.applet_spot_checks = acowork_android::host::parse_spot_checks(&value.stdout);
+            }
             ProbeCommand::BusyboxList => out.busybox_list = Some(value),
             ProbeCommand::MountTable => out.mount_table = Some(value),
             ProbeCommand::SystemRemount => out.system_remount = Some(value),
@@ -51,8 +54,13 @@ pub fn probe_of(pairs: &[(ProbeCommand, &str)]) -> ProbeOutput {
 /// absent" rule.
 pub const SYSTEM_SH_VERSION: &str = "KSH=@(#)MIRBSD KSH R57 2019-03-01 Android\nBASH=\n";
 
-pub const TOYBOX_LIST: &str =
-    "basename\ncat\nchmod\ndf\ndumpsys\ngetprop\nlogcat\nmount\nps\nsetprop\ntoybox\n";
+/// Probe item 6a's answer, restricted to names that are genuinely toybox applets.
+///
+/// `logcat`, `dumpsys` and `getprop` are deliberately **not** here. On the measured device
+/// they are standalone `/system/bin` binaries and appear in none of the 194 listed applets;
+/// an earlier version of this fixture listed them and thereby described a device that does
+/// not exist. Their presence comes from item 6c's spot-checks instead.
+pub const TOYBOX_LIST: &str = "basename\ncat\nchmod\ndf\nmount\nps\nsetprop\n";
 
 // ── Baseline 1: user build + Termux ─────────────────────────────────────────
 

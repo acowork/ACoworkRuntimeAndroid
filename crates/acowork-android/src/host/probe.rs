@@ -17,6 +17,7 @@
 //! probe runs at startup on a phone, and a startup that hangs is indistinguishable
 //! from a crash to the user.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -30,12 +31,15 @@ pub const PROBE_ITEM_TIMEOUT: Duration = Duration::from_millis(500);
 /// Whole-probe budget. Exceeding it is a bug, not a degradation.
 pub const PROBE_TOTAL_BUDGET: Duration = Duration::from_secs(2);
 
-/// The high-value commands spot-checked with `command -v`.
+/// The high-value commands spot-checked with `command -v` (item 6c).
 ///
-/// android-host-probe.md §7.5 item 1 caps this at ten, because each check is a
-/// process spawn and hundreds of spawns at startup is not acceptable on a mobile
-/// device. These ten are the ones the Android debugging toolset
-/// (ADR-AND-001 §4.6 item 6) and the write tier actually invoke.
+/// android-host-probe.md §7.5 item 1 caps this at ten. The cap was originally justified by
+/// spawn cost — one process per name — and item 6c now runs them all in a single shell
+/// invocation, so the budget is no longer what the number protects. It still earns its
+/// place for a different reason: every name here is a claim the port makes about devices
+/// in general, so the list has to stay short enough that each entry is defensible. These ten
+/// are the ones the Android debugging toolset (ADR-AND-001 §4.6 item 6) and the write tier
+/// actually invoke.
 pub const SPOT_CHECK_APPLETS: [&str; 10] = [
     "logcat",
     "dumpsys",
@@ -71,6 +75,20 @@ pub enum ProbeCommand {
     ToyboxList,
     /// Item 6b — `busybox --list`.
     BusyboxList,
+    /// Item 6c — `command -v` spot-check over [`SPOT_CHECK_APPLETS`].
+    ///
+    /// The bulk listings in 6a/6b answer "which applets does this toybox/busybox build
+    /// provide". They do **not** answer "which commands can this shell run": on a real
+    /// device the high-value debug commands are standalone binaries that no applet listing
+    /// mentions — measured on a Huawei BLA-AL00, `toybox` listed 194 applets and `logcat`,
+    /// `getprop`, `dumpsys`, `am`, `pm`, `input` and `screencap` were none of them, while
+    /// all of them exist under `/system/bin`. A profile assembled from the listing alone
+    /// therefore reports the whole read surface of ADR-AND-001 §4.4 as absent on a device
+    /// that has it.
+    ///
+    /// This is android-host-probe.md §7.5 item 1's second half: take the bulk list once,
+    /// then `command -v` a capped set of high-value names.
+    SpotChecks,
     /// Item 7a — the mount table.
     MountTable,
     /// Item 7b — the `/system` remount attempt.
@@ -104,12 +122,12 @@ impl ProbeCommand {
     /// - `getenforce` and the applet listings are run **without** a shell wrapper
     ///   where possible, so a missing applet produces a spawn error rather than a
     ///   shell error message that a parser might mistake for data.
-    pub fn command_line(&self) -> &'static str {
+    pub fn command_line(&self) -> Cow<'static, str> {
         match self {
-            ProbeCommand::Id => "id -u",
-            ProbeCommand::GetEnforce => "getenforce",
-            ProbeCommand::AttrCurrent => "cat /proc/self/attr/current",
-            ProbeCommand::Su => "su -c 'id -u; cat /proc/self/attr/current'",
+            ProbeCommand::Id => Cow::Borrowed("id -u"),
+            ProbeCommand::GetEnforce => Cow::Borrowed("getenforce"),
+            ProbeCommand::AttrCurrent => Cow::Borrowed("cat /proc/self/attr/current"),
+            ProbeCommand::Su => Cow::Borrowed("su -c 'id -u; cat /proc/self/attr/current'"),
             // Item 4a. `command -v` rather than a `stat` over a candidate list, for two
             // reasons. A helper can live anywhere on `PATH` — the device measured here has
             // `/sbin`, `/system/xbin`, `/vendor/bin`, `/vendor/xbin` and three apex dirs on
@@ -121,8 +139,8 @@ impl ProbeCommand {
             // Verified on that device: `command -v cat` echoes `/system/bin/cat` and exits 0,
             // `command -v su` prints nothing and exits 1, so exit code plus non-empty stdout
             // is a sound presence test — the same shape item 5a already relies on.
-            ProbeCommand::SuPath => "command -v su",
-            ProbeCommand::BashPath => "command -v bash",
+            ProbeCommand::SuPath => Cow::Borrowed("command -v su"),
+            ProbeCommand::BashPath => Cow::Borrowed("command -v bash"),
             // NOT `/system/bin/sh --version`. Android's mksh is built without the version
             // option, and on a real device the attempt is an error rather than a banner —
             // measured on a Huawei BLA-AL00 (API 29): `/system/bin/sh: --: unknown option`,
@@ -132,20 +150,34 @@ impl ProbeCommand {
             //
             // Both dialects are echoed because exactly one will be non-empty, and an empty
             // answer is itself the evidence that the shell is neither mksh nor bash.
-            ProbeCommand::SystemShVersion => {
-                "/system/bin/sh -c 'echo \"KSH=$KSH_VERSION\"; echo \"BASH=$BASH_VERSION\"'"
-            }
-            ProbeCommand::ToyboxList => "toybox",
-            ProbeCommand::BusyboxList => "busybox --list",
-            ProbeCommand::MountTable => "cat /proc/mounts",
-            ProbeCommand::SystemRemount => "mount -o remount,rw /system",
-            ProbeCommand::PropBuildType => "getprop ro.build.type",
-            ProbeCommand::PropDebuggable => "getprop ro.debuggable",
-            ProbeCommand::PropSecure => "getprop ro.secure",
-            ProbeCommand::PropAdbSecure => "getprop ro.adb.secure",
-            ProbeCommand::PropVerityMode => "getprop ro.boot.veritymode",
-            ProbeCommand::PropSdk => "getprop ro.build.version.sdk",
-            ProbeCommand::PropAbi => "getprop ro.product.cpu.abi",
+            ProbeCommand::SystemShVersion => Cow::Borrowed(
+                "/system/bin/sh -c 'echo \"KSH=$KSH_VERSION\"; echo \"BASH=$BASH_VERSION\"'",
+            ),
+            ProbeCommand::ToyboxList => Cow::Borrowed("toybox"),
+            ProbeCommand::BusyboxList => Cow::Borrowed("busybox --list"),
+            // Item 6c. One spawn for the whole set, because the cost this probe is designed
+            // around is process creation (android-host-probe.md §7.5 item 1: probing every
+            // applet individually is "上百次子进程派生", unacceptable on a battery), and
+            // over the adb harness each spawn is also a round trip. `command -v` is a shell
+            // builtin, so the loop itself costs nothing.
+            //
+            // The marker prefix is not decoration: a login shell on the device can print
+            // banner prose, and a parser that takes any line as data would read the banner
+            // as a resolved path.
+            ProbeCommand::SpotChecks => Cow::Owned(format!(
+                "for n in {} ; do p=$(command -v \"$n\") ; rc=$? ; echo \"SPOT $n rc=$rc path=$p\" \
+                 ; done",
+                SPOT_CHECK_APPLETS.join(" ")
+            )),
+            ProbeCommand::MountTable => Cow::Borrowed("cat /proc/mounts"),
+            ProbeCommand::SystemRemount => Cow::Borrowed("mount -o remount,rw /system"),
+            ProbeCommand::PropBuildType => Cow::Borrowed("getprop ro.build.type"),
+            ProbeCommand::PropDebuggable => Cow::Borrowed("getprop ro.debuggable"),
+            ProbeCommand::PropSecure => Cow::Borrowed("getprop ro.secure"),
+            ProbeCommand::PropAdbSecure => Cow::Borrowed("getprop ro.adb.secure"),
+            ProbeCommand::PropVerityMode => Cow::Borrowed("getprop ro.boot.veritymode"),
+            ProbeCommand::PropSdk => Cow::Borrowed("getprop ro.build.version.sdk"),
+            ProbeCommand::PropAbi => Cow::Borrowed("getprop ro.product.cpu.abi"),
         }
     }
 
@@ -185,6 +217,7 @@ pub fn all_commands() -> Vec<ProbeCommand> {
         ProbeCommand::SystemShVersion,
         ProbeCommand::ToyboxList,
         ProbeCommand::BusyboxList,
+        ProbeCommand::SpotChecks,
         ProbeCommand::MountTable,
         ProbeCommand::SystemRemount,
         ProbeCommand::PropBuildType,
@@ -427,6 +460,51 @@ pub async fn run_probe(
     output
 }
 
+/// Parse item 6c's `SPOT <name> rc=<n> path=<p>` lines into per-command results.
+///
+/// Three rules keep this from inventing facts:
+///
+/// - Only names in [`SPOT_CHECK_APPLETS`] are accepted. Banner prose, a shell warning, or a
+///   device that echoes the loop back would otherwise become evidence about a command nobody
+///   asked about.
+/// - A name that never appears gets **no** entry. Missing from the output means the answer
+///   was lost — truncated buffer, a shell that broke out of the loop — which is *unknown*,
+///   not *absent*. Collapsing those two is how a device with `logcat` ends up reported as a
+///   device without it.
+/// - The recorded exit code is the one the device reported for that `command -v`, not a
+///   synthesised one, so [`CommandOutput::succeeded`] means the same thing here as it does
+///   for every other probe item.
+pub fn parse_spot_checks(stdout: &str) -> BTreeMap<String, CommandOutput> {
+    let mut checks = BTreeMap::new();
+    for line in stdout.lines() {
+        let Some(body) = line.trim().strip_prefix("SPOT ") else {
+            continue;
+        };
+        let Some((name, rest)) = body.split_once(" rc=") else {
+            continue;
+        };
+        if !SPOT_CHECK_APPLETS.contains(&name) {
+            continue;
+        }
+        let Some((rc_text, path)) = rest.split_once(" path=") else {
+            continue;
+        };
+        let Ok(exit_code) = rc_text.trim().parse::<i32>() else {
+            // Shaped like our own output but carrying something that is not an exit status.
+            // Record "no evidence" rather than choosing which way to guess.
+            checks.insert(name.to_string(), CommandOutput::unavailable(false));
+            continue;
+        };
+        let output = if exit_code == 0 {
+            CommandOutput::ok(path.trim())
+        } else {
+            CommandOutput::failed(exit_code, "")
+        };
+        checks.insert(name.to_string(), output);
+    }
+    checks
+}
+
 /// Place one command's output into the right `ProbeOutput` field.
 fn route(output: &mut ProbeOutput, command: ProbeCommand, result: Option<CommandOutput>) {
     match command {
@@ -439,6 +517,15 @@ fn route(output: &mut ProbeOutput, command: ProbeCommand, result: Option<Command
         ProbeCommand::SystemShVersion => output.system_sh_version = result,
         ProbeCommand::ToyboxList => output.toybox_list = result,
         ProbeCommand::BusyboxList => output.busybox_list = result,
+        ProbeCommand::SpotChecks => {
+            output.applet_spot_checks = match result {
+                Some(out) if out.succeeded() => parse_spot_checks(&out.stdout),
+                // No shell, a failed loop, a timeout: no evidence either way. Leaving the map
+                // empty is the honest outcome — an entry claiming "absent" would be a claim
+                // about the device that nothing observed.
+                _ => BTreeMap::new(),
+            };
+        }
         ProbeCommand::MountTable => output.mount_table = result,
         ProbeCommand::SystemRemount => output.system_remount = result,
         ProbeCommand::PropBuildType => output.prop_build_type = result,
@@ -501,10 +588,116 @@ mod tests {
 
     #[test]
     fn spot_check_list_is_capped_at_ten() {
-        // android-host-probe.md §7.5 item 1: at most ten, because each is a spawn.
+        // android-host-probe.md §7.5 item 1. The cap is about how many claims the port
+        // makes about devices in general, not about spawn cost — item 6c runs them in one
+        // shell invocation.
         assert!(SPOT_CHECK_APPLETS.len() <= 10);
         assert!(SPOT_CHECK_APPLETS.contains(&"logcat"));
         assert!(SPOT_CHECK_APPLETS.contains(&"screencap"));
+    }
+
+    #[test]
+    fn the_spot_check_asks_for_every_name_in_one_invocation() {
+        // The whole point of batching: probing each name as its own command would be ten
+        // spawns, and over the adb harness ten spawns is ten round trips at startup on a
+        // battery. `command -v` is a builtin, so the loop itself is free.
+        let line = ProbeCommand::SpotChecks.command_line();
+        assert_eq!(line.matches("command -v").count(), 1);
+        assert_eq!(line.matches("for n in ").count(), 1);
+        for name in SPOT_CHECK_APPLETS {
+            assert!(
+                line.contains(&format!(" {name} "))
+                    || line.starts_with(&format!("for n in {name} ")),
+                "{name} is not in the spot-check list: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn spot_checks_confirm_the_commands_an_applet_listing_cannot_see() {
+        // Verbatim from a Huawei BLA-AL00 (API 29) through `adb shell`. Seven of these ten
+        // names do not appear anywhere in that device's 194-applet `toybox` listing, because
+        // they are standalone `/system/bin` binaries rather than applets. A profile built
+        // from the listing alone reports the entire read surface as absent.
+        let device_output = "\
+SPOT logcat rc=0 path=/system/bin/logcat
+SPOT dumpsys rc=0 path=/system/bin/dumpsys
+SPOT getprop rc=0 path=/system/bin/getprop
+SPOT setprop rc=0 path=/system/bin/setprop
+SPOT am rc=0 path=/system/bin/am
+SPOT pm rc=0 path=/system/bin/pm
+SPOT input rc=0 path=/system/bin/input
+SPOT screencap rc=0 path=/system/bin/screencap
+SPOT mount rc=0 path=/system/bin/mount
+SPOT ps rc=0 path=/system/bin/ps
+";
+        let checks = parse_spot_checks(device_output);
+        assert_eq!(checks.len(), SPOT_CHECK_APPLETS.len());
+        for (name, out) in &checks {
+            assert!(
+                out.succeeded(),
+                "{name} reported present but not successful"
+            );
+            assert_eq!(out.stdout, format!("/system/bin/{name}"));
+        }
+    }
+
+    #[test]
+    fn a_measured_absence_is_recorded_and_is_not_the_same_as_no_answer() {
+        // `command -v` exits non-zero and prints nothing when the name is not on the PATH:
+        // that is an observed fact about the device, so it gets an entry whose `succeeded()`
+        // is false. A name with no line at all gets no entry (next test).
+        let checks =
+            parse_spot_checks("SPOT am rc=1 path=\nSPOT logcat rc=0 path=/system/bin/logcat\n");
+        let am = &checks["am"];
+        assert_eq!(am.exit_code, Some(1), "the device's own status is recorded");
+        assert!(am.stdout.is_empty());
+        assert!(!am.succeeded());
+        assert!(checks["logcat"].succeeded());
+    }
+
+    #[test]
+    fn answers_about_commands_nobody_asked_about_are_dropped() {
+        // `su` is not on the capped list. Accepting its line would let a device's output
+        // populate a claim the probe never made, and the claim would look measured.
+        let checks = parse_spot_checks("SPOT su rc=0 path=/system/xbin/su\n");
+        assert!(
+            checks.is_empty(),
+            "the parser must not accept answers about commands it did not ask about"
+        );
+    }
+
+    #[test]
+    fn a_name_that_never_answered_is_unknown_rather_than_absent() {
+        // Truncated output, or a shell that broke out of the loop, loses answers. Reading
+        // that as "this device does not have dumpsys" is the failure mode that made the
+        // fabricated fixtures more confident than the real device ever was.
+        let checks = parse_spot_checks("SPOT logcat rc=0 path=/system/bin/logcat\n");
+        assert!(checks.contains_key("logcat"));
+        assert!(
+            !checks.contains_key("dumpsys"),
+            "no line means no evidence — not a claim of absence"
+        );
+    }
+
+    #[test]
+    fn shell_noise_is_not_evidence_about_a_command() {
+        // A login shell can print prose. Lines that are not ours are dropped, and a line
+        // that looks like ours but carries a non-numeric status is recorded as no evidence
+        // rather than guessed at.
+        let checks = parse_spot_checks(
+            "WARNING: shell noise\n\
+             logcat: something\n\
+             SPOT logcat rc=ok path=/system/bin/logcat\n\
+             SPOT ps rc=0 path=/system/bin/ps\n",
+        );
+        assert_eq!(checks.len(), 2);
+        assert!(!checks["logcat"].succeeded());
+        assert!(
+            checks["logcat"].exit_code.is_none(),
+            "unparseable status = no result"
+        );
+        assert!(checks["ps"].succeeded());
     }
 
     #[test]

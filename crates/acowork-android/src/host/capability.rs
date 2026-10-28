@@ -396,7 +396,7 @@ mod tests {
             shell: Some(ShellDialect::MkSh),
             shell_executed: true,
             dialects: [ShellDialect::MkSh].into_iter().collect(),
-            applets: AppletSet::parse_list("cat\nlogcat\nsetprop\n"),
+            applets: AppletSet::parse_list("cat\nsetprop\nmount\n"),
             fs_roots: vec![
                 FsRoot {
                     path: "/data/data/com.example.agent".to_string(),

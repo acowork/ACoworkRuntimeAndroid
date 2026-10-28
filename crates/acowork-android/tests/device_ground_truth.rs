@@ -16,14 +16,16 @@
 //!
 //! # What it is for
 //!
-//! Three of the four findings below were bugs, each invisible to the hand-written fixtures:
+//! Four findings, each a bug, each invisible to the hand-written fixtures:
 //!
 //! 1. probe item 5b ran `/system/bin/sh --version`, which **errors** on a real device, so the
 //!    dialect was never detected and a working shell host was classified as an APK sandbox;
 //! 2. `/proc/*/attr/current` is NUL-terminated, and `str::trim` does not remove NUL, so the
 //!    terminator was stored in the profile and echoed into audit records;
 //! 3. a host with no Termux was handed a fabricated `$PREFIX`, forging the very marker the
-//!    profile exists to record.
+//!    profile exists to record;
+//! 4. the applet listings were the only source of command presence, and they cannot see
+//!    `/system/bin` binaries — see [`the_read_surface_exists_on_the_device_only_item_6c_can_see`].
 
 use std::path::PathBuf;
 
@@ -176,14 +178,76 @@ fn the_applet_listing_survives_the_real_typography() {
         set.len()
     );
 
-    // `logcat` and `getprop` are standalone binaries in `/system/bin`, not toybox applets, on
-    // this device. The hand-written fixture claimed `logcat` was an applet, and the backend
-    // uses exactly this fact to decide whether `logcat --pid` is available.
+    // `logcat` and `getprop` are standalone `/system/bin` binaries on this device, not toybox
+    // applets, so the bulk listing does not contain them. The hand-written fixture claimed it
+    // did. Nothing here proves those commands are *absent* — only that `toybox --list` is not
+    // where their presence comes from; that is item 6c's `command -v` spot-check, which the
+    // listing alone cannot substitute for (android-host-probe.md §7.5 item 1).
     assert!(
         !set.contains("logcat"),
         "logcat is /system/bin/logcat here, not a toybox applet"
     );
     assert!(!set.contains("getprop"));
+}
+
+#[test]
+fn the_read_surface_exists_on_the_device_where_only_item_6c_can_see_it() {
+    // ADR-AND-001 §4.4 defines the read allow-list as getprop / dumpsys / logcat / ps / df /
+    // mount / getenforce. On this device seven of those tools are standalone `/system/bin`
+    // binaries that appear in none of the 194 listed applets. Before item 6c the listings
+    // were the *only* source of command presence, so a profile assembled from this device
+    // declared absent the exact surface this port exists to offer — and the hand-written
+    // fixtures, which listed `logcat` as an applet, kept the two sources from being told
+    // apart.
+    let probe = ground_truth();
+    let listed = AppletSet::parse_list(&probe.toybox_list.as_ref().unwrap().stdout);
+    let profile = HostProfile::assemble(&probe, OWN_PACKAGE);
+
+    assert!(
+        probe.applet_spot_checks.values().all(|o| o.succeeded()),
+        "the device answered for every name it was asked about"
+    );
+
+    for name in [
+        "logcat",
+        "dumpsys",
+        "getprop",
+        "am",
+        "pm",
+        "input",
+        "screencap",
+    ] {
+        assert!(
+            !listed.contains(name),
+            "{name} is not a toybox applet on this device; if the fixture changed, this \
+             test is describing the wrong device"
+        );
+        assert!(
+            profile.applets.contains(name),
+            "{name} is at /system/bin/{name} and the profile must know it"
+        );
+    }
+
+    // The ones that genuinely are applets are present through both sources, which is the
+    // expected overlap rather than a contradiction.
+    assert!(listed.contains("mount") && profile.applets.contains("mount"));
+    assert!(listed.contains("ps") && profile.applets.contains("ps"));
+}
+
+#[test]
+fn su_presence_has_exactly_one_source() {
+    // `su` is decided by item 4a (`command -v su`), whose answer feeds `ShellPaths::su`.
+    // Keeping it out of item 6c's list matters: two independent "is su present" claims on
+    // one device is how a root tier gets built on evidence the other probe contradicts.
+    assert!(
+        !acowork_android::host::SPOT_CHECK_APPLETS.contains(&"su"),
+        "su presence must come from item 4a only"
+    );
+    let probe = ground_truth();
+    assert!(
+        !probe.applet_spot_checks.contains_key("su"),
+        "the spot-check set must not have grown an su answer"
+    );
 }
 
 #[test]

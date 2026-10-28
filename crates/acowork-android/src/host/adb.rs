@@ -396,7 +396,7 @@ impl ProbeRunner for AdbTransport {
                 command.command_line()
             )));
         }
-        self.probe_line(command.command_line()).await
+        self.probe_line(command.command_line().as_ref()).await
     }
 
     /// Probe item 12, established by `touch` rather than by mount options.

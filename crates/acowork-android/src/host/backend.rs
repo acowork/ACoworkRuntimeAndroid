@@ -612,7 +612,7 @@ mod tests {
             shell: Some(ShellDialect::MkSh),
             shell_executed: true,
             dialects: [ShellDialect::MkSh].into_iter().collect(),
-            applets: AppletSet::parse_list("cat\nlogcat\nsetprop\nmount\n"),
+            applets: AppletSet::parse_list("cat\nsetprop\nmount\nps\n"),
             fs_roots: vec![FsRoot {
                 path: "/data/local/tmp".to_string(),
                 writable: true,

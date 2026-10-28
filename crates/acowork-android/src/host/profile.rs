@@ -677,6 +677,16 @@ mod tests {
         CommandOutput::ok(stdout)
     }
 
+    /// Item 6c answers for the commands no applet listing can see. On the measured device
+    /// these are standalone `/system/bin` binaries; a fixture that lists them as applets is
+    /// describing a device that does not exist.
+    fn spot_checks(names: &[&str]) -> std::collections::BTreeMap<String, CommandOutput> {
+        names
+            .iter()
+            .map(|n| (n.to_string(), out(&format!("/system/bin/{n}"))))
+            .collect()
+    }
+
     fn rooted_probe() -> ProbeOutput {
         ProbeOutput {
             id: Some(out("10233\n")),
@@ -686,11 +696,9 @@ mod tests {
             su_path: Some(out("/sbin/su\n")),
             bash_path: Some(out("")),
             system_sh_version: Some(out("KSH=@(#)MIRBSD KSH R57 2019-03-01 Android\\nBASH=\\n")),
-            toybox_list: Some(out(
-                "cat\nchmod\ngetprop\nlogcat\nmount\nps\nsetprop\ntoybox\n",
-            )),
+            toybox_list: Some(out("cat\nchmod\nmount\nps\nsetprop\n")),
             busybox_list: None,
-            applet_spot_checks: Default::default(),
+            applet_spot_checks: spot_checks(&["logcat", "dumpsys", "getprop", "am", "pm"]),
             mount_table: Some(out("/dev/block/sda1 on /data type f2fs (rw,seclabel)\n")),
             system_remount: Some(out("")),
             prop_build_type: Some(out("userdebug\n")),
@@ -748,9 +756,43 @@ mod tests {
     #[test]
     fn applets_come_from_the_bulk_list() {
         let p = HostProfile::assemble(&rooted_probe(), "com.example.agent");
-        assert!(p.applets.contains("logcat"));
         assert!(p.applets.contains("setprop"));
+        assert!(p.applets.contains("mount"));
         assert!(!p.applets.list_source_missing);
+    }
+
+    #[test]
+    fn the_bulk_listing_alone_cannot_see_a_system_bin_binary() {
+        // The two sources of command presence are not interchangeable, and this is the
+        // defect item 6c exists for: on the measured device `logcat`, `dumpsys` and `getprop`
+        // are `/system/bin` binaries that appear in no applet listing, so a profile built
+        // from `toybox` alone declares ADR-AND-001 §4.4's whole read surface absent.
+        let mut probe = rooted_probe();
+        assert!(
+            !probe
+                .toybox_list
+                .as_ref()
+                .unwrap()
+                .stdout
+                .contains("logcat"),
+            "the fixture's listing must not contain what the real device's does not"
+        );
+        assert!(
+            HostProfile::assemble(&probe, "com.example.agent")
+                .applets
+                .contains("logcat"),
+            "confirmed by spot-check, therefore present"
+        );
+
+        // Remove the spot-check answers and the command becomes unknown — which is not the
+        // same as the device saying it is absent, and must not be reported as a capability.
+        probe.applet_spot_checks.clear();
+        assert!(
+            !HostProfile::assemble(&probe, "com.example.agent")
+                .applets
+                .contains("logcat"),
+            "presence may not be inferred from a listing that never mentioned it"
+        );
     }
 
     #[test]
