@@ -26,6 +26,10 @@ tokio.workspace = true
 # `std` because Android is a std platform and the models here are stored, logged and put on
 # the wire as owned `String`s. The workspace default is `no_std`; opting in is deliberate.
 serde = { workspace = true, features = ["std"] }
+# The audit trail (§4.6.1) is stored as JSONL, and `host::audit::FileAuditSink` is library code,
+# not test code, so this cannot stay a dev-dependency. Nothing else in the crate serialises to
+# JSON: the contract layer owns the wire format, and the wire never carries a device record.
+serde_json = { workspace = true, features = ["std"] }
 
 # One call: `kill(-pgid, SIGKILL)`, to stop a timed-out command's whole process group
 # instead of only its shell (`std` has no `killpg`). Target-gated to unix, and already in

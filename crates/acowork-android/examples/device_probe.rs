@@ -24,8 +24,8 @@ use acowork_android::host::capability::Capability;
 use acowork_android::host::probe::{CommandOutput, ProbeOutput, run_probe};
 use acowork_android::host::spawn::{SpawnInvocation, SpawnRunner};
 use acowork_android::host::{
-    AdbTransport, ExecRequest, ExecutionBackend, HostProfile, ProbeCommand, ShellBackend,
-    check_script, shell_tools,
+    AdbTransport, AuditedBackend, BackendError, ExecRequest, ExecutionBackend, FileAuditSink,
+    HostProfile, ProbeCommand, ShellBackend, check_script, shell_tools,
 };
 use acowork_platform_contract::HostDescription;
 
@@ -126,6 +126,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 println!("      {line}");
             }
         }
+        println!("\n── 6. §4.6.1 audit trail ────────────────────────────");
+        report_audit(&profile, &transport).await?;
     }
 
     Ok(())
@@ -325,4 +327,100 @@ async fn report_guardrails(profile: &HostProfile, transport: &AdbTransport) {
         ),
         Err(e) => println!("  logcat on device: failed {e}"),
     }
+}
+
+/// §4.6.1: the audit fields were all being computed and then dropped, so the harness runs
+/// three real attempts through the auditing decorator and prints the file that comes out.
+///
+/// Three attempts, not one, because the log has to separate the outcomes that matter:
+/// something ran, something was refused for a fixable reason, and something was refused
+/// because it must never run. A trail that records only the first is a traffic counter.
+///
+/// The sink writes on the **host** here, because this harness runs on the host and drives the
+/// device over adb. On a device the same `FileAuditSink` points at the node's own data
+/// directory. What is proved is the code path — record, spawn, record — not the partition.
+async fn report_audit(
+    profile: &HostProfile,
+    transport: &AdbTransport,
+) -> Result<(), Box<dyn Error>> {
+    use std::sync::Arc;
+
+    use acowork_android::host::{AuditSink, DEFAULT_MAX_FILE_BYTES, MemoryAuditSink};
+
+    let shell: Arc<dyn ExecutionBackend> = Arc::new(ShellBackend::with_runner(
+        profile.clone(),
+        transport.clone(),
+    )?);
+
+    let path = std::env::temp_dir().join(format!(
+        "acowork-audit-harness-{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let sink = Arc::new(FileAuditSink::new(&path));
+    let audited = AuditedBackend::new(shell.clone(), sink.clone());
+
+    for (script, claim) in [
+        ("getprop ro.build.type", Capability::ShellRead),
+        (
+            "settings put system airplane_mode_on 1",
+            Capability::ShellRead,
+        ),
+        ("toybox rm -rf /data", Capability::ShellWrite),
+    ] {
+        let outcome = audited
+            .exec(ExecRequest::new(claim, script, "harness-session"))
+            .await;
+        print!("  {:<40} ", script);
+        match outcome {
+            Ok(record) => println!(
+                "ran: exit {:?} uid {:?} {}ms",
+                record.exit_code, record.uid, record.duration_ms
+            ),
+            Err(BackendError::Refused { kind, .. }) => println!("refused: {kind:?}"),
+            Err(e) => println!("failed: {e}"),
+        }
+    }
+
+    // The fail-closed half: a sink that cannot accept the opening record stops the command
+    // before the device is touched. The backend is never entered, so nothing ran — which is
+    // the only reason this is safe to demonstrate against a real phone at all.
+    let blocked = AuditedBackend::new(shell, Arc::new(MemoryAuditSink::failing_after(0)));
+    match blocked
+        .exec(ExecRequest::read(
+            "getprop ro.build.type",
+            "harness-session",
+        ))
+        .await
+    {
+        Err(e) => println!("  sink refuses the record    -> command not run: {e}"),
+        Ok(_) => println!("  sink refuses the record    -> RAN ANYWAY (this is a defect)"),
+    }
+
+    let text = std::fs::read_to_string(&path)?;
+    println!(
+        "\n  {} — {} records, {} bytes (cap {DEFAULT_MAX_FILE_BYTES})",
+        path.display(),
+        text.lines().count(),
+        text.len()
+    );
+    for line in text.lines() {
+        let event: serde_json::Value = serde_json::from_str(line)?;
+        let outcome = &event["outcome"];
+        println!(
+            "    id {:<2} {:<9} {:<18} uid {:<6} ctx {:<20} {}",
+            event["id"],
+            event["backend"].as_str().unwrap_or("?"),
+            event["capability"].as_str().unwrap_or("?"),
+            event["uid"],
+            event["context"].as_str().unwrap_or("-"),
+            outcome["outcome"].as_str().unwrap_or("?"),
+        );
+        if let Some(reason) = outcome.get("reason").and_then(|v| v.as_str()) {
+            let one_line: String = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+            println!("        {}", one_line.chars().take(140).collect::<String>());
+        }
+    }
+    println!("  sink failures: {}", sink.failures());
+    Ok(())
 }

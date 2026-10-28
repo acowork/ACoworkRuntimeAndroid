@@ -30,6 +30,7 @@
 //! | Backends | [`backends`] | The tier-specific `ExecutionBackend` implementations | Composes script + spawn + commands |
 //! | Transport | [`adb`] | Drive a device from the host over `adb` (feature `device`) | I/O |
 //! | Feedback | [`denial`] | `avc: denied` → an actionable next step | Pure, plus a session ledger |
+//! | Accountability | [`audit`] | §4.6.1: one record per attempt, written before and after | I/O on the way in, pure mapping |
 //!
 //! Keeping the parsers pure is not tidiness for its own sake: it is what makes the
 //! P0 acceptance criterion in ADR-AND-001 §6 ("单元测试用伪造 probe 输出")
@@ -50,6 +51,7 @@
 //! - **No polling.** The profile is built once and re-derived only on the events
 //!   listed in android-host-probe.md §6.
 
+pub mod audit;
 pub mod backend;
 pub mod backends;
 pub mod capability;
@@ -67,6 +69,10 @@ pub mod adb;
 
 #[cfg(feature = "device")]
 pub use adb::{AdbTransport, CANDIDATE_ROOTS, RemoteArg};
+pub use audit::{
+    AuditError, AuditEvent, AuditOutcome, AuditSink, AuditedBackend, DEFAULT_MAX_FILE_BYTES,
+    FileAuditSink, MAX_COMMAND_BYTES, MemoryAuditSink,
+};
 pub use backend::{
     ApprovalToken, BackendError, ContractBackend, DEFAULT_OUTPUT_CAP, DEFAULT_READ_TIMEOUT,
     ExecRecord, ExecRequest, ExecutionBackend, SessionLockOutcome, SessionWriteLock,
