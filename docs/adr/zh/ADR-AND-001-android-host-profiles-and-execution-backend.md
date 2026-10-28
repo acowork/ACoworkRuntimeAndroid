@@ -3,7 +3,7 @@
 - **状态**：**部分 Accepted** —— §1–§6（宿主档位、一个引擎、工具级提权、`ExecutionBackend` 契约）有效并已落地 P0；档位由三档扩到四档，见 §4.3；⚠️ **§7.1 与 §7.4 待与上游对齐**，二者被晚于本 ADR 的上游文档推翻，详见下方「上游冲突」与 [开发就绪度评估](../../review/zh/2026-10-28-readiness-assessment.md) B1/B2。
 - **日期**：2026-10-20（原标 `2026-05-15` 有误：正文引用了 2026-09-13 才创建的 ADR-075、2026-10-05 的 ADR-087、2026-10-09 的 ADR-090，该日期不可能成立）
 - **相关**：[README.md](../../../README.md)、上游 `docs/design/zh/12-tool-system.md`（平台支持矩阵与运行时平台检测）、上游 `core/acowork-runtime/src/tools/builtin/shell.rs`（多 shell 注册范式）、上游 ADR-087（node/agent 归属与门控）、上游 `docs/design/zh/30-runtime-protocol-and-pluggable-engine.md`（能力注册表与可插拔引擎，**v0.2 直接点名本 ADR**）、session 参数 `shellApprovalThreshold` / `approvalTimeoutSecs`
-- **实现**：P0 已交付，并按 [ADR-AND-002](ADR-AND-002-platform-contract-layer.md) 拆成两层 —— 规则在 `crates/acowork-platform-contract/`（平台中立，只依赖 serde，可在裸机 target 编译），Android 的事实与机制在 `crates/acowork-android/src/host/`（探测解析器、capability 取值、`su -c` 包装、`avc` 回灌）。248 测试通过，clippy `-D warnings` 零告警。本 ADR §7.1/§7.4 的门控落点已从 `backend.rs` 迁至契约层 `gate.rs`，§4.4 的权限描述已细化为四轴 `CapabilitySpec`——**决策内容不变**，详见 ADR-AND-002 §4
+- **实现**：P0 已交付，并按 [ADR-AND-002](ADR-AND-002-platform-contract-layer.md) 拆成两层 —— 规则在 `crates/acowork-platform-contract/`（平台中立，只依赖 serde，可在裸机 target 编译），Android 的事实与机制在 `crates/acowork-android/src/host/`（探测解析器、capability 取值、`su -c` 包装、`avc` 回灌）。382 测试通过，clippy `-D warnings` 零告警，并在华为 BLA-AL00 上端到端验证。本 ADR §7.1/§7.4 的门控落点已从 `backend.rs` 迁至契约层 `gate.rs`，§4.4 的权限描述已细化为四轴 `CapabilitySpec`——**决策内容不变**，详见 ADR-AND-002 §4
 - **EN mirror**：待补 `docs/adr/en/`（上游 `AGENTS.md:142` 要求中英 ADR 同一 commit 更新；本仓库尚未采用该约定，见评估 B7）
 
 > ### ⚠️ 上游冲突（2026-10-28 核对）
@@ -182,6 +182,8 @@ graph TD
 
 审批机制**复用** session 已有的 `shellApprovalThreshold` / `approvalTimeoutSecs`，不新造一套审批子系统。
 
+**「白名单自动放行」按脚本内容判定，不按标签判定**（`crates/acowork-android/src/host/commands.rs`）。`ExecRequest::read()` 只是调用方的自我声明；若只读标签就能拿到执行权，把 `setprop` 标成 read 即绕过全部审批，白名单形同虚设。后端在派生进程前解析脚本本身：逐段（`;` `|` `&&` `||` 换行）取命令词，绝对路径取基名，`toybox`/`busybox` 多路复用器解包成真正的子命令，再按命令 + 标志位 + 子命令定效果（`logcat -c` 清缓冲、`mount -o remount` 重挂、`pm install`、`settings put`、任何重定向到文件）。自称 read 而内容含写 → 拒绝并指名缺哪一档能力；含**无法解析**的结构（命令替换、反引号、嵌套 shell、`if`/`for`）判为 `Opaque`，**任何档位都不放行**——解析不了就无法证明它只做读，这是 fail-closed 而非保守。写标签下 §4.6.3 的硬禁列表同样直接拒绝，且不附「可升级到 X 档」的提示。效果之间按 §4.4 的档位排序比较（`shell:write` 覆盖它自带的读），过度声明（写标签跑纯读脚本）不拒：多花一次审批，不伤害任何人。
+
 ### 4.5 工具注册：复用上游双 shell 范式
 
 上游 `shell.rs` 在 Windows 上已把 Git Bash 与 PowerShell 注册为**两个独立工具、各自带描述**，让模型有依据地选择并 fallback。Android 直接沿用：
@@ -189,14 +191,15 @@ graph TD
 - `bash`：Termux 环境，POSIX + bash 扩展。
 - `ash`：`/system/bin/sh`（mksh），显式声明「无 bash 数组、`[[` 语义差异、命令由 toybox/busybox 提供」。
 
-工具描述由 HostProfile Probe 的探测结果动态生成（哪些 applet 真实存在），而非硬编码。
+工具描述由 HostProfile Probe 的探测结果动态生成（哪些 applet 真实存在），而非硬编码。 **现状**：「哪些命令真实存在」已可回答（探测项 6a/6c，`ShellPaths.applets`），动态生成工具描述本身尚未实现——这是 §4.4 只读档落地后 Item #8 剩下的那一半。
 
 ### 4.6 调试场景护栏（rollback-first）
 
-1. **审计日志**：每条提权命令记录 `capability / 实际 uid / SELinux 域 / 命令 / exit code / 耗时 / avc 拒绝`。
+1. **审计日志**：每条提权命令记录 `capability / 实际 uid / SELinux 域 / 命令 / exit code / 耗时 / avc 拒绝`。**字段齐备、出口未接**：`ExecRecord` 已携带 uid / SELinux 域 / exit code / 耗时 / 超时 / `selinux_denials`，但还没有把拒绝与提权事件持久化的 sink（拒绝目前只作为 `BackendError` 返回给调用方）。
 2. **拒绝归类**：从 stderr 抽取 `avc: denied`，转成可执行的下一步提示（「需要 su 域」/「需要显式 permissive 审批」），避免模型盲目重试。
-3. **硬禁列表**：`dd of=/dev/block/*`、`rm -rf /data`、`wipe data`、`fastboot`、分区 `flash` —— 默认拒绝，即使 dangerous-mode 也需人工确认 + 设备指纹匹配。
+3. **硬禁列表**：`dd of=/dev/block/*`、`rm -rf /data`、`wipe data`、`fastboot`、分区 `flash` —— 默认拒绝，即使 dangerous-mode 也需人工确认 + 设备指纹匹配。 **已实现**（`commands::Effect::Banned`）：`fastboot` / `flash` / `mkfs` / `format` 与任何含 `wipe-data` 的参数命中即拒；`dd` 看 `of=` 指向、`rm` 看删除目标是否为设备根或分区根、重定向落进分区路径同样判禁——删应用自身目录这类正常写不受影响。拒绝措辞不给出任何可达路径。
 4. **写操作可撤销**：改 prop 前记录旧值，会话结束自动回滚（`persist.*` 需显式声明才保留）；改文件先备份到 Agent 工作区，提供 `restore`。
+   **未实现**：闸门已有 `rollback_plan` 轴（缺计划即拒 `RollbackPlanRequired`），但 Android 侧没有任何产生回滚计划的机制——`ExecRequest` 的该字段恒为 `None`。写档真正开放前必须补上。
 5. **DeviceWriteLock**：root 操作作用于**整机全局状态**，多个 Agent 并发调试会互相踩踏。Node Agent 侧新增 per-device 写锁，串行化 mutating 命令（read 类不锁）。锁由 **session 持有**、TTL 10 分钟、拿不到锁立即失败不排队 —— 语义详见 §7.2。这是本决策引入的**新架构件**。
 6. **证据采集**：`logcat -d`（带 buffer / filter）、`screencap`、`dumpsys <service>`、`/data/anr`、`/data/tombstones`、`bugreportz`。这是 root 档的真正价值——把「复现 → 证据 → 关联分析」闭环。
 

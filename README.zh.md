@@ -18,8 +18,9 @@
 ---
 
 > **状态：早期开发。** 设计文档齐备，P0 切片（HostProfile 探测、脚本装配、进程生成、
-> `ExecutionBackend` 实现）已交付为可构建、可测试的 Rust 库，344 个测试通过，且整条链路已在真机上
-> 跑通过一次（华为 BLA-AL00，经 adb：17 条探测 → `HostProfile` → 一条真实命令，139ms / exit 0）。
+> `ExecutionBackend` 实现、§4.4 只读档护栏）已交付为可构建、可测试的 Rust 库，382 个测试通过，
+> 且整条链路已在真机上跑通过（华为 BLA-AL00，经 adb：18 条只读探测 → `HostProfile` → 真实命令，
+> ~120ms / exit 0，其中 `logcat` 之所以能跑，是因为探测项 6c 去抽查了它）。
 > **仍无 node 二进制产物**——目前唯一可运行的东西就是那个真机 harness——不适合用于生产环境。
 >
 > 下文标注 🚧 / ⬜ / ⛔ 的内容均为设计意图。三条 ⛔ 是「本仓库裁定 vs 上游权威」的冲突，
@@ -197,7 +198,7 @@ graph TD
 | 5b | 执行栈：脚本装配、`SpawnRunner` 平台接缝、`ShellBackend` / `RootShellBackend` / `AppSandboxBackend`、adb 传输层 | ✅ **已交付并在真机上验证** —— `cargo run --example device_probe` 端到端驱动真机；把它的回包与 fixture 逐字段对账后，修正了 5 处 fixture 编造出来的事实（见[地面实况测试](crates/acowork-android/tests/device_ground_truth.rs)） |
 | 6 | 电池 / Doze 调优与长跑稳定性测试 | ⬜ 计划中 |
 | 7 | 发布产物（Termux 包 + 签名 APK） | ⬜ 计划中（依赖 #2/#4；NDK 管线可复用上游 `apps/acowork-mobile`） |
-| 8 | `root-shell` 宿主档，**仅只读能力**（`logcat` / `dumpsys` / `getprop`） | 🚧 **可开工** —— 契约与门控已就绪，待两个 backend 实现 + 真机验证 |
+| 8 | `root-shell` 宿主档，**仅只读能力**（`logcat` / `dumpsys` / `getprop`） | 🚧 **大部分交付** —— 只读档现在按**脚本内容**放行而非按调用方标签（[`host/commands.rs`](crates/acowork-android/src/host/commands.rs)），且覆盖的命令是被探测出来的而非假定的（探测项 6c）；已在 BLA-AL00 上端到端验证。剩余：动态工具描述（§4.5），以及 `RootShellBackend` 在一台真有 `su` 的设备上跑一次——它至今没碰过真实的 su |
 | 9 | Android 调试工具集（截屏、ANR / tombstone / bugreport 采集）+ 命令审计日志 | ⬜ 计划中（依赖 #8） |
 | 10 | 写能力档：审批门控、设备级写锁、prop / 文件自动回滚 | ⛔ **阻塞（B1）** —— ADR §7.4 的 owner 合取项与上游 ADR-087 D1/D5 冲突；门控骨架已按「两权威分解」实现，待上游确认 |
 | 11 | Magisk 模块形态，用于长期挂机的调试设备农场 —— **仅当该需求真实成立** | ⬜ 暂缓 |
@@ -217,7 +218,7 @@ graph TD
 
 ```bash
 cargo build                                        # 构建
-cargo test                                         # 344 个测试（Android 单元 172 + 契约层 83 + 契约集成 23 + 规则一致性 43 + 真进程 12 + 真机地面实况 11）
+cargo test                                         # 382 个测试（Android 单元 208 + 契约层 83 + 契约集成 23 + 规则一致性 43 + 真进程 12 + 真机地面实况 13）
 cargo clippy --all-targets -- -D warnings          # 上游 CI 约定，须零告警
 cargo fmt --check
 ```
