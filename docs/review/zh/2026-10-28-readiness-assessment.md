@@ -224,7 +224,7 @@ ADR §7.4 只裁定了 `fs:system` 与 `selinux:permissive` 两条需要 owner �
 | P0 | 修正 ADR 日期、把 §7.1/§7.4 标注为待对齐 | 本仓库 | ✅ 已完成 |
 | P1 | 与 mobile app 负责人对齐 B4 的 APK 形态归属 | 需产品 | ⬜ 未开始 |
 | P1 | 回写 probe §3（B8 `dialects`、B12 shell 前置条件）与 §4（B10 ledger） | 本仓库 | ✅ 已完成（2026-10-29） |
-| — | 抽出平台中立契约层，使规则不绑在 Android 上（规避 B3、为第二个端口打样） | 本仓库 | ✅ 已完成 —— [ADR-AND-002](../../adr/zh/ADR-AND-002-platform-contract-layer.md)，442 测试 |
+| — | 抽出平台中立契约层，使规则不绑在 Android 上（规避 B3、为第二个端口打样） | 本仓库 | ✅ 已完成 —— [ADR-AND-002](../../adr/zh/ADR-AND-002-platform-contract-layer.md)，447 测试 |
 | — | 在真实嵌入式 target 上验证 R12（ESP32-C3 `riscv32imac-unknown-none-elf` 或 `riscv32imac-esp-espidf`） | 本仓库 | ⚠️ 部分 —— 已在更严格的 `riscv32imc`（无原子）上编译通过；`imac` 与 ESP-IDF 的 rust-std 组件下载被网络策略阻断 |
 | P2 | 实现只读档 backend（`ShellBackend` / `RootShellBackend` / `AppSandboxBackend`）+ adb 传输层 + 真机 harness | 本仓库，不被阻塞 | ✅ 已完成（2026-10-30）—— 20 条只读探测（原 18，后加 13 / 13b 两项证据面探测）+ `assemble` + 真实命令在 BLA-AL00 上跑通，~120ms / exit 0 / uid 2000。**getprop 与 mount 已实测**；`logcat` / `dumpsys` 此前是**手工**实测可读、不属于探测集——现已由探测项 6c 收进集合（真机 10 项抽查中 8 项不在任何 `--list` 输出里，含 §4.4 点名却谁都看不见的 `settings`） |
 | P2 | §4.4 只读白名单按**脚本内容**判定（自称 read 的写命令在执行前被拒），§4.6.3 硬禁列表任何档位拒绝 | 本仓库，不被阻塞 | ✅ 已完成（2026-10-31）—— [`host/commands.rs`](../../../crates/acowork-android/src/host/commands.rs)，29 个新测试；BLA-AL00 实测 `settings put` 挂 read 标签被拒并指名 `android:shell:write`，`toybox rm -rf` 设备根在任何档位被拒 |
@@ -252,7 +252,7 @@ ADR §7.4 只裁定了 `fs:system` 与 `selinux:permissive` 两条需要 owner �
 | 审计日志 sink | **已实现**（`host/audit.rs`，§4.6.1）：`AuditedBackend` 装饰器 + `AuditSink` trait + 限长 JSONL 文件实现。开口记录写不进就拒绝执行（fail closed），收尾记录写不进只累计失败计数（命令已经跑了，谎报失败会诱导重试一次已发生的改动）。拒绝也记账，且带 `RefusalKind`——硬禁尝试与贴错档位是两类事件 | 节点侧决定落盘目录与保留策略 |
 | SELinux context 经错误文案上线 | **已修复**：`BackendError::to_contract()` 把 `observed_context` 原串拼进过线文案，违反 §7.1；当时的单测还断言着这个泄漏。改为只报 uid + 域的类别（六值固定词表），原串留在本地 `ExecRecord`/`Display`。新增遍历全部错误变体的守门测试 | 无 |
 | SELinux 拒绝明细经**命令输出**上线 | **已修复**（§7.1 的第三个出口，也是最大的一个）：`ExecRecord::to_contract()` 原样搬运 stdout/stderr。avc 审计记录是内核写进 audit log 的，所以它到达本进程的方式不是「后端出错」而是 §4.6 item 6 第一条取证命令的输出——BLA-AL00 实测一次 `logcat -d -b events -t 400` 带 181 条记录（175 denied + 6 granted）、181 处 `u:r:`、234 处 `u:object_r:`、23 处 `s0:c` 与第三方应用私有目录路径，全部过线。现在投影处重写审计记录：保留权限集 / 对象类 / 目标类型（平台 sepolicy 词表），丢掉 user / role / MLS 区间 / 路径；非记录行逐字节不动（`ps -Z` 保留）。**守门测试当时结构上不可能发现**：断言写在 `serde_json::to_string(&outcome)` 上，而 `ExecOutput.bytes` 是 `Vec<u8>`，序列化成数字数组，任何内容都能通过 | 无 |
-| 证据源能不能采集 | **已实现**（探测项 13 / 13b）：`/data/anr`、`/data/tombstones`、`/data/system/dropbox` 逐源实测「在不在 / 能不能列 / 几条 / 能不能读」，`dumpsys -l` 数服务清单。ADR §4.6 item 6 把六个源写成并列可采集，实测是六个权限问题：无 root 时**没有一个能取到内容**，`/data/anr` 只给文件名。§4.5 的工具描述按实测访问级逐源点名，`not probed` 也占位 | 有 root 的设备上重测一遍（预期 `readable`），并补 `bugreportz` 这一项——它还没进探测集 |
+| 证据源能不能采集 | **已实现**（探测项 13 / 13b）：`/data/anr`、`/data/tombstones`、`/data/system/dropbox` 逐源实测「在不在 / 能不能列 / 几条 / 能不能读」，`dumpsys -l` 数服务清单。ADR §4.6 item 6 把六个源写成并列可采集，实测是六个权限问题：无 root 时**没有一个能取到内容**，`/data/anr` 只给文件名。§4.5 的工具描述按实测访问级逐源点名，`not probed` 也占位 | `bugreportz` 已进 6c 抽查名单（BLA-AL00 实测存在，且是唯一任何 applet 列表都看不见的证据源）；工具描述按分类器结论陈述它的档位。剩下的：有 root 的设备上重测一遍（预期 `readable`） |
 | `dumpsys` / `logcat` | 在同一设备上手工实测：shell uid 在 user 版上 `logcat -d` **读到的是全量缓冲区**（拿到了别的进程的日志行），`dumpsys -l` 能列服务。**「它们不属于探测集」这句已作废**——探测项 6c 已把两者收进集合，且实测证明必须收：二者都不是 toybox applet，批量列表看不见它们。仍未验证的是单个 service 的转储（`dumpsys package` 等）；若要作为工具开放，需按工具而非按档位来记 | 逐项 service 验证 |
 | 第四档命名 | `system-shell` 描述的是"无 Termux 的普通 shell"，与 adb 无关（adb 只是这次到达它的方式） | 若上游摘要要按档位做调度，命名需与上游对齐 |
 

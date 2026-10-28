@@ -30,7 +30,7 @@ Android 宿主的差异不是「桌面 vs 移动」这种二分，而是连续�
 | 4 | su 可用性 | `su -c 'id -u; cat /proc/self/attr/current'` | 记录 su 后的 uid **与域**（二者可能不同） | 超时 / 拒绝 → 不提供 `root-shell`；**弹窗被拒不可重试** |
 | 4a | su 位置 | `command -v su` | 与 5a 同形：exit 0 且 stdout 非空才算存在。**必须是探测而不是 `stat`**：`RootShellBackend` 没有绝对路径就无法构造（子进程环境被清空，裸名解析不出来），而固定路径清单会漏掉 `PATH` 上的安装位置；harness 跑在手机上而非手机里时，本地 `stat` 问的还是错的文件系统 | 找不到 → `paths.su = None`，root 档不可用；**不得回落成一个"常见路径"** |
 | 5 | shell 方言 | ~~`/system/bin/sh --version`~~ → `sh -c 'echo $KSH_VERSION; echo $BASH_VERSION'`、`command -v bash` | 区分 mksh / bash / busybox sh。`--version` **在真机上直接报错**（`sh: --: unknown option`，BLA-AL00 实测），mksh 的版本只能从内建变量取；变量未设置时输出空串，故两问一起问 | 无可用 shell → 不注册 shell 工具 |
-| 6 | 命令集 | `toybox`（裸）/ `busybox --list` + `ls`（applet 列表） | 得到实际存在的 applet 集合。**两种写法不是一回事**：BLA-AL00 实测裸 `toybox` 返回 194 个**applet 名**，`toybox --list` 返回同样 194 项但带安装路径（`bin/cat`、`usr/bin/acpi`）。解析器要的是名字，改成 `--list` 会把路径当成 applet 名收进集合；输出按终端宽度折行（真机 19 行），须按空白切分而非按行 | 两者皆无 → 仅 shell 内建，工具描述需说明。**6c 抽查已落地**（`ProbeCommand::SpotChecks`，一条 shell 问 10 个 `command -v`）：BLA-AL00 实测 10 项全在 `/system/bin`，其中 **8 项不在任何 `--list` 输出里**（`logcat` `dumpsys` `getprop` `am` `pm` `input` `screencap` `settings` 是系统原生二进制，不是 toybox applet）——只信 `--list` 会把这 8 项判成不存在 |
+| 6 | 命令集 | `toybox`（裸）/ `busybox --list` + `ls`（applet 列表） | 得到实际存在的 applet 集合。**两种写法不是一回事**：BLA-AL00 实测裸 `toybox` 返回 194 个**applet 名**，`toybox --list` 返回同样 194 项但带安装路径（`bin/cat`、`usr/bin/acpi`）。解析器要的是名字，改成 `--list` 会把路径当成 applet 名收进集合；输出按终端宽度折行（真机 19 行），须按空白切分而非按行 | 两者皆无 → 仅 shell 内建，工具描述需说明。**6c 抽查已落地**（`ProbeCommand::SpotChecks`，一条 shell 问 11 个 `command -v`）：BLA-AL00 实测 11 项全在 `/system/bin`，其中 **9 项不在任何 `--list` 输出里**（`logcat` `dumpsys` `getprop` `am` `pm` `input` `screencap` `settings` `bugreportz` 是系统原生二进制，不是 toybox applet）——只信 `--list` 会把这 9 项判成不存在 |
 | 7 | 可写挂载 | `mount` 解析 + `touch` 试探 | `/data` 可写；`/system`、`/` 是否可 remount | 不可写 → 不开放 `android:fs:system` |
 | 8 | 构建类型 | `getprop ro.build.type` | `user` / `userdebug` / `eng` | — |
 | 9 | 可调试性 | `getprop ro.debuggable`、`ro.secure`、`ro.adb.secure` | `ro.debuggable=1` 是调试档的强信号 | — |
@@ -226,8 +226,8 @@ stderr），后者是「过线的字节里不许有标签」。logcat 里别人�
 
 原三条未决问题已在 [ADR-AND-001 §7.5](../../adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md) 定案：
 
-1. **applets 探测粒度**：`toybox` + `busybox --list` 一次性取全量，再对 ≤10 个高价值命令做 `command -v` 抽查。逐个探测需上百次子进程派生，在移动端功耗不可接受；只信 `--list` 则会漏掉系统原生 `/system/bin/*`。
-   **已实现并被真机证实**：抽查（探测项 6c）与批量列表合并进 `ShellPaths.applets`，一次往返 117ms。真机漏检率 8/10——`logcat` 等 8 个命令确实不在任何 `--list` 里。名单的选法因此有两条：先要 §4.4 能力词汇表真的用到它，再看**别的探测项是否已经证明过它**。`mount` 因此让出了位置——探测项 7 本身就执行 `mount` 并解析挂载表，它的存在早被"跑成功"这件事回答了，抽查只是再问一遍；而 `settings` 是 §4.4 写档点名的命令、任何列表都看不见。`ps` 与 `setprop` 虽然出现在 `--list` 里，仍然保留：列表是 dispatcher 自述的表，`command -v` 问的是 shell 实际要解析的文件系统，两者是否一致是设备相关的偶然。
+1. **applets 探测粒度**：`toybox` + `busybox --list` 一次性取全量，再对 ≤12 个高价值命令做 `command -v` 抽查。逐个探测需上百次子进程派生，在移动端功耗不可接受；只信 `--list` 则会漏掉系统原生 `/system/bin/*`。
+   **已实现并被真机证实**：抽查（探测项 6c）与批量列表合并进 `ShellPaths.applets`，一次往返 117ms。真机漏检率 9/11——`logcat` 等 9 个命令确实不在任何 `--list` 里。名单的选法因此有两条：先要 §4.4 能力词汇表或 §4.6 item 6 的证据源真的用到它，再看**别的探测项是否已经证明过它**。`mount` 因此让出了位置——探测项 7 本身就执行 `mount` 并解析挂载表，它的存在早被"跑成功"这件事回答了，抽查只是再问一遍；而 `settings` 是 §4.4 写档点名的命令、任何列表都看不见；`bugreportz` 是 §4.6 item 6 点名的证据源、同样任何列表都看不见，它加入时把上限从 10 抬到 12（抬上限要付出一句理由，这条规则也写在 `probe.rs` 的名单测试里，不然它会只在文档里活着）。`ps` 与 `setprop` 虽然出现在 `--list` 里，仍然保留：列表是 dispatcher 自述的表，`command -v` 问的是 shell 实际要解析的文件系统，两者是否一致是设备相关的偶然。
 2. **APK 档文件操作是否走 `ExecutionBackend`**：**不走**，继续用 `std::fs`。文件操作不需要 shell，为「四件套语义一致」而强行统一属于抽象先行。
 3. **su 变体支持面**：首版只支持 **MagiskSU** 语法（`su -c`）。KernelSU 兼容该接口故顺带可用；SuperSU 明确不支持。
 
