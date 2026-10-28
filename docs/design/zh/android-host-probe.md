@@ -1,6 +1,6 @@
 # Android HostProfile Probe 设计
 
-- **状态**：Draft —— P0 已按本设计落地（`crates/acowork-android/src/host/`），实现期发现 3 处契约缺口需回写本文，见下方「实现期修订」
+- **状态**：Draft —— P0 已按本设计落地并按 [ADR-AND-002](../../adr/zh/ADR-AND-002-platform-contract-layer.md) 拆成两层（规则在 `crates/acowork-platform-contract/`，本文描述的探测项与推导规则在 `crates/acowork-android/src/host/`）。实现期发现的 3 处契约缺口已回写本文（§3 B8/B12、§4 B10）
 - **日期**：2026-10-20（原标 `2026-05-15` 与所引 ADR-AND-001 同期，该日期不成立，理由见该 ADR 头部）
 - **相关**：[ADR-AND-001](../../adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md)
 - **目的**：定义「启动时一次性能力探测」的探测项、数据契约、失败语义与消费方式，使工具列表与 shell 方言描述由**实测**生成，而非硬编码平台判断。
@@ -46,38 +46,53 @@ Android 宿主的差异不是「桌面 vs 移动」这种二分，而是连续�
 ```rust
 /// 探测结果：一次生成，会话期内只读。
 pub struct HostProfile {
-    pub name: HostProfileName,        // ApkSandbox | Termux | RootShell
-    pub privilege: Privilege,         // AppUid | ShellUid | Root
-    pub selinux: SelinuxState,        // Enforcing | Permissive | Unknown
-    pub context: Option<String>,      // /proc/self/attr/current 原值
-    pub shell: Option<ShellDialect>,  // Bash | MkSh | BusyBoxSh | None
-    pub applets: AppletSet,           // 实际存在的命令名集合（toybox ∪ busybox ∪ 系统）
-    pub fs_roots: Vec<FsRoot>,        // 可读写根，含 writable: bool
-    pub caps: CapabilitySet,          // 见 §4，由以上事实推导
-    pub device: DeviceFacts,          // build_type / debuggable / api / abi / verity
+    pub name: HostProfileName,            // ApkSandbox | Termux | RootShell
+    pub privilege: Privilege,             // AppUid | ShellUid | Root
+    pub selinux: SelinuxState,            // Enforcing | Permissive | Unknown
+    pub context: Option<String>,          // /proc/self/attr/current 原值
+    pub domain: SelinuxDomain,            // 由 context 解析出的域（UntrustedApp | Shell | Magisk | …）
+    pub shell: Option<ShellDialect>,      // 主方言：裸 `shell` 工具绑定的那一个
+    pub dialects: BTreeSet<ShellDialect>, // 全部可用方言，供 ADR §4.5 的双工具注册（B8）
+    pub applets: AppletSet,               // 实际存在的命令名集合（toybox ∪ busybox ∪ 系统）
+    pub fs_roots: Vec<FsRoot>,            // 可读写根，含 writable / own_package
+    pub su: SuProbe,                      // su 探测结果，含 prompt_denied（§2 item 4：被拒不可重试）
+    pub system_remountable: bool,         // /system 实测可否 remount
+    pub caps: CapabilityTable,            // 见 §4，由以上事实推导（契约层类型，见下方 2026-10-29 修订）
+    pub device: DeviceFacts,              // build_type / debuggable / api / abi / verity
 }
 ```
 
-> ### 实现期修订（2026-10-28，评估 B8/B12）
+> ### 实现期修订（2026-10-29，[ADR-AND-002](../../adr/zh/ADR-AND-002-platform-contract-layer.md)）
 >
-> 落地 P0 时发现本节契约有两处不足，代码已按修订后实现，**本文待回写**：
+> `caps` 的类型从本地的 `CapabilitySet` 换成契约层的 `CapabilityTable`，`HostProfile` 改为实现契约的 `HostDescription` trait。原因是本文档描述的东西分属两层：
+>
+> | 属于 | 内容 |
+> |---|---|
+> | **契约层**（平台无关） | 「能力必须由证据支持才可声明」（R4）、「探测决定声明、不决定放行」（R2）、「探测有界、一次、由事件失效而非轮询」（`ProbeBudget`）、「摘要不含设备标识」（R13） |
+> | **本文档 + Android 层** | 探测**哪 12 项**、每项用什么命令、输出怎么解析、五个 `android:*` ID 的四轴取值、以及下面那张推导规则表 |
+>
+> 判据是一句话：换一个平台，上面那行不用改，下面那行全部重写。§4 的两条原则因此不再是本文档的约定，而是契约层的 R2 与 R9/R4，由 `tests/rules_conformance.rs` 逐条验证。
+
+> ### 实现期修订（2026-10-28，评估 B8/B12 —— **已于 2026-10-29 回写本文**）
+>
+> 落地 P0 时发现本节契约有两处不足：
 >
 > 1. **`shell` 单值字段无法表达 ADR §4.5 的双工具注册（B8）。** §4.5 要求注册 `bash` 与 `ash` 两个独立工具，而 `shell: Option<ShellDialect>` 只能存一个。已增加 `dialects: BTreeSet<ShellDialect>`，`shell` 保留为「主方言」（裸 `shell` 工具绑定的那一个）。
-> 2. **`fs:system` 与 `selinux:permissive` 的推导规则漏了 shell 前置条件（B12）。** remount 意味着*执行* `mount`，`setenforce` 同理；无 shell 的宿主无论如何做不到——这正是 ADR §7.3 陈述为事实的那句话。缺这个前置条件会让 APK 档声明一个无法行使的能力，即上游 design 30 §11.1 警告的「能力谎报」（比「没有能力」更伤信任）。修订后：
->    ```
->    android:fs:system          ← shell != None 且 verity != Enforcing 且 /system 实测可 remount
->    android:selinux:permissive ← shell != None 且 privilege >= Root 且 selinux == Enforcing
->    ```
+> 2. **`fs:system` 与 `selinux:permissive` 的推导规则漏了 shell 前置条件（B12）。** remount 意味着*执行* `mount`，`setenforce` 同理；无 shell 的宿主无论如何做不到——这正是 ADR §7.3 陈述为事实的那句话。缺这个前置条件会让 APK 档声明一个无法行使的能力，即上游 design 30 §11.1 警告的「能力谎报」（比「没有能力」更伤信任）。
+>
+> 两处均已写入上面的 struct 与下面的推导规则表。
 
-**推导规则（关键：capability 是探测事实的函数，不是配置项）**
+**推导规则（关键：capability 是探测事实的函数，不是配置项 —— 契约层 R1）**
 
 ```
-android:shell:read      ← shell != None
-android:shell:write     ← caps 含 read 且 privilege >= Root（或 su 探测成功）
-android:fs:outside-app  ← fs_roots 存在 writable 且不属于自身包目录
-android:fs:system       ← verity != Enforcing 且 /system 实测可 remount
-android:selinux:permissive ← privilege >= Root 且 selinux == Enforcing
+android:shell:read         ← shell != None
+android:shell:write        ← caps 含 read 且 privilege >= Root（或 su 探测成功）
+android:fs:outside-app     ← fs_roots 存在 writable 且 !own_package
+android:fs:system          ← shell != None 且 verity != Enforcing 且 system_remountable
+android:selinux:permissive ← shell != None 且 privilege >= Root 且 selinux == Enforcing
 ```
+
+每条规则都**必须附带证据**才能进入 `CapabilityTable`：契约层 `audit_claims` 是唯一入口，它会拒绝三类声明——未注册的 ID、被拒绝的探测（含 su 弹窗被拒）、以及过期证据（R4）。因此「推导规则」不是一段可以自由改写的业务逻辑，而是一组必须可举证的断言。
 
 ---
 
@@ -87,6 +102,9 @@ SELinux 是**运行时按 (scontext, tcontext, tclass) 判定**的，静态探�
 
 1. **探测结果只用于「是否注册工具 / 是否声明能力」，不作为执行放行的依据。** 真实权限以命令实际 exit code + stderr 为准。
 2. **执行期拒绝必须回灌**：`avc: denied { read } for ... scontext=u:r:magisk:s0 tcontext=u:object_r:system_data_file:s0` 需被结构化抽取，转成给模型的下一步提示（缺哪个能力 / 需要 permissive / 路径不在 fs_roots），并**累计到会话级的 observed-denials 账本**，供同会话后续门控参考（同一 tcontext 二次拒绝即提示「不要重试」）。
+
+> **这两条已上升为契约层规则（2026-10-29）**：第 1 条是 **R2**（探测不是保证；它决定*声明*什么，逐次授权是闸门 `Gate::decide` 的决定，每次请求都跑，不是启动时跑一次）；第 2 条是 **R9**（诊断随错误传递且可操作）与 **R4**（拒绝不支持声明）。
+> 上升的意义在于它们不再是「Android 的设计选择」：任何平台挂进集群都必须满足，且由 `tests/rules_conformance.rs` 的 `r2_*` / `r4_*` / `r9_*` 测试逐条验证。第二个端口不能把这两条当作可选优化。
 
 > ### 实现期修订（2026-10-28，评估 B10 + 一处分类缺陷）
 >

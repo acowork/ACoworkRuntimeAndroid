@@ -17,16 +17,19 @@
 
 ---
 
-> **Status: early development.** The design docs are in place and the P0 slice (HostProfile probe +
-> `ExecutionBackend` contract) ships as a buildable, tested Rust library. **No runnable binary exists
+> **Status: early development.** The design docs are in place, and two crates ship as buildable, tested
+> Rust libraries: the platform-neutral contract layer (`acowork-platform-contract`) and the Android host
+> layer (`acowork-android`, the P0 slice — HostProfile probe + `ExecutionBackend` contract). 249 tests
+> pass, and the contract layer also builds for a bare-metal RISC-V target. **No runnable binary exists
 > yet**, and nothing here is ready for production use.
 >
-> ⚠️ **This English README lags [README.zh.md](README.zh.md).** The Chinese version is currently
-> authoritative for three sections that changed on 2026-10-28: the roadmap (three items are blocked on
-> upstream rulings, not on engineering), the build instructions, and the APK deliverable's unresolved
-> form-factor overlap with upstream `apps/acowork-mobile`. See the
-> [readiness assessment](docs/review/zh/2026-10-28-readiness-assessment.md) — Chinese only for now.
-> Everything below marked 🚧 or *planned* is a design intent, not shipped code.
+> ⚠️ **Partially synced with [README.zh.md](README.zh.md).** The repository layout, roadmap, and build
+> sections below were brought in line on 2026-10-29. The Chinese version remains authoritative for the
+> prose sections (the two deliverables, host profiles) and for the APK deliverable's unresolved
+> form-factor overlap with upstream `apps/acowork-mobile`. **All `docs/` are Chinese-only** — start with
+> the [readiness assessment](docs/review/zh/2026-10-28-readiness-assessment.md) for what conflicts with
+> upstream, and [ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md) for the multi-platform
+> contract layer. Everything below marked 🚧 or *planned* is a design intent, not shipped code.
 
 ---
 
@@ -132,14 +135,16 @@ traits, so that once the port is stable, the differences can be reconciled with 
 
 ## Repository layout
 
-🚧 *planned* — the structure below is the intended shape, not what exists today.
+The two crates under `crates/` **exist and build**; `crates/acowork-android-cli` and `apps/android` are
+still 🚧 *planned*.
 
 ```mermaid
 graph TD
     subgraph Repo["ACoworkRuntimeAndroid"]
-        Lib["crates/acowork-android<br/>shared, platform-agnostic agent engine"]
-        Cli["crates/acowork-android-cli<br/>CLI binary: acowork-android"]
-        App["apps/android<br/>APK: foreground service + UI"]
+        Contract["crates/acowork-platform-contract<br/>✅ platform-neutral rules: serde-only, builds bare-metal"]
+        Lib["crates/acowork-android<br/>✅ Android facts & mechanisms: probe, capability values, su wrapper, avc feedback"]
+        Cli["crates/acowork-android-cli<br/>🚧 CLI binary: acowork-android"]
+        App["apps/android<br/>🚧 APK: foreground service + UI"]
     end
     Node["Node Agent tier<br/>enroll / process table / package store"]
     Rt["Runtime tier<br/>LLM loop / memory / tools"]
@@ -147,6 +152,7 @@ graph TD
 
     Cli --> Lib
     App --> Lib
+    Lib --> Contract
     Lib --> Node
     Lib --> Rt
     Node --> Gw
@@ -155,9 +161,20 @@ graph TD
 
 | Path | Contents |
 |------|----------|
-| `crates/` | Rust crates shared by both builds — the Android-aware runtime + node engine. |
-| `apps/` | The APK application (Gradle project, Kotlin/Java shell, foreground service). |
-| `docs/` | Design notes, platform notes, and the porting rationale — see [ADR-AND-001](docs/adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md) (host profiles & privilege model) and [android-host-probe.md](docs/design/zh/android-host-probe.md) (startup capability probing). |
+| `crates/acowork-platform-contract/` | **The platform-neutral rules**: the four capability axes, the evidence discipline behind a claim, the execution envelope, the authorization gate, the feedback primitives. Depends on `serde` alone and builds under `no_std + alloc`. Any platform joining the cluster — Android, ESP32, whatever comes next — must satisfy R1–R13 as stated here. See [ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md) (Chinese). |
+| `crates/acowork-android/` | **Android's facts and mechanisms**: which commands to probe, how to parse them, the four-axis values for the five `android:*` capabilities, the `su -c` wrapper, `avc: denied` feedback. The test is: swap the platform and the contract crate does not change by one line, while this crate is rewritten entirely. |
+| `crates/` (planned) | The remaining Rust crates shared by both builds — the Android-aware runtime + node engine. |
+| `apps/` (planned) | The APK application (Gradle project, Kotlin/Java shell, foreground service). |
+| `docs/` | Design notes, platform notes, and the porting rationale — see [ADR-AND-001](docs/adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md) (host profiles & privilege model), [ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md) (the platform contract layer), [android-host-probe.md](docs/design/zh/android-host-probe.md) (startup capability probing), and the [readiness assessment](docs/review/zh/2026-10-28-readiness-assessment.md) (conflicts with upstream). All Chinese. |
+
+### Android is only the first port
+
+ACowork's goal is **multi-platform node access**: after Android come ESP32-class devices. Those platforms
+share **no execution model** — an ESP32 has no processes, no POSIX filesystem, no MMU, no SELinux, no
+`std`, and possibly no atomic instructions. So there is no unified *implementation* available, but there
+can be unified *rules*. That is exactly the split above, and it is why the conformance suite
+[`tests/rules_conformance.rs`](crates/acowork-android/tests/rules_conformance.rs) — not the Android code
+itself — is the artifact a second port should copy.
 
 ## Relationship to upstream
 
@@ -174,25 +191,75 @@ graph TD
 | # | Scope | Status |
 |---|-------|--------|
 | 1 | Repository skeleton, license, and this README | 🚧 In progress |
-| 2 | Shared crate: extract node + runtime engine behind platform traits | ⬜ Planned |
-| 3 | CLI build running under Termux, enrolling with a real Gateway | ⬜ Planned |
-| 4 | APK build: foreground service, scoped storage, keep-alive | ⬜ Planned |
-| 5 | `ExecutionBackend` trait + startup HostProfile probe | ⬜ Planned |
+| 2 | Shared crate: extract node + runtime engine behind platform traits | ⛔ **Blocked (B3)** — upstream design 30 §5 and §9 give two different answers on engine ownership. Note this blocks the *engine*; the *host rules* layer shipped independently as #5a and is unaffected by how B3 is ruled |
+| 3 | CLI build running under Termux, enrolling with a real Gateway | ⬜ Planned (depends on #2) |
+| 4 | APK build: foreground service, scoped storage, keep-alive | ⛔ **Blocked (B4)** — collides with upstream `apps/acowork-mobile` (Tauri v2 Android APK, design 25 / ADR-086): same form factor, opposite purpose, ownership unresolved |
+| 5 | `ExecutionBackend` trait + startup HostProfile probe | ✅ **Delivered** (P0) — `crates/acowork-android/src/host/` |
+| 5a | **Platform-neutral contract layer** `acowork-platform-contract`: rules R1–R13 plus a per-rule conformance suite (the template for ESP32-class ports) | ✅ **Delivered** — 249 tests, builds for a bare-metal target; see [ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md) |
 | 6 | Battery / doze tuning and long-run stability testing | ⬜ Planned |
-| 7 | Release artifacts (Termux package + signed APK) | ⬜ Planned |
-| 8 | `root-shell` profile, **read-only capabilities** (`logcat` / `dumpsys` / `getprop`) | ⬜ Planned |
-| 9 | Android debugging toolset (screencap, ANR / tombstone / bugreport capture) + command audit log | ⬜ Planned |
-| 10 | Write capabilities: approval gating, per-device write lock, prop / file auto-rollback | ⬜ Planned |
+| 7 | Release artifacts (Termux package + signed APK) | ⬜ Planned (depends on #2/#4; the NDK pipeline can reuse upstream `apps/acowork-mobile`) |
+| 8 | `root-shell` profile, **read-only capabilities** (`logcat` / `dumpsys` / `getprop`) | 🚧 **Ready to start** — contract and gate are in place; needs the two backend implementations plus on-device verification |
+| 9 | Android debugging toolset (screencap, ANR / tombstone / bugreport capture) + command audit log | ⬜ Planned (depends on #8) |
+| 10 | Write capabilities: approval gating, per-device write lock, prop / file auto-rollback | ⛔ **Blocked (B1)** — ADR §7.4's owner conjunct conflicts with upstream ADR-087 D1/D5; the gate is implemented per the two-authority decomposition and awaits upstream confirmation |
 | 11 | Magisk-module form factor for always-on debug fleets — **only if that need is real** | ⬜ Deferred |
 
 Ordering is deliberate: **read-only before writable**. The read-only root profile already covers most
 system-debugging value (logs, state, properties) with essentially no brick risk, while the write profile
 is where every irreversible decision lives and gets isolated accordingly.
 
+None of the three ⛔ items can be settled inside this repository — each is a conflict between a ruling
+here and an authority upstream. The full reconciliation record, the architectural resolutions adopted, and
+the five contract gaps found during implementation (B8–B12) are in the
+[readiness assessment](docs/review/zh/2026-10-28-readiness-assessment.md) (Chinese).
+
 ## Building
 
-Nothing builds yet. Once there is a first compilable crate, the build instructions will live here,
-along with the exact NDK version and target triple.
+### Host side (what builds today)
+
+Both crates are plain Rust libraries with no platform-specific code, so they build and test on any host:
+
+```bash
+cargo build                                        # build
+cargo test                                         # 249 tests (contract 82 + android unit 101 + contract 23 + rule conformance 43)
+cargo clippy --all-targets -- -D warnings          # upstream CI convention; must be warning-free
+cargo fmt --check
+```
+
+The rules layer must additionally pass on a **bare-metal target**. This is a hard gate on R12 (the
+contract presumes no OS facility), not an optional check:
+
+```bash
+rustup target add riscv32imc-unknown-none-elf      # 32-bit RISC-V, no OS, and no atomic instructions
+cargo build  -p acowork-platform-contract --no-default-features --target riscv32imc-unknown-none-elf
+cargo clippy -p acowork-platform-contract --no-default-features --target riscv32imc-unknown-none-elf -- -D warnings
+```
+
+`imc` is chosen over the ESP32's actual `imac` precisely because it has *one facility fewer* — no `a`
+extension, hence no atomics — making it the stricter test. The cost is that `ResourceLock` is compiled out
+there via `target_has_atomic = "ptr"`; R11's semantics remain mandatory, but a single-core target without
+atomics supplies exclusion from a critical section it already has. See
+[ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md) §5.2.
+
+Toolchain mirrors upstream `core/Cargo.toml`: edition 2024, rust-version 1.95, Apache-2.0.
+
+**Dependency discipline**: `acowork-platform-contract` depends on `serde` alone
+(`default-features = false` + `alloc`/`derive`) — not even `async-trait`, since async is spelled with
+`core::future::Future` plus a GAT associated future type, unboxed. `acowork-android`'s only non-serde
+dependency is the contract crate. Neither depends on `acowork-runtime` / `acowork-core`. This is a
+*structural* guarantee rather than a convention; verify with
+`cargo tree -p acowork-platform-contract --no-default-features -e features --edges no-dev` and confirm no
+`serde_core feature "std"` edge in the lib graph (`--edges no-dev` matters — the `serde_json`
+dev-dependency will otherwise mislead you).
+
+### Android side (not started)
+
+The cross-compilation, JNI, and `.so` packaging pipeline does not exist yet, so the exact NDK version and
+target triple are not pinned.
+
+**Do not build it from scratch**: upstream `apps/acowork-mobile` already has a working Tauri v2 Android
+build (its `Cargo.toml` carries a `cfg(target_os = "android")` section and a `jni` dependency). Take its
+NDK version, target triple, and packaging steps as the baseline and adjust. This is the "existing facts
+left unused" item under B4 in the assessment.
 
 ## Contributing
 

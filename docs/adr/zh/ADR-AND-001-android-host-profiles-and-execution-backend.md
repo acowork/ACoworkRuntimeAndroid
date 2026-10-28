@@ -3,7 +3,7 @@
 - **状态**：**部分 Accepted** —— §1–§6（三档宿主、一个引擎、工具级提权、`ExecutionBackend` 契约）有效并已落地 P0；⚠️ **§7.1 与 §7.4 待与上游对齐**，二者被晚于本 ADR 的上游文档推翻，详见下方「上游冲突」与 [开发就绪度评估](../../review/zh/2026-10-28-readiness-assessment.md) B1/B2。
 - **日期**：2026-10-20（原标 `2026-05-15` 有误：正文引用了 2026-09-13 才创建的 ADR-075、2026-10-05 的 ADR-087、2026-10-09 的 ADR-090，该日期不可能成立）
 - **相关**：[README.md](../../../README.md)、上游 `docs/design/zh/12-tool-system.md`（平台支持矩阵与运行时平台检测）、上游 `core/acowork-runtime/src/tools/builtin/shell.rs`（多 shell 注册范式）、上游 ADR-087（node/agent 归属与门控）、上游 `docs/design/zh/30-runtime-protocol-and-pluggable-engine.md`（能力注册表与可插拔引擎，**v0.2 直接点名本 ADR**）、session 参数 `shellApprovalThreshold` / `approvalTimeoutSecs`
-- **实现**：P0 已交付 —— `crates/acowork-android/src/host/`（探测解析器、capability 推导、`ExecutionBackend` 契约、门控、`avc` 回灌），115 测试通过，clippy `-D warnings` 零告警
+- **实现**：P0 已交付，并按 [ADR-AND-002](ADR-AND-002-platform-contract-layer.md) 拆成两层 —— 规则在 `crates/acowork-platform-contract/`（平台中立，只依赖 serde，可在裸机 target 编译），Android 的事实与机制在 `crates/acowork-android/src/host/`（探测解析器、capability 取值、`su -c` 包装、`avc` 回灌）。248 测试通过，clippy `-D warnings` 零告警。本 ADR §7.1/§7.4 的门控落点已从 `backend.rs` 迁至契约层 `gate.rs`，§4.4 的权限描述已细化为四轴 `CapabilitySpec`——**决策内容不变**，详见 ADR-AND-002 §4
 - **EN mirror**：待补 `docs/adr/en/`（上游 `AGENTS.md:142` 要求中英 ADR 同一 commit 更新；本仓库尚未采用该约定，见评估 B7）
 
 > ### ⚠️ 上游冲突（2026-10-28 核对）
@@ -15,7 +15,7 @@
 > | design 30 v0.2 §6.2 / §9 | 2026-10-24 | 「新增能力的唯一路径是注册表 PR」「能力是布尔开关，不带参数」；并明确要求本 ADR §7.1 的能力上报「**应改为**同一份能力注册表的一个来源」 |
 > | ADR-087 v3 D1/D5 | 2026-10-28 | 「执行点 = Gateway 反代入口，Runtime 不引入 owner 概念」「owner 不进 MQTT proto，Node 不感知用户」——与本 ADR §7.4「设备本地判定请求者是 node owner」及 §7.1「Gateway 不做门控判定」不能同时成立 |
 >
-> **已采用的解法**（见评估 B1/B2）：把 §7.4 的合取项拆成两个权威——Gateway 判*归属*（下发不透明布尔裁决，设备看不到 owner 身份，满足 ADR-087 D1/D5），设备判*本地就绪*（`dangerous-mode` ∧ 写锁 ∧ 探测事实），最终合取在设备侧的 `authorize` 完成。capability 则保留为本仓库自己的领域类型，不绑定上游 `Permission` 封闭 enum；到最终注册表的映射层待 B2 裁定后再建，因此裁定倒向任一边都只需改一个文件。
+> **已采用的解法**（见评估 B1/B2）：把 §7.4 的合取项拆成两个权威——Gateway 判*归属*（下发不透明布尔裁决，设备看不到 owner 身份，满足 ADR-087 D1/D5），设备判*本地就绪*（`dangerous-mode` ∧ 写锁 ∧ 探测事实），最终合取在设备侧完成（原 `authorize`，现为契约层 `Gate::decide`，见 [ADR-AND-002](ADR-AND-002-platform-contract-layer.md) §4）。capability 则保留为本仓库自己的领域类型，不绑定上游 `Permission` 封闭 enum；到最终注册表的映射层待 B2 裁定后再建，因此裁定倒向任一边都只需改一个文件。
 >
 > 影响面：**仅 P3 写档**。P0/P1/P2 只读档不触及 owner 门控，不受阻塞。
 
@@ -278,6 +278,9 @@ exec {
 - **不抢占**：抢占会打断他人的写序列（prop 改了一半、文件备份了但没写完），产生比死锁更难恢复的中间状态。宁可拒绝服务，不可破坏一致性。
 - **进程内单点**：一台设备一个 Node Agent，串行点天然存在，引入分布式锁是纯粹的过度设计。
 
+> **实现落点补注（2026-10-29，见 [ADR-AND-002](ADR-AND-002-platform-contract-layer.md)）**：本节语义已拆成两层。TTL、不排队、不抢占、过期回收是**平台无关规则**（R11），落在契约层 `exec::ResourceLock`；「持有者是 session」和「错误里含持有者标识」是**端口概念**——契约层的锁没有身份，因为 session 在别的平台上未必存在。Android 侧 `SessionWriteLock` 包一层契约锁，只加 session 身份。
+> 这个拆分正是本节「拿不到锁要含持有者标识」这条要求逼出来的：契约锁若自带身份，就等于把 Android 的 session 模型强加给 ESP32。
+
 ### 7.3 dangerous-mode 是否需要 APK UI 开关 → **不做，首版仅 CLI flag**
 
 - 形态：`--dangerous-mode` CLI flag + 环境变量兜底（供 CI 使用），**每次会话显式开启**，不做持久化配置。
@@ -288,7 +291,9 @@ exec {
 > ⚠️ **本节按字面不可实现，已改为两权威分解**（评估 B1）：ADR-087 D1/D5 规定 owner 真相只存 Gateway、不进 MQTT proto、「Runtime 不引入 owner 概念」，因此设备本地无法评估「请求者是 node owner」这一合取项。
 > **保留的**：双条件与、默认拒绝、无主设备一律不开放、fail-closed。
 > **修订的**：归属条件由 Gateway 判定并下发**不透明布尔裁决**（`AttributionVerdict`，不含 user id / owner 名 / 角色），设备侧只判本地就绪并完成合取。布尔裁决不是用户身份，故 ADR-087「Node 不感知用户」依然成立；最终放行仍在设备，故本节立场也成立。
-> 落点：[backend.rs](../../../crates/acowork-android/src/host/backend.rs) 的 `authorize`；测试 `system_tier_needs_both_dangerous_mode_and_attribution`、`unowned_node_never_opens_the_system_tier_even_when_rooted_and_flagged`。
+> 落点：契约层 [gate.rs](../../../crates/acowork-platform-contract/src/gate.rs) 的 `Gate::decide`（原 `backend.rs` 的 `authorize` 已按 [ADR-AND-002](ADR-AND-002-platform-contract-layer.md) §4 上移，这是 R7 的执行点）。
+> 测试：`r7_the_conjunction_happens_on_the_device_and_neither_authority_suffices`（双条件与 + fail-closed，含「问不到控制面不等于同意」）、`r7_the_attribution_verdict_carries_no_identity`（ADR-087 D1/D5：裁决不含身份）、`r7_a_verdict_cannot_be_replayed_against_a_higher_tier`（裁决按档定域，`use` 档不能用于 `manage` 档）、`system_tier_is_refused_on_the_termux_baseline_because_the_fact_is_missing`。均在 [rules_conformance.rs](../../../crates/acowork-android/tests/rules_conformance.rs) 与 [host_profile_contract.rs](../../../crates/acowork-android/tests/host_profile_contract.rs)。
+> 原引的 `system_tier_needs_both_dangerous_mode_and_attribution` / `unowned_node_never_opens_the_system_tier_even_when_rooted_and_flagged` 两个测试名已在重排中被上述测试取代。
 
 ```
 放行 = 设备本地开关（dangerous-mode 已开） ∧ 归属门控（请求者是 node owner）

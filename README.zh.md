@@ -123,16 +123,33 @@ user 版上 `/system` 依然有 verity 保护且只读；`/system/bin/sh` 是 mk
 侧的发布节奏与桌面侧解耦。**最终目标是形成一条干净的上游回流路径** —— 平台相关代码应收敛在 trait 之后，
 待移植稳定后，能够以较小的改动成本与上游对齐。
 
+### 但 Android 只是第一个端口
+
+ACowork 的目标是**多平台 node 接入**：Android 之后还有 ESP32 一类的嵌入式设备。这些平台之间
+**没有统一的执行模型**——ESP32 没有进程、没有 POSIX 文件系统、没有 MMU、没有 SELinux、没有 `std`，
+甚至可能没有原子指令。所以不存在「统一实现」，但可以存在**统一规则**。
+
+这就是 `crates/acowork-platform-contract` 的职责：它固定任何 node 都必须满足的十三条规则（R1–R13），
+只依赖 `serde`，可在裸机 target 上编译。Android 层则只负责**这台设备实测是什么、命令怎么跑**。
+判据是一句话：换一个平台，契约层一行不改，Android 层全部重写。
+
+Android「打样」的交付物因此不只是能跑的代码，而是
+[`tests/rules_conformance.rs`](crates/acowork-android/tests/rules_conformance.rs)——逐条证明 R1–R13
+的测试套件。第二个端口复制这个文件、保留规则名、替换 fixture 即可；某条规则在该平台不适用时要
+**显式说明**而非删除，让「缺席」成为有记录的决定。详见
+[ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md)。
+
 ## 仓库结构
 
-🚧 *规划中* —— 下面是预期形态，而非当前已存在的内容。
+`crates/` 下两个库**已存在并可构建可测试**；`crates/acowork-android-cli` 与 `apps/android` 仍是 🚧 *规划中*。
 
 ```mermaid
 graph TD
     subgraph Repo["ACoworkRuntimeAndroid"]
-        Lib["crates/acowork-android<br/>共享的、平台无关的 Agent 引擎"]
-        Cli["crates/acowork-android-cli<br/>命令行二进制：acowork-android"]
-        App["apps/android<br/>APK：前台服务 + 界面"]
+        Contract["crates/acowork-platform-contract<br/>✅ 平台中立规则层：只依赖 serde，可在裸机 target 编译"]
+        Lib["crates/acowork-android<br/>✅ Android 的事实与机制：探测、capability 取值、su 包装、avc 回灌"]
+        Cli["crates/acowork-android-cli<br/>🚧 命令行二进制：acowork-android"]
+        App["apps/android<br/>🚧 APK：前台服务 + 界面"]
     end
     Node["Node Agent 层<br/>注册 / 进程表 / 包仓库"]
     Rt["Runtime 层<br/>LLM 循环 / 记忆 / 工具"]
@@ -140,6 +157,7 @@ graph TD
 
     Cli --> Lib
     App --> Lib
+    Lib --> Contract
     Lib --> Node
     Lib --> Rt
     Node --> Gw
@@ -148,9 +166,11 @@ graph TD
 
 | 路径 | 内容 |
 |------|------|
-| `crates/` | 两个版本共用的 Rust crate —— 适配 Android 的 runtime + node 引擎。 |
-| `apps/` | APK 应用（Gradle 工程，Kotlin/Java 外壳，前台服务）。 |
-| `docs/` | 设计说明、平台笔记与移植取舍记录 —— 见 [ADR-AND-001](docs/adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md)（宿主档与权限模型）与 [android-host-probe.md](docs/design/zh/android-host-probe.md)（启动能力探测）。 |
+| `crates/acowork-platform-contract/` | **平台中立的规则层**：能力四轴、探测证据纪律、执行信封、授权闸门、反馈原语。只依赖 `serde`，`no_std + alloc` 可编译。任何平台（Android、ESP32、后续端口）挂进集群都要满足这里的 R1–R13。见 [ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md)。 |
+| `crates/acowork-android/` | **Android 的事实与机制**：探测哪些命令、输出怎么解析、五个 `android:*` 能力的四轴取值、`su -c` 包装、`avc: denied` 回灌。判据是「换一个平台，契约层一行不改，这里全部重写」。 |
+| `crates/`（规划） | 两个版本共用的其余 Rust crate —— 适配 Android 的 runtime + node 引擎。 |
+| `apps/`（规划） | APK 应用（Gradle 工程，Kotlin/Java 外壳，前台服务）。 |
+| `docs/` | 设计说明、平台笔记与移植取舍记录 —— 见 [ADR-AND-001](docs/adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md)（宿主档与权限模型）、[ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md)（平台契约层）、[android-host-probe.md](docs/design/zh/android-host-probe.md)（启动能力探测）与 [开发就绪度评估](docs/review/zh/2026-10-28-readiness-assessment.md)（与上游的冲突核对）。 |
 
 ## 与上游的关系
 
@@ -167,10 +187,11 @@ graph TD
 | # | 范围 | 状态 |
 |---|------|------|
 | 1 | 仓库骨架、许可证与本 README | 🚧 进行中 |
-| 2 | 共享 crate：把 node + runtime 引擎抽取到平台 trait 之后 | ⛔ **阻塞（B3）** —— 上游 design 30 §5 与 §9 对「Android 引擎是编进 `acowork-runtime` 的 crate，还是依赖已发布 Host crate 的独立引擎」给出两种答案，且后者依赖的契约 crate 尚不存在 |
+| 2 | 共享 crate：把 node + runtime 引擎抽取到平台 trait 之后 | ⛔ **阻塞（B3）** —— 上游 design 30 §5 与 §9 对「Android 引擎是编进 `acowork-runtime` 的 crate，还是依赖已发布 Host crate 的独立引擎」给出两种答案，且后者依赖的契约 crate 尚不存在。⚠️ 注意本项阻塞的是**引擎**归属；**宿主规则层**已按 #5a 独立交付，不受 B3 裁定影响 |
 | 3 | 命令行版本在 Termux 下运行，并注册到真实 Gateway | ⬜ 计划中（依赖 #2） |
 | 4 | App 版本：前台服务、受作用域存储、保活 | ⛔ **阻塞（B4）** —— 与上游 `apps/acowork-mobile`（Tauri v2 Android APK，design 25 / ADR-086）形态撞车而定位相反，归属未裁定 |
-| 5 | `ExecutionBackend` trait + 启动时 HostProfile 能力探测 | ✅ **已交付**（P0）—— `crates/acowork-android/src/host/`，115 测试通过 |
+| 5 | `ExecutionBackend` trait + 启动时 HostProfile 能力探测 | ✅ **已交付**（P0）—— `crates/acowork-android/src/host/` |
+| 5a | **平台中立契约层** `acowork-platform-contract`：R1–R13 规则 + 逐条一致性测试（为 ESP32 等后续端口打样） | ✅ **已交付** —— 249 测试通过，裸机 target 编译通过，见 [ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md) |
 | 6 | 电池 / Doze 调优与长跑稳定性测试 | ⬜ 计划中 |
 | 7 | 发布产物（Termux 包 + 签名 APK） | ⬜ 计划中（依赖 #2/#4；NDK 管线可复用上游 `apps/acowork-mobile`） |
 | 8 | `root-shell` 宿主档，**仅只读能力**（`logcat` / `dumpsys` / `getprop`） | 🚧 **可开工** —— 契约与门控已就绪，待两个 backend 实现 + 真机验证 |
@@ -189,19 +210,28 @@ graph TD
 
 ### 宿主侧（当前可构建的部分）
 
-`crates/acowork-android` 是纯 Rust 库，不含平台相关代码，可在任意宿主上构建与测试：
+两个 crate 都是纯 Rust 库，不含平台相关代码，可在任意宿主上构建与测试：
 
 ```bash
 cargo build                                        # 构建
-cargo test                                         # 115 个测试（98 单元 + 17 契约）
+cargo test                                         # 249 个测试（契约层 82 + Android 单元 101 + 契约 23 + 规则一致性 43）
 cargo clippy --all-targets -- -D warnings          # 上游 CI 约定，须零告警
 cargo fmt --check
 ```
 
-工具链对齐上游 `core/Cargo.toml`：edition 2024、rust-version 1.95、`async-trait` 0.1.92。
-该 crate **刻意不依赖** `acowork-runtime` / `acowork-core` —— 上游 design 30 §9 自己指出
-「`ExecutionBackend` 在引擎内部，EIP 在引擎外部」，二者正交；保持零引擎依赖使本 crate 在
-B3 的两种裁定下同时成立（既可折进上游作为模块，也可作为独立 crate 被消费）。
+规则层还要在**裸机 target** 上过一遍——这是 R12（契约不预设任何 OS 设施）的硬门，不是可选检查：
+
+```bash
+rustup target add riscv32imc-unknown-none-elf      # 32 位 RISC-V，无 OS，且无原子指令
+cargo build  -p acowork-platform-contract --no-default-features --target riscv32imc-unknown-none-elf
+cargo clippy -p acowork-platform-contract --no-default-features --target riscv32imc-unknown-none-elf -- -D warnings
+```
+
+选 `imc` 而非 ESP32 实际的 `imac`，是因为它**少一项设施**（无 `a` 扩展 → 无原子指令），因而是更严格的检验。代价是 `ResourceLock` 在该 target 上按 `target_has_atomic = "ptr"` 条件编译掉——R11 的语义仍是强制的，只是无原子的单核目标由端口自带临界区。详见 [ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md) §5.2。
+
+工具链对齐上游 `core/Cargo.toml`：edition 2024、rust-version 1.95、license Apache-2.0。
+
+**依赖纪律**：`acowork-platform-contract` 只依赖 `serde`（`default-features = false` + `alloc`/`derive`），连 `async-trait` 都不用——异步靠 `core::future::Future` + GAT 关联 future 类型，不装箱。`acowork-android` 的唯一非 serde 依赖就是契约层。二者都**刻意不依赖** `acowork-runtime` / `acowork-core`：上游 design 30 §9 自己指出「`ExecutionBackend` 在引擎内部，EIP 在引擎外部」，二者正交；保持零引擎依赖使本仓库在 B3 的两种裁定下同时成立。这现在是**结构保证**而非约定——可用 `cargo tree -p acowork-platform-contract --no-default-features -e features --edges no-dev` 复核 lib 依赖图里没有 `serde_core feature "std"` 边（必须带 `--edges no-dev`，否则 dev-dependency `serde_json` 会误导）。
 
 ### Android 侧（尚未开始）
 

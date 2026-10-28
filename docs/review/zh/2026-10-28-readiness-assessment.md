@@ -1,9 +1,10 @@
 # 开发就绪度评估 —— ADR-AND-001 与上游的一致性核对
 
 - **日期**：2026-10-28
-- **范围**：[README.zh.md](../../../README.zh.md)、[ADR-AND-001](../../adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md)、[android-host-probe.md](../../design/zh/android-host-probe.md)
+- **范围**：[README.zh.md](../../../README.zh.md)、[ADR-AND-001](../../adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md)、[ADR-AND-002](../../adr/zh/ADR-AND-002-platform-contract-layer.md)（2026-10-29 新增）、[android-host-probe.md](../../design/zh/android-host-probe.md)
 - **核对基准**：上游 `AgentCowork` @ `0b5e8f14`（2026-10-28）
 - **结论**：**文档质量高，但有 3 条硬阻塞（B1/B2/B3）需上游裁定。** P0 只读切片不被阻塞，已交付并通过验收判据。
+  > **2026-10-29 更新**：**B3 的影响面已收窄，但未消除。** 规则层抽成只依赖 `serde` 的独立 crate 后，「引擎归属形态二义」无论上游怎么裁定都**不波及规则层**，且这是结构保证（裸机 target 编译 + lib 依赖图无 std 边）而非约定。但 B3 二义的本来就是*引擎*（node + runtime）的归属，README 路线图 #2 的引擎抽取**仍然阻塞**——契约层解决的是宿主规则，不是引擎归属。B1 的解法已在契约层落地为规则 R7 并有测试钉住，仍待上游评审以确认 §7.1 的字面修订。B2（词汇表所有权）**仍是唯一未解的硬阻塞**。
 
 ---
 
@@ -53,7 +54,11 @@
 
 设备收到的是**不透明布尔裁决**，不含 user id / owner 名 / 角色。这既满足 ADR-087「Node 不感知用户」（布尔量不是用户），又保留 ADR-AND-001「最终合取在设备评估」（探测事实在设备）。两个权威互不重复，因此不存在第二处会漂移的真相。
 
-**这确实修订了 §7.1 的字面表述**：Gateway 做*归属*判定，不做*能力*判定。落点：[backend.rs](../../../crates/acowork-android/src/host/backend.rs) 的 `AttributionVerdict` / `AuthorizationContext` / `authorize`。
+**这确实修订了 §7.1 的字面表述**：Gateway 做*归属*判定，不做*能力*判定。
+
+> **落点已迁移（2026-10-29，[ADR-AND-002](../../adr/zh/ADR-AND-002-platform-contract-layer.md) §4）**：原写在 [backend.rs](../../../crates/acowork-android/src/host/backend.rs) 的 `AttributionVerdict` / `AuthorizationContext` / `authorize` 已上移到契约层 [gate.rs](../../../crates/acowork-platform-contract/src/gate.rs)，成为 `AttributionVerdict` / `LocalReadiness` / `Gate::decide`，即规则 **R7** 的执行点。
+> 迁移的理由与本节的分析同源：B1 的冲突源于上游两份文档在回答**不同的问题**（谁能请求 vs 此刻什么可行），而「不同的问题」是平台无关的——把它留在 Android 层，第二个端口就得自己再推导一遍同样的分解。
+> 解法内容**未变**，并由 `r7_the_conjunction_happens_on_the_device_and_neither_authority_suffices`、`r7_the_attribution_verdict_carries_no_identity`、`r7_a_verdict_cannot_be_replayed_against_a_higher_tier` 三个测试钉住。
 
 ### B2 —— capability 词汇表所有权已被上游收走，N4「协议契约不变」不成立
 
@@ -87,6 +92,10 @@ Android 到底是「编进上游 runtime 的 crate」还是「依赖已发布 Ho
 #### 已采用的解法：本 crate 零依赖引擎
 
 design 30 §9 自己说「`ExecutionBackend` 在**引擎内部**，EIP 在**引擎外部**」，二者正交。因此本 crate 只依赖 `serde` + `async-trait`，**不依赖** `acowork-runtime` / `acowork-core`。这使它在方案 A 与方案 D 下**同时成立**：既可折进上游作为模块，也可作为独立 crate 被消费。B3 的二义性因此不必在 P0 之前解决。
+
+> **已进一步加强（2026-10-29，[ADR-AND-002](../../adr/zh/ADR-AND-002-platform-contract-layer.md) §2.3）**：规则层被抽成独立 crate `acowork-platform-contract`，依赖**只有 `serde`**——连 `async-trait` 也去掉了，异步改用 `core::future::Future` + GAT 关联 future 类型（不装箱）。
+> 这不是洁癖：`async-trait` 会把返回类型装箱成 `Pin<Box<dyn Future + Send>>`，既假定 `std` 又强制 `Send`，裸机端要为此付出堆分配和一个它用不上的约束。去掉它之后契约层能在 `riscv32imc-unknown-none-elf`（无 OS、无原子指令）上编译通过。
+> 对 B3 的影响：原来「零依赖引擎」是**约定**（靠 code review 维持），现在是**结构保证**——`cargo tree --edges no-dev` 的 lib 依赖图里没有 `serde_core feature "std"` 边，且裸机 target 编译是硬门。B3 的二义性因此不仅不必在 P0 前解决，**无论上游怎么裁定都不会波及规则层**。
 
 ---
 
@@ -204,14 +213,20 @@ ADR §7.4 只裁定了 `fs:system` 与 `selinux:permissive` 两条需要 owner �
 
 ## 6. 建议的下一步
 
-| 优先级 | 动作 | 归属 |
-|---|---|---|
-| P0 | 把 B1 的「两权威」方案与 B2 的注册表提案提交上游评审 | 需上游 |
-| P0 | 修正 ADR 日期、把 §7.1/§7.4 标注为待对齐 | 本仓库 |
-| P1 | 与 mobile app 负责人对齐 B4 的 APK 形态归属 | 需产品 |
-| P1 | 回写 probe §3（B8 `dialects`、B12 shell 前置条件）与 §4（B10 ledger） | 本仓库 |
-| P2 | 实现 `TermuxBackend` + `RootShellBackend`（P1 只读档），真机跑通 getprop / dumpsys / logcat | 本仓库，不被阻塞 |
-| P2 | 补 B5 的上游平台矩阵改动、B6 的 spawn 契约方案 | 需上游 |
-| P3 | 写档（依赖 B1 裁定） | 阻塞中 |
+> **2026-10-29 更新**：本表原列的两项本仓库动作已完成，另新增契约层相关两项。已完成项保留在表内并标注，便于核对。
 
-**可以立刻继续的**：P1 只读档的两个 backend 实现。它不触及 owner 门控（B1 只影响写档）、不触及 Gateway 契约（只读命令本地放行）、不依赖引擎归属（B3 已被零依赖设计规避）。
+| 优先级 | 动作 | 归属 | 状态 |
+|---|---|---|---|
+| P0 | 把 B1 的「两权威」方案与 B2 的注册表提案提交上游评审 | 需上游 | ⬜ 待提交（B1 方案已在契约层落地为 R7，提交时可直接附 `r7_*` 测试作为可执行说明） |
+| P0 | 修正 ADR 日期、把 §7.1/§7.4 标注为待对齐 | 本仓库 | ✅ 已完成 |
+| P1 | 与 mobile app 负责人对齐 B4 的 APK 形态归属 | 需产品 | ⬜ 未开始 |
+| P1 | 回写 probe §3（B8 `dialects`、B12 shell 前置条件）与 §4（B10 ledger） | 本仓库 | ✅ 已完成（2026-10-29） |
+| — | 抽出平台中立契约层，使规则不绑在 Android 上（规避 B3、为第二个端口打样） | 本仓库 | ✅ 已完成 —— [ADR-AND-002](../../adr/zh/ADR-AND-002-platform-contract-layer.md)，248 测试 |
+| — | 在真实嵌入式 target 上验证 R12（ESP32-C3 `riscv32imac-unknown-none-elf` 或 `riscv32imac-esp-espidf`） | 本仓库 | ⚠️ 部分 —— 已在更严格的 `riscv32imc`（无原子）上编译通过；`imac` 与 ESP-IDF 的 rust-std 组件下载被网络策略阻断 |
+| P2 | 实现 `TermuxBackend` + `RootShellBackend`（P1 只读档），真机跑通 getprop / dumpsys / logcat | 本仓库，不被阻塞 | ⬜ 未开始 |
+| P2 | 补 B5 的上游平台矩阵改动、B6 的 spawn 契约方案 | 需上游 | ⬜ 未开始 |
+| P3 | 写档（依赖 B1 裁定） | 阻塞中 | ⬜ 阻塞中 |
+
+**可以立刻继续的**：P1 只读档的两个 backend 实现。它不触及 owner 门控（B1 只影响写档）、不触及 Gateway 契约（只读命令本地放行）、不依赖引擎归属（B3 已被零依赖设计规避，且现在是结构保证而非约定）。
+
+**新增的一条**：`crates/acowork-android/tests/rules_conformance.rs` 是第二个端口的**模板**，不是普通测试文件。任何新平台接入时应复制它、保留 `r1_*`…`r13_*` 命名、替换 fixture；某条规则在该平台不适用时要显式说明而非删除。详见 ADR-AND-002 §3。
