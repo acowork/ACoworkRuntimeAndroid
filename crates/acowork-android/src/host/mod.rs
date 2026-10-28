@@ -12,17 +12,17 @@
 //!     F --> PR["profile<br/>HostProfile aggregate"]
 //!     PR --> C["capability<br/>facts → capabilities"]
 //!     C --> PR
-//!     PR --> B["backend<br/>ExecutionBackend + gate"]
+//!     PR --> B["backend<br/>ExecutionBackend  gate"]
 //!     B --> D["denial<br/>stderr → next step"]
 //! ```
 //!
 //! | Layer | Module | Responsibility | Purity |
 //! |---|---|---|---|
 //! | Data model | [`facts`] | One type per probed fact, plus its text parser | Pure — no I/O |
-//! | Collection | [`probe`] | Which commands to run, the budget, routing results | Contract + routing |
+//! | Collection | [`probe`] | Which commands to run, the budget, routing results | Contract  routing |
 //! | Aggregate | [`profile`] | Assemble facts into the session-immutable `HostProfile` | Pure |
 //! | Derivation | [`capability`] | Capabilities as a function of facts, never of config | Pure |
-//! | Contract | [`backend`] | `ExecutionBackend`, and the gate that composes both authorities | Pure gate + async trait |
+//! | Contract | [`backend`] | `ExecutionBackend`, and the gate that composes both authorities | Pure gate  async trait |
 //! | Feedback | [`denial`] | `avc: denied` → an actionable next step | Pure, plus a session ledger |
 //!
 //! Keeping the parsers pure is not tidiness for its own sake: it is what makes the
@@ -50,6 +50,8 @@ pub mod denial;
 pub mod facts;
 pub mod probe;
 pub mod profile;
+pub mod script;
+pub mod spawn;
 
 pub use backend::{
     ApprovalToken, BackendError, ContractBackend, DEFAULT_OUTPUT_CAP, DEFAULT_READ_TIMEOUT,
@@ -63,10 +65,18 @@ pub use denial::{DenialLedger, SelinuxClassifier, SelinuxDenial, classify, parse
 pub use facts::{
     AppletSet, BuildType, DeviceFacts, FsRoot, MountEntry, Privilege, SelinuxDomain, SelinuxState,
     ShellDialect, SuProbe, VerityState, parse_bool_prop, parse_mount_table, parse_prop,
-    parse_su_probe,
+    parse_su_probe, su_helper_missing, su_prompt_denied,
 };
 pub use probe::{
     CommandOutput, PROBE_ITEM_TIMEOUT, PROBE_TOTAL_BUDGET, ProbeCommand, ProbeError, ProbeOutput,
     ProbeRunner, SPOT_CHECK_APPLETS, all_commands, run_probe,
 };
-pub use profile::{HostCapabilitySummary, HostProfile, HostProfileName};
+pub use profile::{HostCapabilitySummary, HostProfile, HostProfileName, ShellPaths};
+pub use script::{
+    Identity, PreparedScript, ScriptError, extract_identity, is_valid_env_key, next_nonce,
+    nonce_of, prepare, quote_posix,
+};
+pub use spawn::{
+    DynamicSpawnRunner, ProcessSpawnRunner, RawOutput, ScriptedSpawnRunner, SpawnError,
+    SpawnInvocation, SpawnRunner, scripted_output,
+};

@@ -17,8 +17,17 @@ rust-version.workspace = true
 # make every embedded consumer carry `serde/std`.
 acowork-platform-contract = { workspace = true, features = ["std"] }
 async-trait.workspace = true
-serde.workspace = true
+# Only `host::spawn::ProcessSpawnRunner` needs a runtime, and only because starting a
+# process without blocking an async task needs an async pipe reader. Everything else in
+# this crate is `Pin<Box<dyn Future>>`-clean and would compile without tokio; the feature
+# list is the minimum for that one type. A port that supplies its own `SpawnRunner` (over
+# adb, or a blocking thread) does not need this dependency at all.
+tokio.workspace = true
+# `std` because Android is a std platform and the models here are stored, logged and put on
+# the wire as owned `String`s. The workspace default is `no_std`; opting in is deliberate.
+serde = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
 serde_json.workspace = true
 tokio.workspace = true
+

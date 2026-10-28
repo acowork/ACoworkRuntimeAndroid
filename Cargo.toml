@@ -17,6 +17,21 @@ rust-version = "1.95"
 [workspace.dependencies]
 acowork-platform-contract = { path = "crates/acowork-platform-contract", default-features = false }
 async-trait = "0.1.92"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = { version = "1.0", features = ["preserve_order"] }
+# `default-features = false` at the root, so a port that writes `serde.workspace = true` gets a
+# `no_std` serde and has to opt in to `std` on purpose. `acowork-android` does opt in, and says
+# why at its own declaration.
+#
+# This is hardening, not a bug fix. The bare-metal build was broken once during this change and
+# the cause was the command, not the graph: `acowork-platform-contract` carries `std` in its own
+# default features, so `cargo build -p acowork-platform-contract --target
+# riscv32imc-unknown-none-elf` compiles serde_core with `--cfg feature="std"` and fails. The
+# verification command is the one with `--no-default-features`, and a counterfactual run with the
+# previous serde_json declaration passed it too — the workspace defaults were never the leak.
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+# Alloc-only. `preserve_order` was set here and reached two tests that asserted a JSON
+# object's key *order* — a serialisation detail, not an invariant — so dropping it meant
+# changing those two assertions to compare keys as a set, which is what they should have
+# measured anyway: with `preserve_order` off, serde_json's `Value` is a BTreeMap and the keys
+# come out sorted. It also took indexmap, hashbrown and foldhash out of every test build.
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "time", "process", "io-util", "sync"] }
