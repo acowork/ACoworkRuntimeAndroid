@@ -1,0 +1,21 @@
+[package]
+name = "acowork-platform-contract"
+description = "Platform-neutral host contract for ACowork node ports: capability model, probe lifecycle, execution envelope and the authorization gate. Zero dependency on the acowork monorepo."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["std"]
+# `std` does two things and only two: it drops the crate-level `#![no_std]`, and it
+# turns on `serde/std`. The crate's own code is `alloc`-only either way — its error
+# types implement `core::error::Error`, which is the same trait `std` re-exports, so
+# nothing is lost by turning this off. A bare-metal port turns it off; see rule R12.
+std = ["serde/std"]
+
+[dependencies]
+serde = { version = "1.0", default-features = false, features = ["alloc", "derive"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }

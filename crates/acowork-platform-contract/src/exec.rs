@@ -1,0 +1,659 @@
+//! The execution contract: uniform rules, port-shaped mechanisms.
+//!
+//! # R10 — the request shape belongs to the port
+//!
+//! An earlier draft of this contract carried `ExecRequest { script, cwd, env }`.
+//! That is a POSIX request: it assumes a shell to interpret `script`, a filesystem
+//! with directories, and a process environment. An ESP32 has none of the three — it
+//! has an RPC dispatch table and a fixed firmware image.
+//!
+//! So the contract does not define a request. [`ExecutionBackend::Request`] is an
+//! associated type and each port fills it in: Android keeps a script, a working
+//! directory and an environment; a microcontroller carries a service name, a method
+//! and arguments. What the contract requires instead is [`GateView`] — three
+//! accessors that let the gate do its job without knowing the shape.
+//!
+//! This is the difference between a uniform *scheme* and uniform *rules*. Forcing
+//! every platform through one request struct would have produced a lowest-common-
+//! denominator type that fits nothing well. Requiring every request to *answer* the
+//! same three questions produces rules that hold everywhere.
+//!
+//! # R11 — one mutating action at a time
+//!
+//! A device is a single physical thing. Two sessions writing to it concurrently is
+//! not a scheduling problem, it is a correctness problem, and the platform cannot
+//! fix it for us. [`ResourceLock`] serialises mutating capabilities with a TTL and
+//! **no queueing and no preemption**: a second caller is told to come back, not
+//! parked. Queueing would mean an unattended node silently accumulating a backlog of
+//! state changes against a device nobody is watching.
+//!
+//! The lock is driven by a caller-supplied timestamp rather than reading a clock,
+//! because `no_std` targets have no wall clock and a lock that cannot be tested
+//! deterministically is a lock nobody will test.
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::future::Future;
+// The lock below is the only part of this crate that needs target atomics, so the
+// import is gated with it. See `ResourceLock` for why, and for what a port without
+// atomics is expected to do instead.
+#[cfg(target_has_atomic = "ptr")]
+use core::sync::atomic::{AtomicUsize, Ordering};
+use core::time::Duration;
+
+use serde::{Deserialize, Serialize};
+
+use crate::capability::HostCapability;
+
+/// The three things the gate must be able to read off any request, whatever its
+/// shape (R10).
+///
+/// A port implements this on its own request type. Nothing else about the request is
+/// visible to the contract.
+pub trait GateView {
+    /// Which capability this invocation exercises. Drives every axis lookup.
+    fn capability(&self) -> &HostCapability;
+
+    /// The resource budget for this invocation.
+    fn budget(&self) -> &Budget;
+
+    /// How to undo it, when the capability is irreversible (R8).
+    ///
+    /// `None` is correct for reversible capabilities and is *rejected* for
+    /// irreversible ones — the gate makes that call from the capability spec, so a
+    /// port cannot forget it.
+    fn rollback_plan(&self) -> Option<&str> {
+        None
+    }
+}
+
+/// Resource limits for one invocation.
+///
+/// Both fields are mandatory in practice: an unbounded timeout on an unattended node
+/// is a hang, and an unbounded output cap is an OOM. The contract does not pick the
+/// numbers — a phone and a microcontroller differ by orders of magnitude — but it
+/// does require that there *are* numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Budget {
+    /// Wall-clock limit. `None` means "no limit", which a port should only use for
+    /// provably bounded calls.
+    pub timeout: Option<Duration>,
+    /// Maximum bytes of combined output to retain. Output beyond this is dropped and
+    /// [`ExecOutput::truncated`] is set, so a chatty command cannot exhaust memory.
+    pub output_cap: usize,
+}
+
+impl Budget {
+    /// A budget with no limits. Intended for tests and for provably bounded calls;
+    /// a production port should state real numbers.
+    pub fn unbounded() -> Budget {
+        Budget {
+            timeout: None,
+            output_cap: usize::MAX,
+        }
+    }
+}
+
+/// How an invocation ended.
+///
+/// Deliberately not POSIX. There is no `Signal` variant, because signals are a Unix
+/// concept; "the platform stopped it early" is the general idea and is what
+/// [`ExitStatus::Terminated`] means, whether the cause was `SIGKILL`, a watchdog
+/// reset or a radio timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExitStatus {
+    /// A numeric completion code. A POSIX exit status on Android; an RPC result code
+    /// on a microcontroller.
+    Code(i32),
+    /// The platform stopped the invocation before it completed.
+    Terminated,
+    /// This platform has no notion of a completion code.
+    NotApplicable,
+}
+
+impl ExitStatus {
+    /// True when the invocation ran to completion and reported success.
+    ///
+    /// `NotApplicable` counts as success: a platform without completion codes
+    /// signals failure by returning [`ExecutionError`] instead.
+    pub fn is_success(&self) -> bool {
+        matches!(self, ExitStatus::Code(0) | ExitStatus::NotApplicable)
+    }
+}
+
+/// One captured output stream.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ExecOutput {
+    /// The retained bytes. Not assumed to be UTF-8: a shell's stdout can be binary
+    /// and a radio's payload certainly is.
+    pub bytes: Vec<u8>,
+    /// True when [`Budget::output_cap`] cut this stream short.
+    pub truncated: bool,
+}
+
+impl ExecOutput {
+    /// The output as text, lossily. Convenience for ports whose output is textual.
+    pub fn as_text(&self) -> alloc::string::String {
+        String::from_utf8_lossy(&self.bytes).into_owned()
+    }
+
+    /// Append bytes, honouring the cap.
+    ///
+    /// Returns the number of bytes actually retained. A port calls this from its
+    /// reader loop; the cap is enforced here rather than in each port so that no port
+    /// can forget it.
+    pub fn push(&mut self, chunk: &[u8], cap: usize) -> usize {
+        let room = cap.saturating_sub(self.bytes.len());
+        let take = room.min(chunk.len());
+        self.bytes.extend_from_slice(&chunk[..take]);
+        if take < chunk.len() {
+            self.truncated = true;
+        }
+        take
+    }
+}
+
+/// Why an invocation could not be carried out.
+///
+/// Distinct from a non-zero [`ExitStatus`]: this is the backend failing to run the
+/// thing at all, not the thing failing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExecutionError {
+    /// The budget's timeout elapsed.
+    TimedOut,
+    /// The capability is not declared on this device, so there is no way to run it.
+    CapabilityUnavailable(HostCapability),
+    /// The backend itself could not be reached: helper missing, transport down.
+    BackendUnavailable(String),
+    /// The platform refused to start the invocation.
+    Rejected(String),
+}
+
+/// The result of one invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecOutcome {
+    /// How it ended, or why it could not be run.
+    pub result: Result<ExitStatus, ExecutionError>,
+    /// Captured standard output, or the port's equivalent success channel.
+    pub stdout: ExecOutput,
+    /// Captured standard error, or the port's equivalent diagnostic channel.
+    pub stderr: ExecOutput,
+}
+
+impl ExecOutcome {
+    /// An outcome for a backend-level failure, with the reason as stderr text so the
+    /// model sees something actionable (R9).
+    pub fn failed(error: ExecutionError) -> ExecOutcome {
+        // Build the message first, then move `error` into the result. Matching on
+        // `&error` and returning `Err(error)` from inside the arms would move a
+        // borrowed value.
+        let message = match &error {
+            ExecutionError::TimedOut => {
+                alloc::string::String::from("the invocation exceeded its time budget")
+            }
+            // Not an identifier leak: the capability ID is already in the reported
+            // summary, so the model is allowed to see it.
+            ExecutionError::CapabilityUnavailable(cap) => {
+                alloc::format!("capability `{cap}` is not available on this device")
+            }
+            ExecutionError::BackendUnavailable(what) => {
+                alloc::format!("execution backend unavailable: {what}")
+            }
+            ExecutionError::Rejected(why) => {
+                alloc::format!("the device refused this invocation: {why}")
+            }
+        };
+        ExecOutcome {
+            result: Err(error),
+            stdout: ExecOutput::default(),
+            stderr: ExecOutput {
+                bytes: message.into_bytes(),
+                truncated: false,
+            },
+        }
+    }
+
+    /// True when the invocation ran and reported success.
+    pub fn succeeded(&self) -> bool {
+        self.result.as_ref().is_ok_and(ExitStatus::is_success)
+    }
+}
+
+/// What a platform port must provide to run things.
+///
+/// The associated `Request` type is the point (R10): the contract never sees its
+/// fields, only its [`GateView`] answers. `ExecuteFuture` is an associated type
+/// rather than a boxed trait object for the same reason — a multi-threaded host binds
+/// it to a `Send` future, a single-threaded target does not have to, and neither is
+/// forced to pay for the other's constraint.
+pub trait ExecutionBackend {
+    /// The port's own request shape.
+    type Request: GateView;
+
+    /// The port's own future type.
+    type ExecuteFuture<'a>: Future<Output = ExecOutcome>
+    where
+        Self: 'a;
+
+    /// Run one invocation.
+    ///
+    /// Implementations may assume the gate has already run; the contract's
+    /// [`crate::gate`] is what calls this, and it does not call it on a refusal.
+    fn execute(&self, request: Self::Request) -> Self::ExecuteFuture<'_>;
+}
+
+/// Outcome of a lock attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LockOutcome {
+    /// The caller holds the lock and must release it.
+    Acquired,
+    /// Someone else holds it. No queueing, no preemption (R11).
+    Busy {
+        /// How long the current holder has had it.
+        held_for: Duration,
+        /// How long until the TTL expires it, if the holder never releases.
+        retry_after: Duration,
+    },
+}
+
+/// A single-flight lock over the device's mutating capabilities.
+///
+/// Lock-free and clock-free: the caller passes `now`, so the same code runs on a
+/// phone with a wall clock and on a target with only a tick counter, and tests can
+/// move time by hand.
+///
+/// Held state is one atomic timestamp in milliseconds, `0` meaning free. A TTL is
+/// required because an unattended node whose session died mid-write would otherwise
+/// wedge the device permanently — and "permanently" on a device nobody is looking at
+/// means until someone reboots it.
+///
+/// The timestamp is a `usize`, not a `u64`, because 32-bit targets — including the
+/// ESP32-class boards this contract exists to admit — have no 64-bit atomic. That
+/// makes the counter wrap (every ~49.7 days at millisecond resolution on a 32-bit
+/// `usize`), so every comparison here goes through [`elapsed_since`], which uses
+/// wrapping subtraction. Elapsed time stays correct across one wrap as long as it is
+/// much shorter than the wrap period; a TTL measured in minutes satisfies that by
+/// four orders of magnitude. On a 64-bit target the wrap is unreachable and the
+/// arithmetic degenerates to ordinary subtraction.
+///
+/// # Availability
+///
+/// Gated on `target_has_atomic = "ptr"`: the compare-exchange in [`Self::try_acquire`]
+/// is what makes two racing callers unable to both believe they won, and a target with
+/// no atomics cannot express it. Such targets do exist — `riscv32imc-unknown-none-elf`
+/// has no `a` extension, so `max_atomic_width` is 0 and this type does not compile
+/// there.
+///
+/// That is a limitation of the *implementation*, not of R11. A target without atomics
+/// is in practice a single-core target without preemptive threading, where mutual
+/// exclusion is either trivial or belongs in a critical section the port already has.
+/// Such a port still owes the R11 semantics — one mutating action at a time, no
+/// queueing, no preemption, a TTL so a dead session cannot wedge the device — and
+/// supplies its own mechanism. The contract states the rule; it does not claim that
+/// this particular lock-free encoding is the only way to satisfy it.
+#[cfg(target_has_atomic = "ptr")]
+#[derive(Debug)]
+pub struct ResourceLock {
+    ttl: Duration,
+    /// Acquisition time in ms since the caller's epoch, plus one; `0` means free.
+    held_since_ms: AtomicUsize,
+}
+
+/// The sentinel for "not held".
+///
+/// A real acquisition is stored as `now_ms + 1`, so a timestamp of exactly zero is
+/// unambiguous and the offset costs nothing but one `wrapping_sub` on read. Storing
+/// the raw timestamp instead would make "acquired at t=0" indistinguishable from
+/// "free", which is not a hypothetical: every test in this module starts at zero, and
+/// so does a target whose clock begins at boot.
+#[cfg(target_has_atomic = "ptr")]
+const FREE: usize = 0;
+
+/// Elapsed time between a stored acquisition and `now`.
+///
+/// Wrapping, not saturating: on a 32-bit target the caller's millisecond counter can
+/// roll over while the lock is held, and saturating subtraction would report the hold
+/// as zero-length — which would make it look expired and hand the lock to a second
+/// writer. `held` must not be [`FREE`].
+#[cfg(target_has_atomic = "ptr")]
+fn elapsed_since(held: usize, now: Duration) -> Duration {
+    let held_ms = held.wrapping_sub(1);
+    let now_ms = now.as_millis() as usize;
+    Duration::from_millis(now_ms.wrapping_sub(held_ms) as u64)
+}
+
+/// Encode an acquisition time for storage.
+///
+/// The `+1` offset is what makes [`FREE`] unambiguous, but it aliases exactly one
+/// input — a counter reading of `usize::MAX` — back onto the sentinel. That case is
+/// mapped to the largest representable hold instead. It then reads back one
+/// millisecond earlier than the truth, which is benign; reading back as `FREE` would
+/// admit a second writer, which is the one thing R11 forbids. The failure mode is
+/// deliberately chosen to be "stays locked", never "opens".
+///
+/// On a 64-bit target the aliased instant is unreachable in practice. On a 32-bit one
+/// it occurs for a single millisecond every ~49.7 days — rare, but a lock that fails
+/// once a month on a device nobody is watching is not a lock.
+#[cfg(target_has_atomic = "ptr")]
+fn stored_for(now: Duration) -> usize {
+    match (now.as_millis() as usize).wrapping_add(1) {
+        FREE => usize::MAX,
+        stored => stored,
+    }
+}
+
+#[cfg(target_has_atomic = "ptr")]
+impl ResourceLock {
+    /// A lock whose hold expires after `ttl`.
+    pub fn new(ttl: Duration) -> ResourceLock {
+        ResourceLock {
+            ttl,
+            held_since_ms: AtomicUsize::new(FREE),
+        }
+    }
+
+    /// The configured TTL.
+    pub fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
+    /// Try to take the lock at time `now`.
+    ///
+    /// Three outcomes, and only three:
+    /// - free → take it;
+    /// - held within its TTL → [`LockOutcome::Busy`]. **No queueing, no preemption**
+    ///   (R11): a live holder is never displaced, because two concurrent writers to
+    ///   one physical device is a correctness bug the platform cannot fix for us;
+    /// - held past its TTL → reclaim it. The previous holder is presumed dead, which
+    ///   is the only assumption that stops a crashed session from wedging a device
+    ///   nobody is watching.
+    ///
+    /// Implemented as a compare-exchange loop rather than a load-then-store: two
+    /// callers racing must not both believe they won. Each retry means another caller
+    /// changed the state, so the loop is lock-free — it always makes system-wide
+    /// progress even though an individual caller may spin.
+    pub fn try_acquire(&self, now: Duration) -> LockOutcome {
+        let now_ms = stored_for(now);
+        loop {
+            let held = self.held_since_ms.load(Ordering::Acquire);
+
+            if held == FREE {
+                return match self.held_since_ms.compare_exchange(
+                    FREE,
+                    now_ms,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => LockOutcome::Acquired,
+                    // Lost the race to another taker; re-read and take the Busy path.
+                    Err(_) => continue,
+                };
+            }
+
+            if !self.is_expired(held, now) {
+                let held_for = elapsed_since(held, now);
+                return LockOutcome::Busy {
+                    held_for,
+                    retry_after: self.ttl.saturating_sub(held_for),
+                };
+            }
+
+            // Expired. Reclaim only if the value is still the one we read: if another
+            // caller got there first, loop and report Busy against *their* hold.
+            return match self.held_since_ms.compare_exchange(
+                held,
+                now_ms,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => LockOutcome::Acquired,
+                Err(_) => continue,
+            };
+        }
+    }
+
+    /// Release the lock.
+    ///
+    /// Idempotent, and safe to call after the TTL has already reclaimed the hold:
+    /// releasing something you no longer hold must not free someone else's lock. A
+    /// caller that needs that guarantee should hold a guard rather than a timestamp —
+    /// the contract keeps this simple because the gate releases on every denial path
+    /// and a double release there is harmless.
+    pub fn release(&self) {
+        self.held_since_ms.store(FREE, Ordering::Release);
+    }
+
+    /// Who holds the lock at time `now`, and for how long.
+    pub fn holder(&self, now: Duration) -> Option<Duration> {
+        let held = self.held_since_ms.load(Ordering::Acquire);
+        if held == FREE || self.is_expired(held, now) {
+            return None;
+        }
+        Some(elapsed_since(held, now))
+    }
+
+    /// True when nothing is held at `now`.
+    pub fn is_free(&self, now: Duration) -> bool {
+        self.holder(now).is_none()
+    }
+
+    /// True when a hold has outlived the TTL. Only meaningful for a non-`FREE` value.
+    fn is_expired(&self, held: usize, now: Duration) -> bool {
+        elapsed_since(held, now) >= self.ttl
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    #[test]
+    fn output_cap_is_enforced_and_truncation_is_reported() {
+        let mut out = ExecOutput::default();
+        assert_eq!(out.push(b"hello", 8), 5);
+        assert!(!out.truncated);
+        assert_eq!(out.push(b"world", 8), 3);
+        assert!(
+            out.truncated,
+            "the caller must be able to tell output was cut"
+        );
+        assert_eq!(out.bytes, b"hellowor");
+        // Once at the cap, nothing more is retained.
+        assert_eq!(out.push(b"!", 8), 0);
+        assert_eq!(out.bytes.len(), 8);
+    }
+
+    #[test]
+    fn output_is_not_assumed_to_be_utf8() {
+        let mut out = ExecOutput::default();
+        out.push(&[0xff, 0xfe, 0x00], 16);
+        assert_eq!(out.bytes, vec![0xff, 0xfe, 0x00]);
+        // Lossy conversion must not panic on invalid UTF-8.
+        assert!(!out.as_text().is_empty());
+    }
+
+    #[test]
+    fn exit_status_success_covers_platforms_without_codes() {
+        assert!(ExitStatus::Code(0).is_success());
+        assert!(!ExitStatus::Code(1).is_success());
+        assert!(!ExitStatus::Terminated.is_success());
+        assert!(
+            ExitStatus::NotApplicable.is_success(),
+            "a platform with no completion codes signals failure via ExecutionError"
+        );
+    }
+
+    #[test]
+    fn a_failed_outcome_carries_an_actionable_message() {
+        // R9: the model gets a reason, not a bare error.
+        let cap = HostCapability::parse("android:shell:write").unwrap();
+        let out = ExecOutcome::failed(ExecutionError::CapabilityUnavailable(cap));
+        assert!(!out.succeeded());
+        assert!(out.stderr.as_text().contains("android:shell:write"));
+        assert!(out.stderr.as_text().contains("not available"));
+
+        let out = ExecOutcome::failed(ExecutionError::TimedOut);
+        assert!(out.stderr.as_text().contains("time budget"));
+    }
+
+    // Everything below exercises `ResourceLock`, which exists only where the target
+    // has atomics. The nested module keeps one gate instead of nine.
+    #[cfg(target_has_atomic = "ptr")]
+    mod resource_lock {
+        use super::*;
+
+        #[test]
+        fn lock_is_single_flight() {
+            let lock = ResourceLock::new(secs(600));
+            assert_eq!(lock.try_acquire(secs(0)), LockOutcome::Acquired);
+            assert!(matches!(
+                lock.try_acquire(secs(1)),
+                LockOutcome::Busy { .. }
+            ));
+            assert_eq!(lock.holder(secs(1)), Some(secs(1)));
+        }
+
+        #[test]
+        fn lock_releases() {
+            let lock = ResourceLock::new(secs(600));
+            lock.try_acquire(secs(0));
+            lock.release();
+            assert!(lock.is_free(secs(1)));
+            assert_eq!(lock.try_acquire(secs(1)), LockOutcome::Acquired);
+        }
+
+        #[test]
+        fn release_is_idempotent() {
+            let lock = ResourceLock::new(secs(600));
+            lock.release();
+            lock.release();
+            assert!(lock.is_free(secs(0)));
+        }
+
+        #[test]
+        fn an_expired_hold_is_reclaimed() {
+            // R11: a session that died mid-write must not wedge the device forever.
+            let lock = ResourceLock::new(secs(600));
+            assert_eq!(lock.try_acquire(secs(0)), LockOutcome::Acquired);
+            assert!(
+                lock.is_free(secs(601)),
+                "past the TTL the hold is presumed dead"
+            );
+            assert_eq!(lock.try_acquire(secs(601)), LockOutcome::Acquired);
+        }
+
+        #[test]
+        fn a_hold_within_ttl_is_not_reclaimed() {
+            let lock = ResourceLock::new(secs(600));
+            lock.try_acquire(secs(0));
+            assert!(matches!(
+                lock.try_acquire(secs(599)),
+                LockOutcome::Busy { .. }
+            ));
+        }
+
+        #[test]
+        fn busy_reports_how_long_to_wait() {
+            // No queueing: the caller is told to come back, not parked.
+            let lock = ResourceLock::new(secs(600));
+            lock.try_acquire(secs(0));
+            match lock.try_acquire(secs(100)) {
+                LockOutcome::Busy {
+                    held_for,
+                    retry_after,
+                } => {
+                    assert_eq!(held_for, secs(100));
+                    assert_eq!(retry_after, secs(500));
+                }
+                other => panic!("expected Busy, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn concurrent_acquisition_admits_exactly_one_holder() {
+            // The compare-exchange, not a load-then-store, is what makes this hold.
+            use std::sync::Arc;
+            use std::thread;
+
+            let lock = Arc::new(ResourceLock::new(secs(600)));
+            let winners = Arc::new(AtomicUsize::new(0));
+            let mut handles = Vec::new();
+            for _ in 0..16 {
+                let lock = Arc::clone(&lock);
+                let winners = Arc::clone(&winners);
+                handles.push(thread::spawn(move || {
+                    if lock.try_acquire(secs(0)) == LockOutcome::Acquired {
+                        winners.fetch_add(1, Ordering::SeqCst);
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+            assert_eq!(winners.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn acquisition_at_the_counter_maximum_still_locks() {
+            // Regression: the `+1` offset aliases `usize::MAX` onto the `FREE` sentinel.
+            // Before `stored_for` handled it, an acquisition on that one millisecond stored
+            // "not held" and the next caller walked straight in — two writers on one device,
+            // which is the exact failure R11 exists to prevent. On a 32-bit target that
+            // millisecond comes around every ~49.7 days.
+            let at_max = Duration::from_millis(usize::MAX as u64);
+            let lock = ResourceLock::new(secs(600));
+
+            assert_eq!(lock.try_acquire(at_max), LockOutcome::Acquired);
+            // The point of the test: still held, so a second taker is refused.
+            assert!(matches!(lock.try_acquire(at_max), LockOutcome::Busy { .. }));
+            assert!(lock.holder(at_max).is_some());
+            assert!(!lock.is_free(at_max));
+        }
+
+        #[test]
+        fn elapsed_time_survives_a_counter_wrap() {
+            // A hold that spans the counter's wrap boundary must not read as zero-length
+            // (which would look expired) or as enormous (which would wedge the device).
+            // Wrapping subtraction gets it right; saturating subtraction got it wrong.
+            let before = usize::MAX - 500; // 500 ms short of the wrap
+            let lock = ResourceLock::new(secs(600));
+            assert_eq!(
+                lock.try_acquire(Duration::from_millis(before as u64)),
+                LockOutcome::Acquired
+            );
+
+            // 60 s later, i.e. past the wrap.
+            let after = before.wrapping_add(60_000);
+            assert!(
+                after < before,
+                "test premise: the counter must have wrapped"
+            );
+
+            match lock.try_acquire(Duration::from_millis(after as u64)) {
+                LockOutcome::Busy {
+                    held_for,
+                    retry_after,
+                } => {
+                    assert_eq!(held_for, Duration::from_secs(60));
+                    assert_eq!(retry_after, secs(600) - Duration::from_secs(60));
+                }
+                other => panic!("a live hold must not be reclaimed across a wrap: {other:?}"),
+            }
+            assert_eq!(
+                lock.holder(Duration::from_millis(after as u64)),
+                Some(Duration::from_secs(60))
+            );
+        }
+    }
+
+    #[test]
+    fn budget_unbounded_is_explicit() {
+        let b = Budget::unbounded();
+        assert_eq!(b.timeout, None);
+        assert_eq!(b.output_cap, usize::MAX);
+    }
+}
