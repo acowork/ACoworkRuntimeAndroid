@@ -1,0 +1,20 @@
+[workspace]
+members = [
+    "crates/acowork-android",
+]
+resolver = "2"
+
+# Mirrors the upstream `core/Cargo.toml` workspace settings so that this crate
+# can be folded back into the upstream tree (or published as a Host-crate
+# dependency) without a toolchain bump. See README「为什么独立建仓」.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.95"
+
+[workspace.dependencies]
+async-trait = "0.1.92"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "time", "process", "io-util", "sync"] }

@@ -1,0 +1,587 @@
+//! The `HostProfile` aggregate: what this device actually is.
+//!
+//! android-host-probe.md §3 defines the contract; this module implements it and
+//! adds the assembly step that turns raw probe output into the typed profile.
+//!
+//! # Lifecycle
+//!
+//! A profile is produced **once at startup** and is read-only for the rest of the
+//! session (android-host-probe.md §3: "一次生成，会话期内只读"). It is
+//! re-derived only on the events listed in §6 — a Magisk policy change, a
+//! `setenforce`, a `remount`, or a process restart after reboot. There is
+//! deliberately no polling: probing spawns subprocesses, and on a battery-powered
+//! device that costs power for information nobody asked for.
+//!
+//! # Probe is not a guarantee
+//!
+//! android-host-probe.md §4 is the load-bearing rule of this whole subsystem:
+//! the profile decides **which tools get registered and which capabilities get
+//! declared**. It never decides whether a concrete command is allowed to run.
+//! SELinux judges per `(scontext, tcontext, tclass)` at execution time, so a
+//! profile that says "writable" can still collect `avc: denied`. Real authority
+//! is the actual exit code plus stderr, and denials are fed back through
+//! [`super::denial`].
+//!
+//! Treating the profile as a guarantee produces the failure mode §4 warns about:
+//! the model probes, gets denied, retries, and fills the context window with
+//! garbage. Everything in this module is designed to be *informative*, never
+//! *permissive*.
+
+use std::collections::BTreeSet;
+
+use serde::{Deserialize, Serialize};
+
+use crate::host::capability::{CapabilitySet, derive_capabilities};
+use crate::host::facts::{
+    AppletSet, DeviceFacts, FsRoot, Privilege, SelinuxDomain, SelinuxState, ShellDialect, SuProbe,
+};
+use crate::host::probe::ProbeOutput;
+
+/// Which of the three host profiles this device turned out to be.
+///
+/// ADR-AND-001 §4.1: these are three capability tiers of **one** engine, not
+/// three products. The tier is probed, never configured — the same binary behaves
+/// differently on a stock phone and on a rooted engineering device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum HostProfileName {
+    /// No shell, scoped storage only. The fallback, and the answer whenever the
+    /// probe itself could not run (android-host-probe.md §2 item 1).
+    ApkSandbox,
+    /// Termux: app uid, bash, `$PREFIX`.
+    Termux,
+    /// A rooted debugging device: `su -c` escalation is available.
+    RootShell,
+}
+
+impl HostProfileName {
+    /// True when this profile can spawn processes at all.
+    ///
+    /// `ApkSandbox` cannot, which is why ADR-AND-001 §7.3 rules that
+    /// `dangerous-mode` has no APK UI switch: there is no shell and no `su` on
+    /// that profile, so `android:fs:system` is simply unreachable there.
+    pub fn has_shell(&self) -> bool {
+        !matches!(self, HostProfileName::ApkSandbox)
+    }
+}
+
+/// The probed host, in full.
+///
+/// Field-for-field this is the android-host-probe.md §3 contract, plus four
+/// additions. Each addition is a measured fact that the contract's own derivation
+/// rules or audit requirements already presuppose, so leaving it out would force
+/// callers to re-derive it:
+///
+/// | Field | Why it is here |
+/// |---|---|
+/// | `domain` | §2 item 3 classifies the context; `context` alone keeps only the raw string |
+/// | `su` | §2 item 4 requires the uid **and** domain after `su`, and §7 needs the denial/absent distinction because a denied prompt is not retryable |
+/// | `system_remountable` | §2 item 7's `touch`/remount probe result; the `android:fs:system` rule reads it directly |
+/// | `dialects` | ADR-AND-001 §4.5 registers `bash` **and** `ash` as separate tools, which a single-valued `shell` field cannot express |
+///
+/// The `dialects` addition is recorded as **B8** in the readiness assessment: the
+/// §3 contract needs updating upstream-side, because dual tool registration is
+/// already decided in the ADR but not representable in the contract as written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostProfile {
+    /// Which tier this device is.
+    pub name: HostProfileName,
+    /// Privilege of the process that ran the probe. The Runtime itself is
+    /// **always** `AppUid` or `ShellUid` — ADR-AND-001 §4.1 forbids running the
+    /// Runtime as root, so a `Root` value here means the probe was run from a
+    /// privileged context and is a bug worth surfacing, not a feature.
+    pub privilege: Privilege,
+    /// SELinux enforcement mode.
+    pub selinux: SelinuxState,
+    /// Raw `/proc/self/attr/current`, kept verbatim for diagnostics.
+    /// Never reported to the Gateway (ADR-AND-001 §7.1).
+    pub context: Option<String>,
+    /// Classified form of `context`.
+    pub domain: SelinuxDomain,
+    /// Primary shell dialect — the one a bare `shell` tool binds to.
+    pub shell: Option<ShellDialect>,
+    /// Every dialect detected, for ADR-AND-001 §4.5 dual registration.
+    pub dialects: BTreeSet<ShellDialect>,
+    /// Commands actually present (toybox ∪ busybox ∪ spot checks).
+    pub applets: AppletSet,
+    /// Reachable filesystem roots with measured writability.
+    pub fs_roots: Vec<FsRoot>,
+    /// Result of the `su` probe.
+    pub su: SuProbe,
+    /// Whether `/system` survived an actual remount probe.
+    pub system_remountable: bool,
+    /// Derived capabilities. A pure function of the fields above.
+    pub caps: CapabilitySet,
+    /// Immutable device facts.
+    pub device: DeviceFacts,
+}
+
+impl HostProfile {
+    /// Assemble a profile from raw probe output.
+    ///
+    /// `own_package` is the Agent's package name (or install directory), used to
+    /// tell "our own writable directory" apart from "somewhere else writable" —
+    /// the distinction the `android:fs:outside-app` rule turns on.
+    ///
+    /// This function performs no I/O. Everything it knows came from `probe`.
+    pub fn assemble(probe: &ProbeOutput, own_package: &str) -> HostProfile {
+        // ── Item 1: uid ────────────────────────────────────────────────────
+        // A failed id probe is the documented signal to fall all the way back
+        // to apk-sandbox (§2 item 1).
+        let privilege = probe
+            .id
+            .as_ref()
+            .and_then(|out| Privilege::parse_uid(&out.stdout))
+            .unwrap_or(Privilege::AppUid);
+        let probe_ran = probe.id.is_some();
+
+        // ── Items 2 + 3: SELinux mode and domain ───────────────────────────
+        let selinux = probe
+            .getenforce
+            .as_ref()
+            .map(|out| SelinuxState::parse(&out.stdout))
+            .unwrap_or(SelinuxState::Unknown);
+        let context = probe.attr_current.as_ref().and_then(|out| {
+            let text = out.stdout.trim();
+            (!text.is_empty()).then(|| text.to_string())
+        });
+        let domain = context
+            .as_deref()
+            .map(SelinuxDomain::parse)
+            .unwrap_or(SelinuxDomain::Unreadable);
+
+        // ── Item 4: su ─────────────────────────────────────────────────────
+        let su = match probe.su.as_ref() {
+            Some(out) => {
+                crate::host::facts::parse_su_probe(&out.stdout, &out.stderr, out.timed_out)
+            }
+            // Not run at all (e.g. no su binary on PATH per a cheap pre-check).
+            None => SuProbe {
+                uid: None,
+                context: None,
+                prompt_denied: false,
+                unavailable: true,
+            },
+        };
+
+        // ── Items 5: shell dialects ────────────────────────────────────────
+        let mut dialects = BTreeSet::new();
+        if let Some(out) = probe.bash_path.as_ref()
+            && out.succeeded()
+            && !out.stdout.trim().is_empty()
+        {
+            dialects.insert(ShellDialect::Bash);
+        }
+        let system_sh_dialect = probe
+            .system_sh_version
+            .as_ref()
+            .and_then(|out| ShellDialect::parse_version_banner(&out.stdout));
+        if let Some(d) = system_sh_dialect {
+            dialects.insert(d);
+        }
+
+        // Primary dialect: prefer the one the host is actually known for. On
+        // Termux that is bash; on a rooted device driving /system/bin/sh it is
+        // whatever that binary turned out to be.
+        let shell = if dialects.contains(&ShellDialect::Bash) && probe.termux_prefix.is_some() {
+            Some(ShellDialect::Bash)
+        } else {
+            system_sh_dialect.or_else(|| dialects.iter().next().copied())
+        };
+
+        // ── Item 6: applets ────────────────────────────────────────────────
+        let mut applets = AppletSet::new();
+        let mut saw_list_source = false;
+        for out in probe.toybox_list.iter().chain(probe.busybox_list.iter()) {
+            let parsed = AppletSet::parse_list(&out.stdout);
+            saw_list_source |= !parsed.list_source_missing;
+            applets.merge(&parsed);
+        }
+        applets.list_source_missing = !saw_list_source;
+        for (name, out) in &probe.applet_spot_checks {
+            // `command -v <name>` echoes the resolved path and exits non-zero
+            // when the applet is absent, so exit code plus non-empty stdout is
+            // the presence test. The name comes from the map key, which the
+            // runner recorded when it issued the check.
+            if out.succeeded() && !out.stdout.trim().is_empty() {
+                applets.insert_confirmed(name);
+            }
+        }
+
+        // ── Items 7 + 12: mounts, remount probe, fs roots ──────────────────
+        let system_remountable = probe
+            .system_remount
+            .as_ref()
+            .is_some_and(|out| out.exit_code == Some(0));
+        let fs_roots = probe.fs_roots.clone();
+
+        // ── Items 8-11: device facts ───────────────────────────────────────
+        let device = DeviceFacts {
+            build_type: probe
+                .prop_build_type
+                .as_ref()
+                .and_then(|out| crate::host::facts::parse_prop(&out.stdout))
+                .as_deref()
+                .map(crate::host::facts::BuildType::parse)
+                .unwrap_or(crate::host::facts::BuildType::Unknown),
+            debuggable: probe
+                .prop_debuggable
+                .as_ref()
+                .is_some_and(|out| crate::host::facts::parse_bool_prop(&out.stdout)),
+            secure: probe
+                .prop_secure
+                .as_ref()
+                .is_some_and(|out| crate::host::facts::parse_bool_prop(&out.stdout)),
+            adb_secure: probe
+                .prop_adb_secure
+                .as_ref()
+                .is_some_and(|out| crate::host::facts::parse_bool_prop(&out.stdout)),
+            api_level: probe
+                .prop_sdk
+                .as_ref()
+                .and_then(|out| out.stdout.trim().parse::<u32>().ok()),
+            abi: probe
+                .prop_abi
+                .as_ref()
+                .and_then(|out| crate::host::facts::parse_prop(&out.stdout)),
+            verity: probe
+                .prop_veritymode
+                .as_ref()
+                .map(|out| crate::host::facts::VerityState::parse(&out.stdout))
+                .unwrap_or(crate::host::facts::VerityState::Unknown),
+        };
+
+        // ── Profile tier ───────────────────────────────────────────────────
+        // Precedence RootShell > Termux > ApkSandbox, where the dividing line
+        // between Termux and ApkSandbox is **whether a shell actually executed**.
+        //
+        // Making that the criterion rather than "is $PREFIX set" is what turns the
+        // invariant into a structural one: ApkSandbox holds if and only if no
+        // shell was detected, so an ApkSandbox profile can never declare a shell
+        // capability. Keying on `$PREFIX` instead would misclassify an
+        // `adb shell` host (uid 2000, mksh, no Termux, no su) as ApkSandbox while
+        // still deriving `android:shell:read` from the detected shell — a profile
+        // that contradicts itself. `$PREFIX` remains the marker that decides the
+        // *primary dialect* above, which is where it actually belongs.
+        //
+        // The precedence itself is an inference: neither the ADR nor the probe
+        // spec states it. Recorded as B9 in the readiness assessment.
+        let name = if !probe_ran {
+            // §2 item 1: the probe itself failed => apk-sandbox.
+            HostProfileName::ApkSandbox
+        } else if su.got_root() {
+            HostProfileName::RootShell
+        } else if shell.is_some() {
+            HostProfileName::Termux
+        } else {
+            HostProfileName::ApkSandbox
+        };
+
+        let mut profile = HostProfile {
+            name,
+            privilege,
+            selinux,
+            context,
+            domain,
+            shell,
+            dialects,
+            applets,
+            fs_roots,
+            su,
+            system_remountable,
+            caps: CapabilitySet::new(),
+            device,
+        };
+        profile.caps = derive_capabilities(&profile);
+
+        // Structural invariant: the tier says "has a shell" exactly when the
+        // derivation produced a shell capability. This is a self-check, not a
+        // second source of truth — if it ever fires, the tier logic above and the
+        // capability rules have drifted apart, and the profile would be lying to
+        // the tool registry in one direction or the other.
+        debug_assert_eq!(
+            profile.name.has_shell(),
+            profile
+                .caps
+                .contains(crate::host::capability::Capability::ShellRead),
+            "host tier and declared shell capability disagree"
+        );
+
+        // `own_package` is used by the runner when it builds `fs_roots` (it is
+        // the runner that knows which root is the app's own). Accepting it here
+        // keeps the signature honest about what assembly depends on, and lets a
+        // caller re-tag roots if the package name was not known at probe time.
+        if !own_package.is_empty() {
+            for root in &mut profile.fs_roots {
+                if root.path.contains(own_package) {
+                    root.own_package = true;
+                }
+            }
+            profile.caps = derive_capabilities(&profile);
+        }
+
+        profile
+    }
+
+    /// The coarse summary that may be reported to the Gateway.
+    ///
+    /// ADR-AND-001 §7.1 is explicit about both halves of this: report the
+    /// profile name, capability set, shell dialect and privilege level; do
+    /// **not** report the device serial or model, the concrete `fs_roots` paths,
+    /// the raw SELinux context string, or observed-denial detail.
+    ///
+    /// Note that §7.1 also rules the Gateway uses this only for display and
+    /// filtering and never for an allow decision. That ruling currently
+    /// contradicts upstream ADR-087 D5 and design doc 30 §6.2 — see blocker
+    /// **B1**/**B2** in the readiness assessment. The summary type is kept
+    /// minimal so that whichever way the ruling goes, the wire shape does not
+    /// have to leak more than this.
+    pub fn gateway_summary(&self) -> HostCapabilitySummary {
+        HostCapabilitySummary {
+            profile: self.name,
+            privilege: self.privilege,
+            caps: self.caps.ids(),
+            shell_dialect: self.shell.map(|d| match d {
+                ShellDialect::Bash => "bash",
+                ShellDialect::MkSh => "mksh",
+                ShellDialect::BusyBoxSh => "busybox-sh",
+            }),
+        }
+    }
+
+    /// True when the Runtime process itself is running privileged.
+    ///
+    /// ADR-AND-001 §4.1 makes "the Runtime is never root" a non-negotiable
+    /// invariant, and §6 P1 makes asserting it an acceptance criterion. This is
+    /// the predicate that assertion checks.
+    pub fn runtime_is_unprivileged(&self) -> bool {
+        self.privilege < Privilege::Root
+    }
+}
+
+/// The Gateway-facing capability summary (ADR-AND-001 §7.1).
+///
+/// Deliberately contains no device identifiers and no paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostCapabilitySummary {
+    /// Which tier this device is.
+    pub profile: HostProfileName,
+    /// Privilege level of the Runtime process itself.
+    pub privilege: Privilege,
+    /// Declared capability IDs.
+    pub caps: Vec<&'static str>,
+    /// Primary shell dialect, for tool registration.
+    pub shell_dialect: Option<&'static str>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host::capability::Capability;
+    use crate::host::facts::VerityState;
+    use crate::host::probe::{CommandOutput, ProbeOutput};
+
+    fn out(stdout: &str) -> CommandOutput {
+        CommandOutput::ok(stdout)
+    }
+
+    fn rooted_probe() -> ProbeOutput {
+        ProbeOutput {
+            id: Some(out("10233\n")),
+            getenforce: Some(out("Enforcing\n")),
+            attr_current: Some(out("u:r:untrusted_app:s0:c512,c768\n")),
+            su: Some(out("0\nu:r:magisk:s0\n")),
+            bash_path: Some(out("")),
+            system_sh_version: Some(out("@(#)MIRBSD KSH R59 2020/10/31\n")),
+            toybox_list: Some(out(
+                "cat\nchmod\ngetprop\nlogcat\nmount\nps\nsetprop\ntoybox\n",
+            )),
+            busybox_list: None,
+            applet_spot_checks: Default::default(),
+            mount_table: Some(out("/dev/block/sda1 on /data type f2fs (rw,seclabel)\n")),
+            system_remount: Some(out("")),
+            prop_build_type: Some(out("userdebug\n")),
+            prop_debuggable: Some(out("1\n")),
+            prop_secure: Some(out("0\n")),
+            prop_adb_secure: Some(out("0\n")),
+            prop_sdk: Some(out("34\n")),
+            prop_abi: Some(out("arm64-v8a\n")),
+            prop_veritymode: Some(out("disabled\n")),
+            termux_prefix: None,
+            fs_roots: vec![
+                FsRoot {
+                    path: "/data/data/com.example.agent".to_string(),
+                    writable: true,
+                    own_package: true,
+                },
+                FsRoot {
+                    path: "/data/local/tmp".to_string(),
+                    writable: true,
+                    own_package: false,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn rooted_device_assembles_the_root_shell_tier() {
+        let p = HostProfile::assemble(&rooted_probe(), "com.example.agent");
+        assert_eq!(p.name, HostProfileName::RootShell);
+        // The Runtime itself stays unprivileged even though su works.
+        assert_eq!(p.privilege, Privilege::AppUid);
+        assert!(p.runtime_is_unprivileged());
+        assert_eq!(p.selinux, SelinuxState::Enforcing);
+        assert_eq!(p.domain, SelinuxDomain::UntrustedApp);
+        assert_eq!(p.shell, Some(ShellDialect::MkSh));
+        assert!(p.su.got_root());
+        assert_eq!(
+            p.device.build_type,
+            crate::host::facts::BuildType::UserDebug
+        );
+        assert!(p.device.debuggable);
+        assert_eq!(p.device.api_level, Some(34));
+        assert_eq!(p.device.abi.as_deref(), Some("arm64-v8a"));
+        assert_eq!(p.device.verity, VerityState::NotEnforcing);
+    }
+
+    #[test]
+    fn rooted_device_derives_the_full_capability_set() {
+        let p = HostProfile::assemble(&rooted_probe(), "com.example.agent");
+        for cap in Capability::all() {
+            assert!(p.caps.contains(cap), "missing {cap}");
+        }
+    }
+
+    #[test]
+    fn applets_come_from_the_bulk_list() {
+        let p = HostProfile::assemble(&rooted_probe(), "com.example.agent");
+        assert!(p.applets.contains("logcat"));
+        assert!(p.applets.contains("setprop"));
+        assert!(!p.applets.list_source_missing);
+    }
+
+    #[test]
+    fn termux_probe_yields_the_termux_tier_with_bash() {
+        let probe = ProbeOutput {
+            su: None,
+            bash_path: Some(out("/data/data/com.termux/files/usr/bin/bash\n")),
+            system_sh_version: Some(out("@(#)MIRBSD KSH R59\n")),
+            termux_prefix: Some("/data/data/com.termux/files/usr".to_string()),
+            prop_veritymode: Some(out("enforcing\n")),
+            system_remount: None,
+            fs_roots: vec![FsRoot {
+                path: "/data/data/com.termux/files/usr".to_string(),
+                writable: true,
+                own_package: false,
+            }],
+            ..rooted_probe()
+        };
+        let p = HostProfile::assemble(&probe, "com.termux");
+        assert_eq!(p.name, HostProfileName::Termux);
+        assert_eq!(p.shell, Some(ShellDialect::Bash));
+        // Both dialects are visible so §4.5 can register two tools.
+        assert!(p.dialects.contains(&ShellDialect::Bash));
+        assert!(p.dialects.contains(&ShellDialect::MkSh));
+        assert!(p.caps.contains(Capability::ShellRead));
+        assert!(
+            !p.caps.contains(Capability::ShellWrite),
+            "Termux without su must stay read-only"
+        );
+        assert!(!p.caps.contains(Capability::FsSystem));
+    }
+
+    #[test]
+    fn failed_probe_falls_back_to_apk_sandbox() {
+        // §2 item 1: the probe itself failing means apk-sandbox.
+        let p = HostProfile::assemble(&ProbeOutput::nothing_ran(), "com.example.agent");
+        assert_eq!(p.name, HostProfileName::ApkSandbox);
+        assert!(p.caps.is_empty());
+        assert_eq!(p.selinux, SelinuxState::Unknown);
+        assert_eq!(p.domain, SelinuxDomain::Unreadable);
+        assert!(!p.name.has_shell());
+    }
+
+    #[test]
+    fn apk_without_shell_or_prefix_is_apk_sandbox() {
+        let probe = ProbeOutput {
+            id: Some(out("10233\n")),
+            su: None,
+            bash_path: Some(out("")),
+            system_sh_version: None,
+            termux_prefix: None,
+            fs_roots: vec![FsRoot {
+                path: "/data/data/com.example.agent".to_string(),
+                writable: true,
+                own_package: true,
+            }],
+            ..rooted_probe()
+        };
+        let p = HostProfile::assemble(&probe, "com.example.agent");
+        assert_eq!(p.name, HostProfileName::ApkSandbox);
+        assert!(p.caps.is_empty());
+    }
+
+    #[test]
+    fn denied_su_prompt_does_not_yield_the_root_tier() {
+        let probe = ProbeOutput {
+            su: Some(CommandOutput::failed(1, "su: Permission denied")),
+            ..rooted_probe()
+        };
+        let p = HostProfile::assemble(&probe, "com.example.agent");
+        assert_ne!(p.name, HostProfileName::RootShell);
+        assert!(p.su.prompt_denied);
+        assert!(!p.caps.contains(Capability::ShellWrite));
+    }
+
+    #[test]
+    fn own_package_root_is_retagged_from_the_package_name() {
+        let probe = ProbeOutput {
+            fs_roots: vec![FsRoot {
+                path: "/data/data/com.example.agent/files".to_string(),
+                writable: true,
+                // Runner did not know the package at probe time.
+                own_package: false,
+            }],
+            ..rooted_probe()
+        };
+        let p = HostProfile::assemble(&probe, "com.example.agent");
+        assert!(p.fs_roots[0].own_package);
+        // With only our own directory writable, outside-app must not be granted.
+        assert!(!p.caps.contains(Capability::FsOutsideApp));
+    }
+
+    #[test]
+    fn gateway_summary_carries_no_device_identifiers_or_paths() {
+        let p = HostProfile::assemble(&rooted_probe(), "com.example.agent");
+        let summary = p.gateway_summary();
+        let json = serde_json::to_string(&summary).unwrap();
+
+        assert_eq!(summary.profile, HostProfileName::RootShell);
+        assert!(summary.caps.contains(&"android:shell:read"));
+        assert_eq!(summary.shell_dialect, Some("mksh"));
+
+        // ADR-AND-001 §7.1: none of these may cross the wire.
+        for forbidden in [
+            "u:r:untrusted_app",
+            "/data/local/tmp",
+            "/data/data/com.example.agent",
+            "arm64-v8a",
+            "userdebug",
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "gateway summary leaked {forbidden}: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn profile_serializes_stably_for_snapshot_baselines() {
+        let p = HostProfile::assemble(&rooted_probe(), "com.example.agent");
+        let a = serde_json::to_string(&p).unwrap();
+        let b = serde_json::to_string(&p).unwrap();
+        assert_eq!(
+            a, b,
+            "android-host-probe.md §7 needs deterministic snapshots"
+        );
+    }
+}
