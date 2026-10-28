@@ -716,6 +716,7 @@ mod tests {
 
     fn rooted_probe() -> ProbeOutput {
         ProbeOutput {
+            costs: Vec::new(),
             id: Some(out("10233\n")),
             getenforce: Some(out("Enforcing\n")),
             attr_current: Some(out("u:r:untrusted_app:s0:c512,c768\n")),

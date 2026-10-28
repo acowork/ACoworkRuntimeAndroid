@@ -421,10 +421,31 @@ fn no_evidence_source_is_readable_without_root() {
 
 #[test]
 fn the_probe_budget_was_met_on_real_hardware() {
-    // android-host-probe.md §3 bounds the whole probe. A real device over a real adb link is
-    // the only way to know whether that number is fiction; measured here at ~2 s for 16
-    // commands, which is why the budget is a budget and not an aspiration.
+    // android-host-probe.md §3 bounds the whole probe at < 2 s with a 500 ms per-item
+    // deadline. Two guards, and the old test checked only the second one — which said
+    // nothing about the first: twenty commands at 49 ms each never trip a deadline and still
+    // cost a second. Now both are measured, from durations the probe loop recorded rather
+    // than from an estimate in a comment.
     let probe = ground_truth();
+    let total = probe
+        .total_duration_ms()
+        .expect("the ground-truth fixture carries per-invocation costs");
+    assert!(
+        total < 2_000,
+        "§3 budgets the probe at under 2 s; this device took {total} ms over a real adb link"
+    );
+    let slowest = probe
+        .slowest_item_ms()
+        .expect("at least one command was timed");
+    assert!(
+        slowest < 500,
+        "an item came within a whisker of its own 500 ms deadline ({slowest} ms): the budget          is being spent by single calls, not by their number"
+    );
+    assert_eq!(
+        probe.costs.len(),
+        20,
+        "the read-only set is twenty invocations; the budget is stated per invocation"
+    );
     let ran = [
         probe.id.as_ref(),
         probe.getenforce.as_ref(),

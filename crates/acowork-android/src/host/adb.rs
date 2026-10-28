@@ -320,6 +320,9 @@ impl AdbTransport {
             stderr: String::from_utf8_lossy(&raw.stderr).into_owned(),
             exit_code: raw.exit_code,
             timed_out: raw.timed_out,
+            // Left to `run_probe`, which owns the number that matters for the budget: what
+            // the probe loop waited, measured the same way for every runner.
+            duration_ms: None,
         })
     }
 

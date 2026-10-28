@@ -180,7 +180,12 @@ fn report_probe(probe: &ProbeOutput) {
     let field = |name: &str, slot: &Option<CommandOutput>| match slot {
         None => println!("  {name:<16} not run"),
         Some(o) => println!(
-            "  {name:<16} exit {:?}{}  {}",
+            "  {:<16} {:>5}  exit {:?}{}  {}",
+            name,
+            match o.duration_ms {
+                Some(ms) => format!("{ms}ms"),
+                None => "-".to_string(),
+            },
             o.exit_code,
             if o.timed_out { " TIMEOUT" } else { "" },
             excerpt(&o.stdout, &o.stderr),
@@ -204,6 +209,19 @@ fn report_probe(probe: &ProbeOutput) {
     field("veritymode", &probe.prop_veritymode);
     field("sdk", &probe.prop_sdk);
     field("abi", &probe.prop_abi);
+    field("evidence", &probe.evidence_surface);
+    field("dumpsys -l", &probe.dumpsys_inventory);
+    // The §3 budget is a *total*, and a per-item deadline is not evidence about it: twenty
+    // commands at 49 ms each never trip a 500 ms guard and still cost a second. Printed with
+    // its scope stated, because this number covers the serial command loop and not the
+    // up-front `$PREFIX` read or the `fs_roots` write probes.
+    match (probe.total_duration_ms(), probe.slowest_item_ms()) {
+        (Some(total), Some(slowest)) => println!(
+            "  {:<16} {total}ms total, {slowest}ms slowest  (serial command loop only)",
+            "probe cost"
+        ),
+        _ => println!("  {:<16} not measured", "probe cost"),
+    }
     println!("  {:<16} {:?}", "termux $PREFIX", probe.termux_prefix);
     println!("  {:<16} {} reachable", "fs roots", probe.fs_roots.len());
     for r in &probe.fs_roots {

@@ -20,6 +20,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::time::Duration;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -303,6 +304,16 @@ pub struct CommandOutput {
     pub exit_code: Option<i32>,
     /// Whether the per-item timeout fired.
     pub timed_out: bool,
+    /// Wall time the device took to answer, measured by the probe loop around the runner
+    /// call. `None` means "not measured", which is a different fact from `Some(0)`.
+    ///
+    /// It exists because §3 states a budget ("< 2s for the whole probe") that nothing could
+    /// otherwise check: the fixture recorded exit codes and timeouts but no durations, so
+    /// "the budget was met" was an inference from "no item hit its deadline". Absence of a
+    /// timeout is not evidence about total time — twenty items at 49 ms each never trip a
+    /// 500 ms guard and still cost a second.
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
 }
 
 impl CommandOutput {
@@ -313,6 +324,7 @@ impl CommandOutput {
             stderr: String::new(),
             exit_code: Some(0),
             timed_out: false,
+            duration_ms: None,
         }
     }
 
@@ -323,6 +335,7 @@ impl CommandOutput {
             stderr: stderr.to_string(),
             exit_code: Some(exit_code),
             timed_out: false,
+            duration_ms: None,
         }
     }
 
@@ -336,6 +349,7 @@ impl CommandOutput {
             stderr: String::new(),
             exit_code: None,
             timed_out,
+            duration_ms: None,
         }
     }
 
@@ -400,6 +414,16 @@ pub struct ProbeOutput {
     pub evidence_surface: Option<CommandOutput>,
     /// Item 13b — `dumpsys -l`, the service inventory.
     pub dumpsys_inventory: Option<CommandOutput>,
+    /// What each invocation cost, in the order the loop ran them.
+    ///
+    /// Kept beside the answers rather than inside them, because the two have different
+    /// lifetimes: the spot-check batch is parsed into ten per-applet entries and the original
+    /// `CommandOutput` is dropped, so a duration carried only on the output would vanish with
+    /// it. A budget total that silently omits one of twenty round trips is not the number it
+    /// says it is.
+    #[serde(default)]
+    pub costs: Vec<(ProbeCommand, u64)>,
+
     /// `$PREFIX`, when set and reachable — the Termux marker.
     pub termux_prefix: Option<String>,
     /// Item 12. Produced by the runner rather than parsed from text, because
@@ -412,6 +436,28 @@ impl ProbeOutput {
     /// An empty result set: nothing ran. Assembles to `ApkSandbox`.
     pub fn nothing_ran() -> ProbeOutput {
         ProbeOutput::default()
+    }
+
+    /// Total device time the probe's command loop waited.
+    ///
+    /// `None` when nothing was timed — which is what a fixture captured before durations
+    /// existed reports. The field is `Option` for that reason: "0 ms" and "we did not measure"
+    /// are different claims, and only one of them can be checked.
+    ///
+    /// Deliberately narrower than "how long the probe took": it covers the serial command
+    /// loop, not the up-front `$PREFIX` read or the `fs_roots` write probes, which are
+    /// separate runner calls that never pass through this loop.
+    pub fn total_duration_ms(&self) -> Option<u64> {
+        (!self.costs.is_empty()).then(|| self.costs.iter().map(|(_, ms)| *ms).sum())
+    }
+
+    /// The slowest single invocation, in milliseconds.
+    ///
+    /// Kept separate from the total because the two answer different questions and §3's
+    /// budget conflates them: a per-item deadline catches a device that hangs on one command
+    /// and says nothing about twenty commands that are each fine and together slow.
+    pub fn slowest_item_ms(&self) -> Option<u64> {
+        self.costs.iter().map(|(_, ms)| *ms).max()
     }
 
     /// True when not a single probe command produced output.
@@ -511,7 +557,24 @@ pub async fn run_probe(
         // A runner that cannot operate yields `None` for every command, which the
         // parsers read as Unknown. That is the honest outcome, so the error is
         // deliberately dropped rather than propagated.
+        //
+        // Timed around the runner rather than inside it, so the number means the same thing
+        // for adb, for a device-side runner, and for the in-memory test double: how long the
+        // probe loop waited.
+        let started = Instant::now();
         let result = runner.run(*command).await.ok();
+        // One measurement, recorded twice: on the answer, for a caller displaying a single
+        // item, and in the ledger, which is what the budget is computed from. The ledger has
+        // to exist because `route` parses the spot-check batch into per-applet entries and
+        // drops the original answer — and it records the call even when there is no answer
+        // at all, since a command that hung and was killed still spent the time it spent. A
+        // budget that counted only successes would be flattered by the device's failures.
+        let ms = started.elapsed().as_millis() as u64;
+        let result = result.map(|mut out| {
+            out.duration_ms = Some(ms);
+            out
+        });
+        output.costs.push((*command, ms));
         route(&mut output, *command, result);
     }
 
@@ -879,7 +942,6 @@ SPOT ps rc=0 path=/system/bin/ps
     struct TableRunner {
         table: BTreeMap<ProbeCommand, CommandOutput>,
     }
-
     #[async_trait::async_trait]
     impl ProbeRunner for TableRunner {
         async fn run(&self, command: ProbeCommand) -> Result<CommandOutput, ProbeError> {
@@ -927,5 +989,52 @@ SPOT ps rc=0 path=/system/bin/ps
             output.termux_prefix.as_deref(),
             Some("/data/data/com.termux/files/usr")
         );
+    }
+
+    #[tokio::test]
+    async fn every_invocation_is_costed_including_the_ones_that_never_answered() {
+        // The ledger is what the §3 budget is computed from, so it has to count the calls the
+        // device failed to answer. A total over successes only would be flattered by a bad
+        // link: the hung and killed commands are precisely the expensive ones.
+        let table = [(ProbeCommand::Id, CommandOutput::ok("2000"))]
+            .into_iter()
+            .collect();
+        let runner = TableRunner { table };
+        let commands = [ProbeCommand::Id, ProbeCommand::GetEnforce, ProbeCommand::Su];
+        let output = run_probe(&runner, &commands, "com.example.agent").await;
+
+        assert_eq!(output.costs.len(), 3, "one entry per invocation attempted");
+        assert!(output.getenforce.is_none() && output.su.is_none());
+        // `None`, not `Some(0)`, when nothing was timed — and here something was.
+        assert!(output.total_duration_ms().is_some());
+        assert!(output.slowest_item_ms().is_some());
+    }
+
+    #[test]
+    fn a_probe_with_no_ledger_reports_no_duration_rather_than_zero() {
+        // A fixture captured before durations existed must read as "not measured". Calling
+        // that "0 ms" would turn an absence of evidence into evidence of speed, which is the
+        // exact mistake §3's budget line used to make.
+        let probe = ProbeOutput::nothing_ran();
+        assert_eq!(probe.total_duration_ms(), None);
+        assert_eq!(probe.slowest_item_ms(), None);
+
+        let probe = ProbeOutput {
+            costs: vec![(ProbeCommand::Id, 0), (ProbeCommand::Su, 7)],
+            ..ProbeOutput::nothing_ran()
+        };
+        assert_eq!(probe.total_duration_ms(), Some(7));
+        assert_eq!(probe.slowest_item_ms(), Some(7));
+    }
+
+    #[test]
+    fn an_empty_cost_is_still_a_measurement() {
+        // The distinction the `Option` exists for: `Some(0)` means we timed it and it was
+        // instant, `None` means nobody looked. Both must be expressible.
+        let probe = ProbeOutput {
+            costs: vec![(ProbeCommand::Id, 0)],
+            ..ProbeOutput::nothing_ran()
+        };
+        assert_eq!(probe.total_duration_ms(), Some(0));
     }
 }
