@@ -15,8 +15,9 @@
 //! resident root process, i.e. the Runtime's own privilege stays below root.
 
 use acowork_android::host::{
-    Capability, CommandOutput, ExecRequest, FsRoot, HostProfile, Privilege, ProbeOutput,
-    SelinuxDomain, SelinuxState, SessionWriteLock, ShellDialect, VerityState,
+    BackendError, Capability, CommandOutput, ExecRecord, ExecRequest, FsRoot, HostProfile,
+    Privilege, ProbeOutput, SelinuxDomain, SelinuxState, SessionWriteLock, ShellDialect,
+    VerityState, parse_denials,
 };
 use acowork_platform_contract::{
     AttributionTier, AttributionVerdict, Gate, GateDecision, HostDescription, LocalReadiness,
@@ -316,6 +317,91 @@ fn gateway_summary_never_leaks_device_detail_on_any_tier() {
         assert!(json.contains("profile"));
         assert!(json.contains("privilege"));
         assert!(json.contains("caps"));
+    }
+}
+
+#[test]
+fn the_exec_error_path_never_leaks_device_detail_either() {
+    // §7.1 has two halves. The summary is the one everyone remembers; the other is the
+    // error string, which is *also* built on the device and shipped to the Gateway, and
+    // which is far more likely to be written as free text because "just put the reason in
+    // the message" feels helpful. Every way the host layer can fail, projected onto the
+    // contract, must clear the same forbidden vocabulary.
+    let context = "u:r:untrusted_app:s0:c166,c232";
+    let denial = "avc: denied { read } for scontext=u:r:untrusted_app:s0:c166,c232 \
+                  tcontext=u:object_r:shell_data_file:s0";
+    let cases: Vec<(BackendError, &str)> = vec![
+        (
+            BackendError::PrivilegeNotGranted {
+                observed_uid: Some(10166),
+                observed_context: Some(context.into()),
+            },
+            "silent privilege drop",
+        ),
+        (
+            BackendError::PrivilegeNotGranted {
+                observed_uid: None,
+                observed_context: None,
+            },
+            "identity probe produced nothing",
+        ),
+        (
+            BackendError::EscalationUnavailable("su: prompt denied".into()),
+            "no su",
+        ),
+        (
+            BackendError::Backend("spawn failed".into()),
+            "backend broke",
+        ),
+        (
+            BackendError::Refused("`setprop` needs android:shell:write".into()),
+            "content refusal",
+        ),
+    ];
+
+    for (err, label) in cases {
+        let projected = err.to_contract().to_string();
+        for forbidden in [
+            "u:r:",
+            "s0:c",
+            "c166",
+            "c232",
+            "untrusted_app",
+            "shell_data_file",
+        ] {
+            assert!(
+                !projected.contains(forbidden),
+                "{label}: projection leaked `{forbidden}`: {projected}"
+            );
+        }
+        // R9 still holds on the far side of the seam: a refusal must say something usable.
+        assert!(
+            projected.split_whitespace().count() > 4,
+            "{label}: projection is not actionable: {projected}"
+        );
+    }
+
+    // The record is the local channel, and it keeps what the projection dropped — otherwise
+    // the audit trail could not answer "who actually ran this".
+    let record = ExecRecord {
+        stdout: String::new(),
+        stderr: denial.into(),
+        exit_code: Some(1),
+        selinux_denials: parse_denials(denial),
+        uid: Some(10166),
+        context: Some(context.into()),
+        duration_ms: 12,
+        truncated: false,
+        timed_out: false,
+    };
+    assert_eq!(record.context.as_deref(), Some(context));
+    assert!(!record.selinux_denials.is_empty());
+    let wire = serde_json::to_string(&record.to_contract()).unwrap();
+    for forbidden in ["u:r:", "c166", "s0:c"] {
+        assert!(
+            !wire.contains(forbidden),
+            "ExecOutcome leaked `{forbidden}`: {wire}"
+        );
     }
 }
 

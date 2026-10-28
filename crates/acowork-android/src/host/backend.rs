@@ -72,7 +72,7 @@ use acowork_platform_contract::{
 
 use crate::host::capability::Capability;
 use crate::host::denial::SelinuxDenial;
-use crate::host::facts::ShellDialect;
+use crate::host::facts::{SelinuxDomain, ShellDialect};
 use crate::host::profile::HostProfile;
 
 /// Device write-lock TTL (ADR-AND-001 §7.2).
@@ -331,8 +331,37 @@ pub enum BackendError {
     Refused(String),
 }
 
+/// Name the *class* of an SELinux domain, never the string it was derived from.
+///
+/// ADR-AND-001 §7.1 draws the privacy line here: the Gateway may learn that a command ran
+/// in the shell domain rather than a privileged one — that is a policy fact, and without it
+/// a refusal is unactionable — but it must not receive the raw context. The raw string is
+/// not merely identifying: on the APK tier it carries MLS categories
+/// (`u:r:untrusted_app:s0:c512,c768`) that encode *which app* the process is, and the
+/// category set differs per install, so it is a device fingerprint as much as a policy
+/// label. `SelinuxDomain::Other` keeps the type field for local use, and this function is
+/// where that field stops: an unrecognised domain is reported as unrecognised.
+fn domain_class(context: Option<&str>) -> &'static str {
+    match context.map(SelinuxDomain::parse) {
+        None => "no domain was observed",
+        Some(SelinuxDomain::UntrustedApp) => "an app-sandbox domain",
+        Some(SelinuxDomain::Shell) => "the shell domain",
+        Some(SelinuxDomain::Magisk) => "a su/magisk domain",
+        Some(SelinuxDomain::Other(_)) => "an unrecognised domain",
+        Some(SelinuxDomain::Unreadable) => "an unreadable domain",
+    }
+}
+
 impl BackendError {
     /// Project onto the contract's error type.
+    ///
+    /// This is the sanitizer at the seam. Everything the device knows goes in; only what
+    /// §7.1 allows to leave the device comes out. Two things survive on purpose: the uid
+    /// (a platform constant — 2000 means shell, 0 means root — not device detail) and the
+    /// *class* of the SELinux domain, which is what makes a silent privilege drop
+    /// explainable to a caller who cannot see the device. The raw context, the denial
+    /// strings and the paths do not: they stay on [`ExecRecord`] and in
+    /// [`Display`](std::fmt::Display), which are the local channels.
     pub fn to_contract(&self) -> ExecutionError {
         match self {
             BackendError::EscalationUnavailable(why) => {
@@ -342,8 +371,9 @@ impl BackendError {
                 observed_uid,
                 observed_context,
             } => ExecutionError::BackendUnavailable(format!(
-                "privilege was asked for but not granted: ran as uid {observed_uid:?} in \
-                 context {observed_context:?}"
+                "privilege was asked for but not granted: ran as uid {observed_uid:?} and {ctx} \
+                 (the raw SELinux context stays on the device)",
+                ctx = domain_class(observed_context.as_deref())
             )),
             BackendError::Backend(why) | BackendError::Refused(why) => {
                 ExecutionError::Rejected(why.clone())
@@ -353,6 +383,11 @@ impl BackendError {
 }
 
 impl std::fmt::Display for BackendError {
+    /// The local, operator-facing form.
+    ///
+    /// Unlike [`to_contract`](Self::to_contract) this does print the raw SELinux context —
+    /// ADR-AND-001 N3 wants the real diagnostics in the log, and §7.1 only forbids sending
+    /// them off the device. Do not route this string into anything that crosses the port.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BackendError::EscalationUnavailable(why) => {
@@ -834,6 +869,7 @@ mod tests {
     fn a_silent_privilege_drop_projects_as_unavailable_and_says_what_it_observed() {
         // The point of the variant is that the *observed* identity survives the projection:
         // "escalation did not happen" is only actionable if the caller can see what did.
+        // What survives is the class of the identity, not the string — §7.1.
         let err = BackendError::PrivilegeNotGranted {
             observed_uid: Some(2000),
             observed_context: Some("u:r:shell:s0".to_string()),
@@ -841,11 +877,55 @@ mod tests {
         match err.to_contract() {
             ExecutionError::BackendUnavailable(why) => {
                 assert!(why.contains("2000"), "{why}");
-                assert!(why.contains("u:r:shell:s0"), "{why}");
+                assert!(why.contains("the shell domain"), "{why}");
+                assert!(!why.contains("u:r:"), "raw context crossed the seam: {why}");
             }
             other => panic!("expected BackendUnavailable, got {other:?}"),
         }
         assert!(err.to_string().contains("asked to run as root"), "{err}");
+        // The local channel keeps the real context — N3 wants it in the log.
+        assert!(err.to_string().contains("u:r:shell:s0"), "{err}");
+    }
+
+    #[test]
+    fn an_mls_category_never_survives_the_contract_projection() {
+        // The APK-tier shape of the leak. `u:r:untrusted_app:s0:c166,c232` identifies the
+        // install, not just the policy, so a projection that round-trips the "domain class"
+        // by lowercasing or truncating the string would still fingerprint the device.
+        let err = BackendError::PrivilegeNotGranted {
+            observed_uid: Some(10166),
+            observed_context: Some("u:r:untrusted_app:s0:c166,c232".to_string()),
+        };
+        let projected = err.to_contract().to_string();
+        for forbidden in ["u:r:", "s0:c", "c166", "c232", "untrusted_app"] {
+            assert!(
+                !projected.contains(forbidden),
+                "projection leaked `{forbidden}`: {projected}"
+            );
+        }
+        assert!(projected.contains("app-sandbox"), "{projected}");
+    }
+
+    #[test]
+    fn a_missing_or_unreadable_domain_is_stated_as_such() {
+        // "no domain was observed" and "an unreadable domain" are different facts from a
+        // recognised one, and neither may be rendered as the empty string — a projection
+        // that reads "ran as uid 0 and " would let a failed identity probe look like a
+        // privileged run.
+        let cases = [
+            (None, "no domain was observed"),
+            (Some(""), "an unreadable domain"),
+            (Some("\0"), "an unreadable domain"),
+            (Some("u:r:init:s0"), "an unrecognised domain"),
+        ];
+        for (context, expected) in cases {
+            let err = BackendError::PrivilegeNotGranted {
+                observed_uid: None,
+                observed_context: context.map(str::to_string),
+            };
+            let projected = err.to_contract().to_string();
+            assert!(projected.contains(expected), "{context:?} -> {projected}");
+        }
     }
 
     #[test]
