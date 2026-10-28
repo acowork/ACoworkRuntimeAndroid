@@ -64,7 +64,7 @@ pub use backend::{
     ExecRecord, ExecRequest, ExecutionBackend, SessionLockOutcome, SessionWriteLock,
     WRITE_LOCK_TTL,
 };
-pub use backends::{AppSandboxBackend, RootShellBackend, TermuxBackend};
+pub use backends::{AppSandboxBackend, RootShellBackend, ShellBackend};
 pub use capability::{
     Capability, PLATFORM, android_vocabulary, derive_claims, explain_absence, lookup,
 };

@@ -3,7 +3,7 @@
 //!
 //! ```text
 //!   this crate (host side)           adb            device
-//!   TermuxBackend / RootShellBackend  -->  adbd  -->  /system/bin/sh -s
+//!   ShellBackend / RootShellBackend  -->  adbd  -->  /system/bin/sh -s
 //! ```
 //!
 //! # Why this is a `SpawnRunner` and not a shell script

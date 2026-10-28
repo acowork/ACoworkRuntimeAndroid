@@ -24,7 +24,7 @@ use acowork_android::host::capability::Capability;
 use acowork_android::host::probe::{CommandOutput, ProbeOutput, run_probe};
 use acowork_android::host::spawn::{SpawnInvocation, SpawnRunner};
 use acowork_android::host::{
-    AdbTransport, ExecRequest, ExecutionBackend, HostProfile, ProbeCommand, TermuxBackend,
+    AdbTransport, ExecRequest, ExecutionBackend, HostProfile, ProbeCommand, ShellBackend,
 };
 use acowork_platform_contract::HostDescription;
 
@@ -228,7 +228,7 @@ fn report_profile(profile: &HostProfile) {
 }
 
 async fn report_exec(profile: &HostProfile, transport: &AdbTransport) {
-    let backend = match TermuxBackend::with_runner(profile.clone(), transport.clone()) {
+    let backend = match ShellBackend::with_runner(profile.clone(), transport.clone()) {
         Ok(b) => b,
         Err(e) => {
             println!("  no shell backend for this profile: {e}");

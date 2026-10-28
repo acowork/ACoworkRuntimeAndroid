@@ -33,7 +33,10 @@ use acowork_android::host::facts::{
     parse_bool_prop, parse_prop, su_helper_missing, su_prompt_denied,
 };
 use acowork_android::host::probe::ProbeOutput;
-use acowork_android::host::{AppletSet, HostProfile, HostProfileName, Privilege, TermuxBackend};
+use acowork_android::host::spawn::ScriptedSpawnRunner;
+use acowork_android::host::{
+    AppletSet, ExecutionBackend, HostProfile, HostProfileName, Privilege, ShellBackend,
+};
 use acowork_platform_contract::HostDescription;
 
 /// The device this fixture came from, as far as the profile is concerned.
@@ -58,9 +61,28 @@ fn the_device_that_started_this_file_is_not_an_apk_sandbox() {
     // `android:shell:read` — on a host that had just answered `id -u` with `2000`.
     let profile = HostProfile::assemble(&ground_truth(), OWN_PACKAGE);
     assert!(profile.shell_executed, "a shell ran every probe command");
-    assert_eq!(profile.name, HostProfileName::Termux);
+    assert_eq!(profile.name, HostProfileName::SystemShell);
     assert_eq!(profile.shell, Some(ShellDialect::MkSh));
     assert!(profile.caps.is_declared(&Capability::ShellRead.id()));
+
+    // And it is not Termux, for the specific reasons Termux would be: this device has no
+    // bash and never reported a `$PREFIX`. A tier name is a claim about the environment, so
+    // the absence of both markers is what puts it in the fourth tier rather than the second.
+    let paths = &profile.paths;
+    assert_eq!(paths.bash, None, "no bash on this device");
+    assert_eq!(paths.termux_prefix, None, "no Termux prefix on this device");
+}
+
+#[test]
+fn the_backend_built_on_this_profile_does_not_call_itself_termux() {
+    // The same fabrication, one layer down. `ShellBackend` serves both unprivileged-shell
+    // tiers, and its `name()` — which is what the exec record carries — used to return the
+    // literal `"termux"` regardless of what the probe found.
+    let profile = HostProfile::assemble(&ground_truth(), OWN_PACKAGE);
+    let backend = ShellBackend::with_runner(profile, ScriptedSpawnRunner::default())
+        .expect("a profile with a shell must yield a backend");
+    assert_eq!(backend.name(), "system-shell");
+    assert_ne!(backend.name(), "termux");
 }
 
 #[test]
@@ -211,7 +233,7 @@ fn a_backend_built_on_the_real_profile_does_not_invent_a_termux_prefix() {
     );
     assert!(profile.paths.bash.is_none(), "no bash on this device");
 
-    let backend = TermuxBackend::new(profile).expect("a shell exists, so a backend can be built");
+    let backend = ShellBackend::new(profile).expect("a shell exists, so a backend can be built");
     assert_eq!(backend.shell_path().to_str(), Some("/system/bin/sh"));
     let env = backend.base_env();
     assert!(

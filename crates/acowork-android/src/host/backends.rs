@@ -2,7 +2,7 @@
 //!
 //! [`super::backend`] defines the contract and the gate that guards it; this module holds the
 //! implementations that turn an [`ExecRequest`] into a running shell. The three profile tiers
-//! of ADR-AND-001 §4.2 each get one: [`TermuxBackend`] (app uid, no escalation),
+//! of ADR-AND-001 §4.2 each get one: [`ShellBackend`] (app uid, no escalation),
 //! [`RootShellBackend`] (uid 0 behind `su`), and [`AppSandboxBackend`] — a backend whose only
 //! honest answer is that there is no shell here.
 //!
@@ -108,7 +108,7 @@ fn scratch_dir(profile: &HostProfile) -> Option<&'static str> {
 /// nothing was proven writable they are left unset rather than pointed at a plausible path:
 /// `mktemp` will then fail naming `/tmp`, which is a true error, instead of writing into a
 /// directory nobody verified.
-fn termux_base_env(prefix: Option<&str>, scratch: Option<&str>) -> BTreeMap<String, String> {
+fn shell_base_env(prefix: Option<&str>, scratch: Option<&str>) -> BTreeMap<String, String> {
     let mut pairs: Vec<(&str, String)> = Vec::new();
     match prefix {
         Some(p) => {
@@ -237,13 +237,13 @@ struct ShellChoice {
     dialect: ShellDialect,
 }
 
-/// Resolve the shell a Termux-tier host should get.
+/// Resolve the shell an unprivileged-shell tier host should get.
 ///
 /// Prefers the probed `bash`, because the Termux tier is *defined* by having it and the tool
 /// registered for it promises bash semantics. Falls back to the platform shell for a host with
-/// a shell but no bash — the `adb shell` / CLI-deliverable case: uid 2000, mksh, no Termux
+/// a shell but no bash — the [`HostProfileName::SystemShell`] case: uid 2000, mksh, no Termux
 /// install, and still a legitimate place to run commands.
-fn choose_termux_shell(profile: &HostProfile) -> Option<ShellChoice> {
+fn choose_shell(profile: &HostProfile) -> Option<ShellChoice> {
     if let Some(bash) = profile.paths.bash.as_ref() {
         return Some(ShellChoice {
             path: bash.clone(),
@@ -259,44 +259,49 @@ fn choose_termux_shell(profile: &HostProfile) -> Option<ShellChoice> {
 
 /// Executes commands as the app uid, with no escalation of any kind.
 ///
-/// This is the backend for the Termux tier and for the `adb shell` deliverable. Everything it
-/// can do, the Runtime process could already do: it is a *convenience*, not a privilege, and
-/// the gate's privilege axis never moves because of it.
+/// One type serves two tiers, because the difference between them is a probed fact it reads
+/// rather than a mechanism it implements: with a `bash` and a `$PREFIX` it is the Termux
+/// environment, without them it is `/system/bin/sh` on a stock device. What it may *not* be
+/// called is what the profile says it is not — see [`ShellBackend::name`], which reports the
+/// tier rather than the type.
+///
+/// Everything this backend can do, the Runtime process could already do: it is a
+/// *convenience*, not a privilege, and the gate's privilege axis never moves because of it.
 #[derive(Debug)]
-pub struct TermuxBackend<R = ProcessSpawnRunner> {
+pub struct ShellBackend<R = ProcessSpawnRunner> {
     profile: HostProfile,
     runner: R,
     shell: ShellChoice,
     base_env: BTreeMap<String, String>,
 }
 
-impl TermuxBackend<ProcessSpawnRunner> {
-    /// Build a Termux backend that starts real processes.
-    pub fn new(profile: HostProfile) -> Result<TermuxBackend<ProcessSpawnRunner>, BackendError> {
-        TermuxBackend::with_runner(profile, ProcessSpawnRunner::new())
+impl ShellBackend<ProcessSpawnRunner> {
+    /// Build a shell backend that starts real processes.
+    pub fn new(profile: HostProfile) -> Result<ShellBackend<ProcessSpawnRunner>, BackendError> {
+        ShellBackend::with_runner(profile, ProcessSpawnRunner::new())
     }
 }
 
-impl<R: SpawnRunner> TermuxBackend<R> {
-    /// Build a Termux backend over an arbitrary runner.
+impl<R: SpawnRunner> ShellBackend<R> {
+    /// Build a shell backend over an arbitrary runner.
     ///
     /// Fails when the profile has no shell at all. Refusing at construction rather than at the
     /// first `exec` matters: the caller decides which tools to register from the profile, and a
     /// backend that exists but cannot run anything would advertise a capability the device did
     /// not earn.
-    pub fn with_runner(profile: HostProfile, runner: R) -> Result<TermuxBackend<R>, BackendError> {
-        let shell = choose_termux_shell(&profile).ok_or_else(|| {
+    pub fn with_runner(profile: HostProfile, runner: R) -> Result<ShellBackend<R>, BackendError> {
+        let shell = choose_shell(&profile).ok_or_else(|| {
             BackendError::Backend(
-                "this host profile has no shell, so a Termux backend cannot be built on it; \
+                "this host profile has no shell, so a shell backend cannot be built on it; \
                  use `AppSandboxBackend` and `std::fs` instead"
                     .to_string(),
             )
         })?;
-        let base_env = termux_base_env(
+        let base_env = shell_base_env(
             profile.paths.termux_prefix.as_deref(),
             scratch_dir(&profile),
         );
-        Ok(TermuxBackend {
+        Ok(ShellBackend {
             profile,
             runner,
             shell,
@@ -316,9 +321,13 @@ impl<R: SpawnRunner> TermuxBackend<R> {
 }
 
 #[async_trait]
-impl<R: SpawnRunner> ExecutionBackend for TermuxBackend<R> {
+impl<R: SpawnRunner> ExecutionBackend for ShellBackend<R> {
     fn name(&self) -> &'static str {
-        "termux"
+        // The tier, not the type. This backend is one implementation serving two tiers, and
+        // hard-coding "termux" here reported a Termux environment on a device whose probe
+        // found no bash and no `$PREFIX` — the same fabrication one tier up, in a second
+        // place that reads it: this name is what the exec record carries.
+        self.profile.name.as_str()
     }
 
     fn dialect(&self) -> Option<ShellDialect> {
@@ -848,7 +857,7 @@ mod tests {
 
     #[test]
     fn a_termux_backend_drives_the_probed_bash() {
-        let backend = TermuxBackend::new(termux_profile()).unwrap();
+        let backend = ShellBackend::new(termux_profile()).unwrap();
         assert_eq!(backend.name(), "termux");
         assert_eq!(backend.dialect(), Some(ShellDialect::Bash));
         assert_eq!(
@@ -861,14 +870,14 @@ mod tests {
     fn a_host_with_a_shell_but_no_bash_falls_back_to_the_platform_shell() {
         // The `adb shell` deliverable: uid 2000, mksh, no Termux. A backend that refused here
         // would leave the CLI build with no way to run anything.
-        let backend = TermuxBackend::new(shell_only_profile()).unwrap();
+        let backend = ShellBackend::new(shell_only_profile()).unwrap();
         assert_eq!(backend.shell_path(), Path::new("/system/bin/sh"));
         assert_eq!(backend.dialect(), Some(ShellDialect::MkSh));
     }
 
     #[test]
     fn no_backend_is_built_on_a_profile_with_no_shell() {
-        let err = TermuxBackend::new(apk_profile()).unwrap_err();
+        let err = ShellBackend::new(apk_profile()).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("no shell"), "{msg}");
         assert!(msg.contains("AppSandboxBackend"), "{msg}");
@@ -939,7 +948,7 @@ mod tests {
     /// this environment from the harness.
     #[test]
     fn a_device_without_termux_is_not_given_a_fake_prefix() {
-        let backend = TermuxBackend::new(shell_only_profile()).unwrap();
+        let backend = ShellBackend::new(shell_only_profile()).unwrap();
         let env = backend.base_env();
         assert!(
             env.get("PREFIX").is_none(),
@@ -966,7 +975,7 @@ mod tests {
             writable: true,
             own_package: false,
         }];
-        let backend = TermuxBackend::new(profile).unwrap();
+        let backend = ShellBackend::new(profile).unwrap();
         let env = backend.base_env();
         assert_eq!(env.get("HOME").map(String::as_str), Some("/data/local/tmp"));
         assert_eq!(
@@ -984,7 +993,7 @@ mod tests {
             writable: false,
             own_package: false,
         }];
-        let backend = TermuxBackend::new(profile).unwrap();
+        let backend = ShellBackend::new(profile).unwrap();
         let env = backend.base_env();
         assert!(
             env.get("HOME").is_none() && env.get("TMPDIR").is_none(),
@@ -1003,7 +1012,7 @@ mod tests {
             writable: true,
             own_package: true,
         }];
-        let backend = TermuxBackend::new(profile).unwrap();
+        let backend = ShellBackend::new(profile).unwrap();
         assert!(backend.base_env().get("HOME").is_none());
     }
 
@@ -1011,7 +1020,7 @@ mod tests {
     /// Termux layout is used, and `PREFIX` is set.
     #[test]
     fn a_probed_prefix_is_used_and_reexported() {
-        let backend = TermuxBackend::new(termux_profile()).unwrap();
+        let backend = ShellBackend::new(termux_profile()).unwrap();
         let env = backend.base_env();
         assert_eq!(env.get("PREFIX").map(String::as_str), Some(PREFIX));
         let want_home = format!("{PREFIX}/home");
@@ -1037,7 +1046,7 @@ mod tests {
     #[tokio::test]
     async fn termux_execs_the_shell_with_s_and_keeps_the_script_out_of_argv() {
         let runner = FakeShell::app().into_runner();
-        let backend = TermuxBackend::with_runner(termux_profile(), runner).unwrap();
+        let backend = ShellBackend::with_runner(termux_profile(), runner).unwrap();
         let shell = backend.shell_path().to_path_buf();
 
         backend.exec(read_request()).await.unwrap();
@@ -1095,7 +1104,7 @@ mod tests {
         // could otherwise point `id` at a script that prints 0, forging the proof this crate
         // exists to obtain.
         let backend =
-            TermuxBackend::with_runner(termux_profile(), FakeShell::app().into_runner()).unwrap();
+            ShellBackend::with_runner(termux_profile(), FakeShell::app().into_runner()).unwrap();
 
         let mut request = read_request();
         request.env = env_map(&[("PATH", "/evil")]);
@@ -1132,7 +1141,7 @@ mod tests {
     #[tokio::test]
     async fn the_request_budget_reaches_the_runner() {
         let backend =
-            TermuxBackend::with_runner(termux_profile(), FakeShell::app().into_runner()).unwrap();
+            ShellBackend::with_runner(termux_profile(), FakeShell::app().into_runner()).unwrap();
 
         let mut request = read_request();
         request.budget.output_cap = 1234;
@@ -1147,7 +1156,7 @@ mod tests {
     #[tokio::test]
     async fn the_working_directory_and_env_reach_the_generated_script() {
         let backend =
-            TermuxBackend::with_runner(termux_profile(), FakeShell::app().into_runner()).unwrap();
+            ShellBackend::with_runner(termux_profile(), FakeShell::app().into_runner()).unwrap();
         let mut request = read_request();
         request.cwd = Some(PathBuf::from("/data/local/tmp"));
         request.env = env_map(&[("TARGET", "u:object_r:system_file:s0")]);
@@ -1168,7 +1177,7 @@ mod tests {
     async fn the_identity_that_ran_is_reported_and_the_marker_is_stripped() {
         let body = "total 0\n";
         let runner = FakeShell::app().body(body).into_runner();
-        let backend = TermuxBackend::with_runner(termux_profile(), runner).unwrap();
+        let backend = ShellBackend::with_runner(termux_profile(), runner).unwrap();
 
         let record = backend.exec(read_request()).await.unwrap();
 
@@ -1187,7 +1196,7 @@ mod tests {
         let stderr = "avc: denied { read } for pid=1234 comm=\"cat\" \
                       name=u:object_r:system_file:s0 tclass=file permissive=0\n";
         let runner = FakeShell::app().stderr(stderr).exit(Some(1)).into_runner();
-        let backend = TermuxBackend::with_runner(termux_profile(), runner).unwrap();
+        let backend = ShellBackend::with_runner(termux_profile(), runner).unwrap();
 
         let record = backend.exec(read_request()).await.unwrap();
 
@@ -1200,7 +1209,7 @@ mod tests {
     #[tokio::test]
     async fn a_timeout_is_a_record_with_evidence_not_an_error_without_any() {
         let runner = FakeShell::app().body("partial").timed_out().into_runner();
-        let backend = TermuxBackend::with_runner(termux_profile(), runner).unwrap();
+        let backend = ShellBackend::with_runner(termux_profile(), runner).unwrap();
 
         let record = backend.exec(read_request()).await.unwrap();
 
@@ -1225,7 +1234,7 @@ mod tests {
         // An invalid env key is rejected by `script::prepare`. The runner must never be called,
         // because a half-built script is not something to hand to a shell.
         let runner = FakeShell::app().into_runner();
-        let backend = TermuxBackend::with_runner(termux_profile(), runner).unwrap();
+        let backend = ShellBackend::with_runner(termux_profile(), runner).unwrap();
 
         let mut request = read_request();
         request.env = env_map(&[("1BAD", "x")]);
@@ -1248,7 +1257,7 @@ mod tests {
             .body("x".repeat(512).as_str())
             .truncated()
             .into_runner();
-        let backend = TermuxBackend::with_runner(termux_profile(), runner).unwrap();
+        let backend = ShellBackend::with_runner(termux_profile(), runner).unwrap();
 
         let record = backend.exec(read_request()).await.unwrap();
         assert!(record.truncated);
@@ -1367,7 +1376,7 @@ mod tests {
     #[tokio::test]
     async fn a_missing_shell_binary_is_a_broken_backend_not_a_missing_privilege() {
         // The same failure at the seam, classified by whether a privileged helper was involved.
-        let backend = TermuxBackend::with_runner(termux_profile(), UnavailableRunner).unwrap();
+        let backend = ShellBackend::with_runner(termux_profile(), UnavailableRunner).unwrap();
         let err = backend.exec(read_request()).await.unwrap_err();
         match err {
             BackendError::Backend(why) => {

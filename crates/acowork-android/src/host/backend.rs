@@ -363,7 +363,7 @@ impl std::error::Error for BackendError {}
 
 /// The Android execution mechanism.
 ///
-/// Three implementations are expected (ADR-AND-001 §4.2): `TermuxBackend` (app uid,
+/// Three implementations are expected (ADR-AND-001 §4.2): `ShellBackend` (app uid,
 /// bash, `$PREFIX`), `AppSandboxBackend` (scoped storage, **no shell**), and
 /// `RootShellBackend` (`su -c` mksh plus toybox/busybox).
 ///

@@ -57,6 +57,14 @@ pub enum HostProfileName {
     ApkSandbox,
     /// Termux: app uid, bash, `$PREFIX`.
     Termux,
+    /// An unprivileged shell that is not Termux: `adb shell` on a stock device — uid 2000,
+    /// `/system/bin/sh` (mksh), no bash, no `$PREFIX`, no `su`.
+    ///
+    /// This tier exists because the alternative was a lie in the audit record. Classifying
+    /// this host as `Termux` reported `"profile": "termux"` for a device with no Termux
+    /// installed, and a control plane reading that would conclude a bash-capable,
+    /// `$PREFIX`-having environment was available when neither probe item had found one.
+    SystemShell,
     /// A rooted debugging device: `su -c` escalation is available.
     RootShell,
 }
@@ -81,6 +89,7 @@ impl HostProfileName {
         match self {
             HostProfileName::ApkSandbox => "apk-sandbox",
             HostProfileName::Termux => "termux",
+            HostProfileName::SystemShell => "system-shell",
             HostProfileName::RootShell => "root-shell",
         }
     }
@@ -415,17 +424,22 @@ impl HostProfile {
         };
 
         // ── Profile tier ───────────────────────────────────────────────────
-        // Precedence RootShell > Termux > ApkSandbox, where the dividing line
-        // between Termux and ApkSandbox is **whether a shell actually executed**.
+        // Precedence RootShell > Termux > SystemShell > ApkSandbox, where the
+        // dividing line between the shell tiers and ApkSandbox is **whether a shell
+        // actually executed**.
         //
         // Making that the criterion rather than "is $PREFIX set" is what turns the
         // invariant into a structural one: ApkSandbox holds if and only if no
         // shell was detected, so an ApkSandbox profile can never declare a shell
-        // capability. Keying on `$PREFIX` instead would misclassify an
-        // `adb shell` host (uid 2000, mksh, no Termux, no su) as ApkSandbox while
-        // still deriving `android:shell:read` from the detected shell — a profile
-        // that contradicts itself. `$PREFIX` remains the marker that decides the
-        // *primary dialect* above, which is where it actually belongs.
+        // capability.
+        //
+        // `$PREFIX` and the resolved `bash` then split the shell tiers, which is where
+        // those markers actually belong: they say *which* shell environment the device
+        // offered, not whether it offered one. Using "a shell ran" alone for that split
+        // called this crate's own test device Termux — a Huawei with no Termux anywhere
+        // on it — and put `"profile": "termux"` in the audit record, which is a claim
+        // about installed software that nothing in the probe had observed. The tier a
+        // device is *not* in is as much a fabrication as a path it invented.
         //
         // The precedence itself is an inference: neither the ADR nor the probe
         // spec states it. Recorded as B9 in the readiness assessment.
@@ -434,10 +448,12 @@ impl HostProfile {
             HostProfileName::ApkSandbox
         } else if su.got_root() {
             HostProfileName::RootShell
-        } else if shell_executed {
+        } else if !shell_executed {
+            HostProfileName::ApkSandbox
+        } else if paths.bash.is_some() || paths.termux_prefix.is_some() {
             HostProfileName::Termux
         } else {
-            HostProfileName::ApkSandbox
+            HostProfileName::SystemShell
         };
 
         let mut profile = HostProfile {
@@ -751,6 +767,48 @@ mod tests {
             "Termux without su must stay read-only"
         );
         assert!(!p.caps.is_declared(&Capability::FsSystem.id()));
+    }
+
+    /// The device this port was first run against: uid 2000, `/system/bin/sh` answering to
+    /// mksh, no bash, no `$PREFIX`, no su.
+    ///
+    /// Until this tier existed that host was reported as `Termux`, which is a claim about
+    /// installed software that neither probe item 5a (`command -v bash`) nor item 13 (`$PREFIX`)
+    /// had observed. The name lands in `HostSummary.profile` and in every exec record, so the
+    /// fabrication was reported upstream on every call.
+    #[test]
+    fn a_shell_without_termux_markers_is_the_system_shell_tier() {
+        let probe = ProbeOutput {
+            su: None,
+            bash_path: None,
+            termux_prefix: None,
+            system_sh_version: Some(out("KSH=@(#)MIRBSD KSH R57 2019-03-01 Android\nBASH=\n")),
+            prop_veritymode: Some(out("enforcing\n")),
+            system_remount: None,
+            fs_roots: vec![FsRoot {
+                path: "/data/local/tmp".to_string(),
+                writable: true,
+                own_package: false,
+            }],
+            ..rooted_probe()
+        };
+        let p = HostProfile::assemble(&probe, "com.acowork.node");
+        assert_eq!(p.name, HostProfileName::SystemShell);
+        assert_eq!(p.name.as_str(), "system-shell");
+        assert!(p.shell_executed);
+        assert_eq!(p.shell, Some(ShellDialect::MkSh));
+        assert_eq!(p.paths.bash, None);
+        assert_eq!(p.paths.termux_prefix, None);
+
+        // Same capability consequences as Termux: for `shell:read` a shell is a shell, and
+        // the absence of root still means no write. The new tier changes what the host *is*,
+        // not what it may do.
+        assert!(p.caps.is_declared(&Capability::ShellRead.id()));
+        assert!(!p.caps.is_declared(&Capability::ShellWrite.id()));
+        assert!(!p.caps.is_declared(&Capability::FsSystem.id()));
+
+        // And it is not the sandbox tier, whose defining property is that nothing ran.
+        assert!(p.name.has_shell());
     }
 
     #[test]
