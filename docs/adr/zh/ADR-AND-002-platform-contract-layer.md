@@ -1,6 +1,6 @@
 # ADR-AND-002: 平台中立契约层 `acowork-platform-contract`
 
-- **状态**：Accepted —— 已落地，395 测试通过（契约层 83 + Android 单元 221 + Android 契约 23 + Android 规则一致性 43 + 真进程 12 + 真机地面实况 13），clippy `-D warnings` 零告警（host 与裸机 target 各自验证），`--no-default-features` 下 `no_std` 构建通过，且已在 `riscv32imc-unknown-none-elf`（无 OS、无原子指令）上编译通过
+- **状态**：Accepted —— 已落地，396 测试通过（契约层 83 + Android 单元 221 + Android 契约 23 + Android 规则一致性 43 + 真进程 13 + 真机地面实况 13），clippy `-D warnings` 零告警（host 与裸机 target 各自验证），`--no-default-features` 下 `no_std` 构建通过，且已在 `riscv32imc-unknown-none-elf`（无 OS、无原子指令）上编译通过
 - **日期**：2026-10-29
 - **相关**：[ADR-AND-001](ADR-AND-001-android-host-profiles-and-execution-backend.md)（本 ADR 改变其 §7.1 / §7.4 的**落点**、把 §4.4 的散文式权限描述**细化**为四轴，不推翻其决策）、[android-host-probe.md](../../design/zh/android-host-probe.md)、[开发就绪度评估](../../review/zh/2026-10-28-readiness-assessment.md) B1/B2/B3
 - **实现**：`crates/acowork-platform-contract/`（规则）、`crates/acowork-android/src/host/`（事实与机制）、`crates/acowork-android/tests/rules_conformance.rs`（一致性证据）

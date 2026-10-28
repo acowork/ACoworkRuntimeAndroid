@@ -18,7 +18,7 @@
 ---
 
 > **状态：早期开发。** 设计文档齐备，P0 切片（HostProfile 探测、脚本装配、进程生成、
-> `ExecutionBackend` 实现、§4.4 只读档护栏、§4.5 动态工具描述）已交付为可构建、可测试的 Rust 库，395 个测试通过，
+> `ExecutionBackend` 实现、§4.4 只读档护栏、§4.5 动态工具描述）已交付为可构建、可测试的 Rust 库，396 个测试通过，
 > 且整条链路已在真机上跑通过（华为 BLA-AL00，经 adb：18 条只读探测 → `HostProfile` → 真实命令，
 > ~120ms / exit 0，其中 `logcat` 之所以能跑，是因为探测项 6c 去抽查了它）。
 > **仍无 node 二进制产物**——目前唯一可运行的东西就是那个真机 harness——不适合用于生产环境。
@@ -218,7 +218,7 @@ graph TD
 
 ```bash
 cargo build                                        # 构建
-cargo test                                         # 395 个测试（Android 单元 221 + 契约层 83 + 契约集成 23 + 规则一致性 43 + 真进程 12 + 真机地面实况 13）
+cargo test                                         # 396 个测试（Android 单元 221 + 契约层 83 + 契约集成 23 + 规则一致性 43 + 真进程 13 + 真机地面实况 13）
 cargo clippy --all-targets -- -D warnings          # 上游 CI 约定，须零告警
 cargo fmt --check
 ```
