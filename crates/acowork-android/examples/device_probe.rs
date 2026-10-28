@@ -130,6 +130,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
         report_audit(&profile, &transport).await?;
         println!("\n── 7. §4.6 item 6 evidence surface ─────────────────");
         report_evidence(&profile);
+        println!("\n── 8. §7.1 projection redaction ───────────────────");
+        report_projection(&profile, &transport).await;
     }
 
     Ok(())
@@ -322,6 +324,76 @@ async fn report_exec(profile: &HostProfile, transport: &AdbTransport) {
             }
         }
         Err(e) => println!("  failed       : {e}"),
+    }
+}
+
+/// Check the §7.1 red line on the **output of a real command**, not only on the port's own
+/// error strings.
+///
+/// The rule forbids denial detail crossing the port, and the realistic carrier is not the
+/// error stream: an avc record is written by the kernel to the audit log, so it reaches this
+/// process as the *stdout* of `logcat -d` — the exact command ADR-AND-001 §4.6 item 6 tells
+/// an agent to run for evidence. A redactor wired only to stderr would ship the MLS
+/// categories of whatever app tripped the denial inside the log dump the agent asked for.
+///
+/// Printed rather than asserted, because the device decides whether there is anything to
+/// check: a quiet log window means the path was not exercised, and saying so out loud is
+/// worth more than a green line that proved nothing.
+async fn report_projection(profile: &HostProfile, transport: &AdbTransport) {
+    let backend = match ShellBackend::with_runner(profile.clone(), transport.clone()) {
+        Ok(b) => b,
+        Err(e) => {
+            println!("  no shell backend for this profile: {e}");
+            return;
+        }
+    };
+    // One command replays the audit log, one is very likely to be refused by policy on a
+    // `user` build, so the blocked-but-clean-exit shape is exercised in the same pass.
+    for script in [
+        "logcat -d -b events -t 400",
+        "cat /data/system/packages.xml",
+    ] {
+        let request = ExecRequest::read(script, "harness-session");
+        let record = match backend.exec(request).await {
+            Ok(r) => r,
+            Err(e) => {
+                println!("\n  {script}\n    failed: {e}");
+                continue;
+            }
+        };
+        let projected = record.to_contract();
+        let out = String::from_utf8_lossy(&projected.stdout.bytes).into_owned();
+        let err = String::from_utf8_lossy(&projected.stderr.bytes).into_owned();
+        let raw = format!("{}{}", record.stdout, record.stderr);
+        let wire = format!("{out}{err}");
+        let denials = acowork_android::host::parse_denials(&raw);
+        println!("\n  {script}");
+        println!(
+            "    exit {:?}  {}ms  {} avc record(s) in the raw output",
+            record.exit_code,
+            record.duration_ms,
+            denials.len()
+        );
+        for token in ["u:r:", "u:object_r:", "s0:c"] {
+            println!(
+                "    {token:<12} raw {:>4}   projected {:>4}{}",
+                raw.matches(token).count(),
+                wire.matches(token).count(),
+                if wire.contains(token) {
+                    "  <- LEAK"
+                } else {
+                    ""
+                }
+            );
+        }
+        println!(
+            "    audit records: {} denied in raw, {} avc-shaped lines redacted",
+            denials.len(),
+            raw.lines().filter(|l| l.contains("avc:")).count()
+        );
+        if let Some(line) = denials.first().map(|d| d.summary()) {
+            println!("    summarised as: {line}");
+        }
     }
 }
 

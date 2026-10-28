@@ -399,13 +399,136 @@ fn the_exec_error_path_never_leaks_device_detail_either() {
     };
     assert_eq!(record.context.as_deref(), Some(context));
     assert!(!record.selinux_denials.is_empty());
-    let wire = serde_json::to_string(&record.to_contract()).unwrap();
-    for forbidden in ["u:r:", "c166", "s0:c"] {
+    let (stdout, stderr) = streams(&record.to_contract());
+    assert_eq!(stdout, "");
+    for forbidden in ["u:r:", "c166", "s0:c", "untrusted_app"] {
         assert!(
-            !wire.contains(forbidden),
-            "ExecOutcome leaked `{forbidden}`: {wire}"
+            !stderr.contains(forbidden),
+            "ExecOutcome stream leaked `{forbidden}`: {stderr}"
         );
     }
+    // And the projection is still useful on the far side (R9): the refusal itself crosses.
+    assert!(stderr.contains("avc: denied {read}"), "{stderr}");
+    assert!(stderr.contains("of type shell_data_file"), "{stderr}");
+    assert!(stderr.contains("enforced denial"), "{stderr}");
+}
+
+#[test]
+fn a_denial_that_arrived_on_stdout_is_redacted_there_too() {
+    // §4.6 item 6's evidence commands print kernel avc records on *stdout*: `logcat -d`
+    // replays the audit ring buffer, and `dumpsys` carries the same lines. A redactor wired
+    // only to the error stream would leave an APK-tier host's MLS categories on the wire
+    // with the agent's own log dump as the carrier — and that dump is the deliverable.
+    let logcat = "--------- beginning of kernel\n\
+                  01-01 00:00:01.000   0   0 I auditd  : avc:  denied  { read } for  \
+                  comm=\"cat\" scontext=u:r:untrusted_app:s0:c166,c232 \
+                  tcontext=u:object_r:system_data_file:s0 tclass=file permissive=0\n\
+                  01-01 00:00:02.000  1234 1234 I ActivityTaskManager: START u0\n";
+    let record = ExecRecord {
+        stdout: logcat.to_string(),
+        stderr: String::new(),
+        exit_code: Some(0),
+        selinux_denials: parse_denials(logcat),
+        uid: Some(10166),
+        context: Some("u:r:untrusted_app:s0:c166,c232".into()),
+        duration_ms: 5,
+        truncated: false,
+        timed_out: false,
+    };
+    assert_eq!(
+        record.selinux_denials.len(),
+        1,
+        "the dmesg spelling must parse"
+    );
+    let (stdout, _) = streams(&record.to_contract());
+    for forbidden in ["c166", "c232", "s0:c", "u:r:", "u:object_r:"] {
+        assert!(
+            !stdout.contains(forbidden),
+            "stdout leaked `{forbidden}`: {stdout}"
+        );
+    }
+    // Everything that is not a denial record survives — the header, the timestamps, the
+    // unrelated line the agent actually asked for.
+    assert!(stdout.contains("--------- beginning of kernel"), "{stdout}");
+    assert!(stdout.contains("ActivityTaskManager"), "{stdout}");
+    assert!(
+        stdout.contains("avc: denied {read} on file of type system_data_file"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn a_ps_dash_z_row_is_not_a_denial_and_keeps_its_labels() {
+    // The other half of the boundary. §7.1 withholds denial *detail*, not every security
+    // label a device can print: `ps -Z` exists on a debugging host precisely so an agent can
+    // see which domain a process runs in. Redacting that would break the platform's own
+    // diagnostic surface in order to satisfy a rule about audit records.
+    let ps = "USER           PID  PPID     STIME COMMAND\n\
+              u:r:shell:s0  1234     1  00:00:00 cat\n";
+    let record = ExecRecord {
+        stdout: ps.to_string(),
+        stderr: String::new(),
+        exit_code: Some(0),
+        selinux_denials: Vec::new(),
+        uid: Some(2000),
+        context: Some("u:r:shell:s0".into()),
+        duration_ms: 5,
+        truncated: false,
+        timed_out: false,
+    };
+    let (stdout, stderr) = streams(&record.to_contract());
+    assert!(stdout.contains("u:r:shell:s0"), "{stdout}");
+    assert!(
+        stderr.is_empty(),
+        "a clean run must gain no commentary: {stderr}"
+    );
+}
+
+#[test]
+fn a_logcat_dump_of_other_processes_denials_is_not_this_runs_block() {
+    // The redaction and the record answer different questions. `selinux_denials` is "what the
+    // kernel refused *this* command", read from its own stderr, and it drives
+    // `was_blocked_by_selinux` — which is what makes the port say "SELinux stopped this" and
+    // suggest escalation. `logcat -d` prints other processes' historical records on *stdout*,
+    // and a projection that parsed those into the same field would report a successful 175-
+    // line log dump as a blocked run and send the agent off to request root it does not need.
+    // The bytes are still redacted; the record is still honest.
+    let dump = "10-29 00:43:44.072   688   688 I auditd  : type=1400 audit(0.0:17248): \
+                avc: denied { read } for pid=688 comm=\"health\" \
+                scontext=u:r:hal_health_default:s0 tcontext=u:object_r:system_prop:s0 \
+                tclass=file permissive=0\n";
+    let record = ExecRecord {
+        stdout: dump.to_string(),
+        stderr: String::new(),
+        exit_code: Some(0),
+        selinux_denials: Vec::new(),
+        uid: Some(2000),
+        context: Some("u:r:shell:s0".into()),
+        duration_ms: 180,
+        truncated: false,
+        timed_out: false,
+    };
+    assert!(!record.was_blocked_by_selinux());
+    let (stdout, stderr) = streams(&record.to_contract());
+    assert!(!stdout.contains("u:r:"), "{stdout}");
+    assert!(
+        stdout.contains("avc: denied {read} on file of type system_prop"),
+        "{stdout}"
+    );
+    // No "denial(s) against this run" commentary on a command that ran clean.
+    assert!(!stderr.contains("against this run"), "{stderr}");
+}
+
+/// The two streams of a projected outcome, as text.
+///
+/// `ExecOutput.bytes` is a `Vec<u8>`, which serde writes as an array of numbers. Asserting
+/// on `serde_json::to_string(&outcome)` therefore passes for *any* content — the first
+/// version of the test above did exactly that and proved nothing while the raw denial text
+/// sailed through unchanged. Decode before searching.
+fn streams(outcome: &acowork_platform_contract::ExecOutcome) -> (String, String) {
+    let one =
+        |o: &acowork_platform_contract::ExecOutput| String::from_utf8_lossy(&o.bytes).into_owned();
+    (one(&outcome.stdout), one(&outcome.stderr))
 }
 
 // ── The §7.4 conjunction, end to end ────────────────────────────────────────

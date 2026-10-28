@@ -86,7 +86,9 @@ pub use commands::{
     Effect, Finding, Refusal, RefusalKind, Verdict, check as check_script,
     classify as classify_script,
 };
-pub use denial::{DenialLedger, SelinuxClassifier, SelinuxDenial, classify, parse_denials};
+pub use denial::{
+    DenialLedger, SelinuxClassifier, SelinuxDenial, classify, parse_denials, redact_denials,
+};
 pub use facts::{
     AppletSet, BuildType, DeviceFacts, FsRoot, MountEntry, Privilege, SelinuxDomain, SelinuxState,
     ShellDialect, SuProbe, VerityState, parse_bool_prop, parse_mount_table, parse_prop,

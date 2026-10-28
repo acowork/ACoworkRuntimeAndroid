@@ -271,14 +271,43 @@ impl ExecRecord {
                 None => Ok(ExitStatus::Terminated),
             }
         };
+        // Redaction, not omission: §7.1 keeps `observed-denials` *detail* off the wire, and
+        // the detail is the context pair, not the fact that a policy refused something. The
+        // raw lines stay in this record and in the audit log; what crosses carries the
+        // permissions, the object class and the target type, which is everything needed to
+        // decide a next step and nothing that identifies the handset.
+        let stdout = crate::host::denial::redact_denials(&self.stdout);
+        let mut stderr = crate::host::denial::redact_denials(&self.stderr);
+        if self.was_blocked_by_selinux() {
+            let blocked = self
+                .selinux_denials
+                .iter()
+                .filter(|d| !d.permissive)
+                .count();
+            let logged = self.selinux_denials.len() - blocked;
+            let mut hint = format!(
+                "\nselinux: {blocked} enforced denial(s) against this run (domain: {})",
+                domain_class(self.context.as_deref())
+            );
+            if logged > 0 {
+                hint.push_str(&format!(
+                    "; {logged} more were logged while permissive, which is not why this failed"
+                ));
+            }
+            hint.push_str(
+                ". The raw records name labels assigned to this device, so they are withheld \
+                 here and kept in the audit log on the device.",
+            );
+            stderr.push_str(&hint);
+        }
         ExecOutcome {
             result,
             stdout: ContractExecOutput {
-                bytes: self.stdout.as_bytes().to_vec(),
+                bytes: stdout.into_bytes(),
                 truncated: self.truncated,
             },
             stderr: ContractExecOutput {
-                bytes: self.stderr.as_bytes().to_vec(),
+                bytes: stderr.into_bytes(),
                 truncated: self.truncated,
             },
         }

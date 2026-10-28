@@ -84,6 +84,58 @@ impl SelinuxDenial {
             self.tclass.as_deref().unwrap_or("?")
         )
     }
+
+    /// This denial restated with nothing in it that identifies the device.
+    ///
+    /// Keeps the three fields that decide a next step — the permissions, the object class,
+    /// and the target's *type* — and drops the user, role and MLS range of both contexts
+    /// along with the path. The type (`shell_data_file`, `system_data_file`) is policy
+    /// vocabulary shipped in the platform's own sepolicy and is the same on every device
+    /// running that Android version; `s0:c166,c232` is assigned per install and names this
+    /// handset.
+    ///
+    /// The wording is deliberately not the raw record's, so a line quoting one cannot be
+    /// mistaken for the other in a log.
+    pub fn summary(&self) -> String {
+        self.summary_with("denied")
+    }
+
+    /// [`Self::summary`] with the verdict word supplied, because the same record shape also
+    /// reads `avc: granted` and a summary must not turn an allowed access into a block.
+    pub fn summary_with(&self, verdict: &str) -> String {
+        let perms = self.permissions.join(" ");
+        let target = match self.tcontext.as_deref().and_then(context_type) {
+            Some(ty) => format!("of type {ty}"),
+            None => "of an unknown type".to_string(),
+        };
+        let class = self.tclass.as_deref().unwrap_or("object");
+        let state = if verdict != "denied" {
+            "allowed"
+        } else if self.permissive {
+            "logged, not enforced"
+        } else {
+            "enforced"
+        };
+        format!("avc: {verdict} {{{perms}}} on {class} {target} ({state})")
+    }
+}
+
+/// The type field of an SELinux context: `u:object_r:shell_data_file:s0` ->
+/// `shell_data_file`.
+///
+/// `None` for anything that is not the four-field `user:role:type:range` shape, rather than
+/// guessing which field is the type: an unrecognised context must produce "of an unknown
+/// type", not a fragment of a security label promoted into a diagnosis.
+fn context_type(context: &str) -> Option<&str> {
+    let mut parts = context.split(':');
+    let (user, role, ty, range) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() || user.is_empty() || role.is_empty() || ty.is_empty() {
+        return None;
+    }
+    // `range` may be a bare `s0` or an MLS form with commas; either way it is dropped here,
+    // which is the point of the function.
+    let _ = range;
+    Some(ty)
 }
 
 /// Extract every `avc: denied` record from a stderr (or logcat) blob.
@@ -100,7 +152,7 @@ impl SelinuxDenial {
 pub fn parse_denials(blob: &str) -> Vec<SelinuxDenial> {
     let mut out = Vec::new();
     for line in blob.lines() {
-        let Some(start) = line.find("avc: denied") else {
+        let Some((start, "denied")) = avc_record(line) else {
             continue;
         };
         if let Some(denial) = parse_one_denial(&line[start..]) {
@@ -108,6 +160,82 @@ pub fn parse_denials(blob: &str) -> Vec<SelinuxDenial> {
         }
     }
     out
+}
+
+/// Where this line's SELinux audit record begins and what verdict it carries, if it has one.
+///
+/// Whitespace runs are tolerated rather than assumed to be one space, because the same
+/// record is printed two ways: `logcat` and auditd write `avc: denied { read }`, while the
+/// kernel's own dmesg format writes `avc:  denied  { read }` with the spaces doubled. A
+/// matcher that required the single-space spelling would read a dmesg-sourced denial as "no
+/// denial here", and the consequence is not cosmetic —
+/// [`ExecRecord::was_blocked_by_selinux`](crate::host::backend::ExecRecord) would call a
+/// SELinux-blocked run clean, and the model would retry the same command forever.
+///
+/// `granted` is matched as well as `denied`, which is not decoration: measured on the Huawei
+/// BLA-AL00, `logcat -b events` replays `avc: granted { execute }` records for third-party
+/// apps, and they carry the same `scontext` / `tcontext` pair and a path inside another
+/// app's private directory. A redactor keyed only to the word "denied" ships those labels
+/// off the device while believing it redacted everything. They stay out of
+/// [`parse_denials`], though: an allowed access is not a block, and counting it as one would
+/// make the port report SELinux as the cause of a command that succeeded.
+fn avc_record(line: &str) -> Option<(usize, &'static str)> {
+    let at = line.find("avc:")?;
+    let after = line[at + 4..].trim_start();
+    let verdict = if after.starts_with("denied") {
+        "denied"
+    } else if after.starts_with("granted") {
+        "granted"
+    } else {
+        return None;
+    };
+    Some((at, verdict))
+}
+
+/// Rewrite every SELinux audit record in a stream into a form that carries the policy and
+/// none of the device identity, leaving every other byte as it arrived.
+///
+/// This is the redaction step at the projection boundary, and its scope is deliberately
+/// narrow. §7.1 forbids `observed-denials` *detail* from crossing the port, and the detail
+/// in an audit record is exactly the `scontext` / `tcontext` pair — which on an APK-tier host
+/// carries MLS categories assigned at install time, i.e. a device fingerprint rather than a
+/// policy label — plus the object path, which names whichever apps happen to be installed.
+/// It does not forbid command output: `ps -Z` and `ls -Z` print contexts because reading
+/// them is the reason a debugging agent is on the device at all, and a redactor that scrubbed
+/// every `u:r:` in sight would break the platform's own diagnostic surface. So the unit of
+/// redaction is the audit record, not the security label.
+///
+/// A line that carries audit fields and cannot be parsed is replaced by an opaque marker
+/// rather than kept. Passing through what we could not understand is fail-open on the one
+/// field the rule exists to protect.
+pub fn redact_denials(text: &str) -> String {
+    if !text.contains("avc:") && !text.contains("scontext=") {
+        // The common case. Returning the text unchanged keeps the bytes identical for every
+        // command that did not touch a policy record — no line re-join, no trailing-newline
+        // surprise, no allocation.
+        return text.to_string();
+    }
+    let withheld = "avc: audit record unparseable; withheld";
+    let mut out = Vec::new();
+    for line in text.lines() {
+        match avc_record(line) {
+            Some((start, verdict)) => {
+                let summary = parse_one_denial(&line[start..])
+                    .map(|d| d.summary_with(verdict))
+                    .unwrap_or_else(|| withheld.to_string());
+                out.push(format!("{}{summary}", &line[..start]));
+            }
+            // A line with audit fields and no `avc:` marker is not a record this parser can
+            // reason about — but it is still carrying labels, so it goes.
+            None if line.contains("scontext=") => out.push(withheld.to_string()),
+            None => out.push(line.to_string()),
+        }
+    }
+    let mut joined = out.join("\n");
+    if text.ends_with('\n') {
+        joined.push('\n');
+    }
+    joined
 }
 
 fn parse_one_denial(text: &str) -> Option<SelinuxDenial> {
@@ -925,5 +1053,161 @@ scontext=u:r:shell:s0 tcontext=u:object_r:shell_data_file:s0 tclass=file permiss
         ledger.record(&b, &p);
         assert_eq!(ledger.distinct_targets(), 2);
         assert!(ledger.is_repeat(&a));
+    }
+
+    #[test]
+    fn a_summary_keeps_the_policy_and_drops_the_identity() {
+        let d = &parse_denials(REAL_LINE)[0];
+        let s = d.summary();
+        // What decides the next step: which permissions, on which class, of which type.
+        assert!(s.contains("{read open}"), "{s}");
+        assert!(s.contains("of type system_data_file"), "{s}");
+        assert!(s.contains("enforced"), "{s}");
+        // What names this handset: the app's MLS categories, the target's range, the path
+        // outside the sandbox, and the pid.
+        for forbidden in [
+            "c512",
+            "c768",
+            "s0:c",
+            "packages.xml",
+            "4321",
+            "u:r:",
+            "u:object_r:",
+        ] {
+            assert!(!s.contains(forbidden), "summary leaked `{forbidden}`: {s}");
+        }
+    }
+
+    #[test]
+    fn a_permissive_denial_is_summarised_as_not_the_cause() {
+        // `permissive=1` is the kernel saying it let this through and noted it. A summary
+        // that read like a block would send the model off to fix a policy that did not stop
+        // the command.
+        let line = "avc: denied { search } for pid=99 comm=\"dumpsys\" \
+                    scontext=u:r:shell:s0 tcontext=u:object_r:system_data_file:s0 tclass=dir \
+                    permissive=1";
+        let d = &parse_denials(line)[0];
+        let s = d.summary();
+        assert!(s.contains("logged, not enforced"), "{s}");
+        assert!(!s.contains("99"), "{s}");
+    }
+
+    #[test]
+    fn a_context_that_is_not_the_four_field_shape_yields_no_type() {
+        // Guessing which field is the type would turn a malformed label into a confident
+        // wrong diagnosis: "of type s0" is worse than "of an unknown type".
+        assert_eq!(
+            context_type("u:object_r:shell_data_file:s0").unwrap(),
+            "shell_data_file"
+        );
+        assert_eq!(context_type("u:object_r:shell_data_file"), None);
+        assert_eq!(context_type("u:object_r::s0"), None);
+        assert_eq!(context_type("shell_data_file"), None);
+        assert_eq!(context_type("a:b:c:d:e"), None);
+    }
+
+    #[test]
+    fn redaction_rewrites_the_denial_and_touches_nothing_else() {
+        let blob = format!(
+            "cat: /data/system/packages.xml: Permission denied\n{REAL_LINE}\n\
+             1234 u:r:shell:s0 shell shell 1234 cat\n"
+        );
+        let out = redact_denials(&blob);
+        // Line 1 (the tool's own error) and line 3 (a `ps -Z` row, whose context is the
+        // reason the command was run) survive byte-for-byte.
+        assert!(
+            out.starts_with("cat: /data/system/packages.xml: Permission denied\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("1234 u:r:shell:s0 shell shell 1234 cat"),
+            "{out}"
+        );
+        // The denial line keeps its logcat prefix and loses its labels.
+        assert!(
+            out.contains("avc: denied {read open} on file of type system_data_file"),
+            "{out}"
+        );
+        assert!(!out.contains("u:object_r:"), "{out}");
+        assert!(!out.contains("s0:c"), "{out}");
+        assert!(!out.contains("c512"), "{out}");
+    }
+
+    #[test]
+    fn a_text_without_denials_is_returned_byte_identical() {
+        // The fast path is not just a speed thing: a redactor that re-joined lines would
+        // change trailing-newline and blank-line structure for every command that ran clean.
+        let blob = "total 12\ndrwxr-x  2 root root 4096 Jan 1 00:00 .\n\n";
+        assert_eq!(redact_denials(blob), blob);
+    }
+
+    #[test]
+    fn an_unparseable_denial_is_withheld_not_passed_through() {
+        // Fail-closed. A line that says `avc: denied` and then something the parser does not
+        // recognise is more likely to carry a label in an unknown arrangement than to carry
+        // nothing, and keeping it because we could not read it is the wrong default.
+        let line = "avc: denied garbage with scontext=u:r:untrusted_app:s0:c166,c232";
+        let out = redact_denials(line);
+        assert!(out.contains("withheld"), "{out}");
+        assert!(!out.contains("c166"), "{out}");
+        assert!(!out.contains("u:r:"), "{out}");
+    }
+
+    #[test]
+    fn a_granted_record_is_redacted_without_being_called_a_block() {
+        // Measured on the BLA-AL00's `logcat -b events`: the buffer replays
+        // `avc: granted { execute }` records that carry the same label pair as a denial, plus
+        // a path inside a third-party app's private directory. Redacting them is required;
+        // calling one a denial would be a fabrication, and the port's next step would be to
+        // "fix" an access the policy allowed.
+        let line = "10-29 01:04:55.116   642   642 I auditd  : type=1400 audit(0.0:17354): \
+                    avc: granted { execute } for pid=642 comm=\"Thread-8\" \
+                    path=\"/data/data/com.example.app/files/lib/x.so\" \
+                    dev=\"mmcblk0\" ino=45107 scontext=u:r:untrusted_app:s0:c51,c256 \
+                    tcontext=u:object_r:app_data_file:s0 tclass=file permissive=0";
+        assert!(
+            parse_denials(line).is_empty(),
+            "an allowed access must not count as a block"
+        );
+        let out = redact_denials(line);
+        assert!(
+            out.contains("avc: granted {execute} on file of type app_data_file"),
+            "{out}"
+        );
+        assert!(out.contains("(allowed)"), "{out}");
+        for forbidden in ["u:r:", "u:object_r:", "s0:c", "c51", "com.example.app"] {
+            assert!(
+                !out.contains(forbidden),
+                "granted record leaked `{forbidden}`: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_audit_line_without_the_avc_marker_is_withheld_too() {
+        // The matcher is a shape guess, not a guarantee: a vendor that prints the fields on a
+        // line without `avc:` on it still must not ship the labels.
+        let line = "type=1400 audit(0.0:99): scontext=u:r:untrusted_app:s0:c166,c232 \
+                    tcontext=u:object_r:system_data_file:s0 tclass=file";
+        let out = redact_denials(line);
+        assert!(out.contains("withheld"), "{out}");
+        assert!(!out.contains("c166"), "{out}");
+    }
+
+    #[test]
+    fn the_kernels_doubled_space_spelling_is_still_a_denial() {
+        // dmesg writes `avc:  denied  {` where logcat writes `avc: denied {`. Missing the
+        // first means a blocked command is reported as an ordinary non-zero exit, and the
+        // retry loop that follows is the model's only way to learn otherwise.
+        let dmesg = "type=1400 audit(1730000000.123:456): avc:  denied  { read } for  \
+                     pid=880 comm=\"cat\" scontext=u:r:shell:s0 \
+                     tcontext=u:object_r:system_data_file:s0 tclass=file permissive=0";
+        let parsed = parse_denials(dmesg);
+        assert_eq!(parsed.len(), 1, "dmesg-shaped denial was not parsed");
+        assert_eq!(parsed[0].permissions, vec!["read".to_string()]);
+        assert!(!parsed[0].permissive);
+        let out = redact_denials(dmesg);
+        assert!(!out.contains("u:r:"), "{out}");
+        assert!(out.contains("of type system_data_file"), "{out}");
     }
 }
