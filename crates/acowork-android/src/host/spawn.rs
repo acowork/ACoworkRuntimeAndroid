@@ -245,6 +245,14 @@ impl SpawnRunner for ProcessSpawnRunner {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
+        // Give the child a process group of its own, with itself as leader. Without this
+        // there is nothing to kill *as a group* later: the child would sit in the runtime's
+        // own group, and signalling that group would take the node down with it.
+        // `tokio::process::Command` mirrors std's unix `process_group` as an inherent
+        // method, so no `CommandExt` import is involved.
+        #[cfg(unix)]
+        command.process_group(0);
+
         let child: Child = command.spawn().map_err(|e| SpawnError::Unavailable {
             file: invocation.file.display().to_string(),
             reason: e.to_string(),
@@ -258,6 +266,35 @@ impl SpawnRunner for ProcessSpawnRunner {
             started,
         )
         .await
+    }
+}
+
+/// Signal every process in a child's own group.
+///
+/// The child was spawned with `process_group(0)`, so its pid *is* its group id and `-pid`
+/// addresses exactly the tree this invocation started — never the runtime's own group.
+/// `killpg` is not in `std`; `libc` is already in the graph through tokio, so this costs no
+/// new dependency at build time.
+#[cfg(unix)]
+fn kill_process_group(pgid: Option<u32>) {
+    // `None` means the child has already been reaped. Its pid may be recycled by then, and
+    // signalling it would kill an unrelated process — so there is nothing to do here, and
+    // the drain below is what bounds the damage.
+    let Some(pgid) = pgid else { return };
+    let Ok(pgid) = i32::try_from(pgid) else {
+        return;
+    };
+    if pgid <= 1 {
+        // `-1` signals every process this uid may signal, and `0` would signal our own
+        // group. Neither is ever the group of a spawned child, so refuse rather than
+        // mis-target: the failure mode is killing the node.
+        return;
+    }
+    // SAFETY: `kill` dereferences nothing; the only memory touched is the kernel's. A group
+    // that has already exited makes it return an error, which is the wanted outcome and is
+    // discarded.
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
     }
 }
 
@@ -321,16 +358,21 @@ pub(crate) async fn run_captured(
     };
 
     if timed_out {
-        // Best effort: if the process is already gone this errors, and we discard it.
-        // The exit code stays `None` either way, which is the honest answer — we do
-        // not know how it ended.
+        // Two signals, in this order, both best effort.
         //
-        // This signals the direct child only. A script that backgrounded a long-lived
-        // command leaves that grandchild running, and killing its process group needs
-        // `killpg`, which is not in `std`. The drain below makes sure the orphan cannot
-        // make *this* call hang; stopping the orphan itself is a device-side follow-up
-        // recorded in the readiness assessment, because on a phone it is a battery cost
-        // rather than a correctness one.
+        // The group first: the child was spawned as the leader of its own process group
+        // (see `ProcessSpawnRunner::spawn`), so `-pid` reaches every process it started. A
+        // script that backgrounds work — `logcat &`, `sleep 30 &` — used to leave that work
+        // running after its parent was killed; measured on the build host, a backgrounded
+        // `sleep 30` survived by 29 seconds, which on a phone is a battery cost paid by the
+        // device's owner for a command we gave up on.
+        //
+        // Then the direct child, which is the portable path and a harmless no-op when the
+        // group signal already got it. If the process is already gone both error, and that
+        // is discarded: the exit code stays `None` either way, which is the honest answer —
+        // we do not know how it ended.
+        #[cfg(unix)]
+        kill_process_group(child.id());
         let _ = child.kill().await;
     }
 

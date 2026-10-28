@@ -97,8 +97,7 @@ fn process_uid() -> u32 {
     // they run concurrently, so two calls would create and then delete the same path — and one
     // would `stat` a file the other had already removed. The counter makes each call's file
     // its own.
-    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let n = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let probe = std::env::temp_dir().join(format!("acowork-uid-{}-{}", std::process::id(), n));
     std::fs::write(&probe, b"x").expect("write uid probe file");
     let uid = std::fs::metadata(&probe)
@@ -106,6 +105,15 @@ fn process_uid() -> u32 {
         .uid();
     let _ = std::fs::remove_file(&probe);
     uid
+}
+
+static TEMP_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A temp path unique to this test process and call, for tests that need a file a *child
+/// process* writes to.
+fn unique_temp(kind: &str) -> PathBuf {
+    let n = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("acowork-{kind}-{}-{}", std::process::id(), n))
 }
 
 #[tokio::test]
@@ -324,6 +332,57 @@ async fn a_timed_out_command_still_reports_the_identity_that_ran_it() {
         "a killed command must still prove which uid ran it; stdout was {:?}",
         String::from_utf8_lossy(&out.stdout)
     );
+}
+
+/// Does a killed command take its children with it?
+///
+/// `spawn.rs` documents that the timeout path signals the direct child only, and that a
+/// backgrounded grandchild survives — "a device-side follow-up", in its words. On a phone a
+/// surviving `sleep 30` is a battery cost paid by whoever owns the device, and a comment is
+/// not evidence that the behaviour is what the code still does. This pins it.
+#[tokio::test]
+async fn a_timed_out_command_does_not_leave_its_children_running() {
+    let _process_table = own_the_process_table().await;
+    let pidfile = unique_temp("orphan-pid");
+    // Background a long-lived child, record its pid, then block in the foreground so the
+    // deadline fires while that child is still alive.
+    let script = format!("sleep 30 & echo $! > '{}'\nsleep 30\n", pidfile.display());
+    let prepared = prepare(&script, None, &base_env()).unwrap();
+
+    let mut inv = SpawnInvocation::new("/bin/sh", prepared.text.clone()).with_args(&["-s"]);
+    inv.env = base_env();
+    inv.timeout = Some(Duration::from_millis(600));
+
+    let out = ProcessSpawnRunner::new().spawn(inv).await.unwrap();
+    assert!(out.timed_out, "expected the deadline to fire");
+
+    let raw = std::fs::read_to_string(&pidfile).expect("the script recorded its child's pid");
+    let _ = std::fs::remove_file(&pidfile);
+    let pid = raw.trim();
+    assert!(!pid.is_empty(), "no pid was recorded");
+
+    let alive = process_alive(pid);
+    if alive {
+        // Never leave a 30-second sleeper behind, whether the assertion passes or not.
+        let _ = std::process::Command::new("/bin/kill")
+            .arg("-9")
+            .arg(pid)
+            .status();
+    }
+    assert!(
+        !alive,
+        "pid {pid} outlived the shell that was killed for overrunning its deadline"
+    );
+}
+
+/// `ps -p` prints a header line and one line per match, so a match is more than one line.
+fn process_alive(pid: &str) -> bool {
+    std::process::Command::new("/bin/ps")
+        .arg("-p")
+        .arg(pid)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().count() > 1)
+        .unwrap_or(false)
 }
 
 /// The end-to-end proof for `host::script`'s quoting.

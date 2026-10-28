@@ -27,6 +27,12 @@ tokio.workspace = true
 # the wire as owned `String`s. The workspace default is `no_std`; opting in is deliberate.
 serde = { workspace = true, features = ["std"] }
 
+# One call: `kill(-pgid, SIGKILL)`, to stop a timed-out command's whole process group
+# instead of only its shell (`std` has no `killpg`). Target-gated to unix, and already in
+# the build graph through tokio on every unix platform, so this adds no transitive weight.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 serde_json.workspace = true
 tokio.workspace = true
