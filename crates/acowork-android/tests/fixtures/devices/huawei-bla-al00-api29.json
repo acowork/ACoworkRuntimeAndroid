@@ -23,6 +23,12 @@
     "exit_code": 127,
     "timed_out": false
   },
+  "su_path": {
+    "stdout": "",
+    "stderr": "",
+    "exit_code": 1,
+    "timed_out": false
+  },
   "bash_path": {
     "stdout": "",
     "stderr": "",

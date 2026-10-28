@@ -138,6 +138,21 @@ fn an_absent_su_is_read_as_absent_rather_than_as_a_declined_prompt() {
     assert!(profile.su.unavailable);
     assert!(!profile.su.prompt_denied);
     assert!(!profile.su.got_root());
+
+    // Item 4a, the one added because `paths.su` was never a probed fact. On this device the
+    // shell's own lookup agrees with the fixed-path attempt: no `su` anywhere on `PATH`
+    // (`/sbin`, `/system/bin`, `/system/xbin`, `/vendor/bin`, `/vendor/xbin` and three apex
+    // dirs were all on it), so exit 1 with empty stdout and no path in the profile.
+    let su_path = ground_truth()
+        .su_path
+        .clone()
+        .expect("item 4a runs on the device");
+    assert_eq!(su_path.exit_code, Some(1));
+    assert_eq!(su_path.stdout.trim(), "");
+    assert_eq!(
+        profile.paths.su, None,
+        "an empty `command -v` answer must not become a path"
+    );
 }
 
 #[test]

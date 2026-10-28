@@ -43,7 +43,7 @@ use crate::host::facts::{
     AppletSet, DeviceFacts, FsRoot, Privilege, SelinuxDomain, SelinuxState, ShellDialect, SuProbe,
     normalize_context,
 };
-use crate::host::probe::ProbeOutput;
+use crate::host::probe::{CommandOutput, ProbeOutput};
 
 /// Which of the three host profiles this device turned out to be.
 ///
@@ -118,15 +118,17 @@ pub struct ShellPaths {
     /// The platform's own shell. Not probed: `/system/bin/sh` is what Android *is*, on
     /// every tier, and it is what a privileged helper is asked to exec.
     pub system_sh: PathBuf,
-    /// The privileged helper. **Not currently a probed fact.**
+    /// The privileged helper, as probe item 4a resolved it.
     ///
-    /// Probe item 4 invokes `su` by bare name, so it records *whether* escalation worked
-    /// and throws away *where* the binary was — and under a cleared environment a bare name
-    /// does not resolve at all. Until item 4 is revised to capture `command -v su`, a caller
-    /// supplies this from [`ShellPaths::SU_CANDIDATES`] or from the device harness. Left as
-    /// `None` rather than defaulted to a guess: a wrong path fails loudly as
-    /// `EscalationUnavailable`, whereas a plausible-but-wrong default fails as a root shell
-    /// that silently is not one.
+    /// Item 4 invokes `su` by bare name, so it records *whether* escalation worked and throws
+    /// away *where* the binary was — and under a cleared environment a bare name does not
+    /// resolve at all. Item 4a (`command -v su`) is what fills this. The two answers are
+    /// independent and both are needed: a helper that exists but refuses is not the same
+    /// situation as one that is not on `PATH`, and `RootShellBackend` distinguishes them.
+    ///
+    /// Left as `None` when the lookup found nothing rather than defaulted to a guess: a wrong
+    /// path fails loudly as `EscalationUnavailable`, whereas a plausible-but-wrong default
+    /// fails as a root shell that silently is not one.
     pub su: Option<PathBuf>,
 }
 
@@ -343,20 +345,19 @@ impl HostProfile {
             system_sh_dialect.or_else(|| dialects.iter().next().copied())
         };
 
-        // ── Item 5a: where bash actually is ────────────────────────────────
-        // `command -v bash` prints the resolved path and exits non-zero when there is none,
-        // so both conditions are needed — a non-zero exit whose stdout happens to be a
-        // leftover from a wrapper script is not a bash.
-        let bash = probe
-            .bash_path
-            .as_ref()
-            .filter(|out| out.succeeded())
-            .map(|out| out.stdout.trim().to_string())
-            .filter(|text| !text.is_empty())
-            .map(PathBuf::from);
+        // ── Items 4a and 5a: where `su` and `bash` actually are ────────────
+        // `command -v X` prints the resolved path and exits non-zero when there is none, so
+        // both conditions are needed — a non-zero exit whose stdout happens to be a leftover
+        // from a wrapper script is not the binary we asked for.
+        let bash = resolved_path(probe.bash_path.as_ref());
+        // The gap this closes is functional, not cosmetic: `RootShellBackend` refuses to be
+        // built without `paths.su`, and nothing used to fill that field, so the root tier was
+        // unreachable from an assembled profile — reachable only from a hand-written one.
+        let su_path = resolved_path(probe.su_path.as_ref());
 
         let paths = ShellPaths {
             bash,
+            su: su_path,
             termux_prefix: probe.termux_prefix.clone(),
             ..ShellPaths::android_default()
         };
@@ -551,6 +552,18 @@ impl HostProfile {
 ///
 /// Exists because [`HostProfile::assemble`] builds the struct before it has the facts
 /// to derive from; the real table is filled in on the next line.
+/// Read a `command -v` answer: the path it echoed, if and only if the lookup succeeded.
+///
+/// Shared by items 4a and 5a because both ask the same question of the same kind of answer,
+/// and because the failure mode is easy to get wrong in one place and not the other: treating
+/// "exit 1, empty stdout" as "present but unnamed" would hand a backend a `Some("")` path.
+fn resolved_path(out: Option<&CommandOutput>) -> Option<PathBuf> {
+    out.filter(|o| o.succeeded())
+        .map(|o| o.stdout.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .map(PathBuf::from)
+}
+
 fn empty_table() -> CapabilityTable {
     CapabilityTable::new(PLATFORM, android_vocabulary())
         .expect("the Android vocabulary satisfies the contract")
@@ -670,6 +683,7 @@ mod tests {
             getenforce: Some(out("Enforcing\n")),
             attr_current: Some(out("u:r:untrusted_app:s0:c512,c768\n")),
             su: Some(out("0\nu:r:magisk:s0\n")),
+            su_path: Some(out("/sbin/su\n")),
             bash_path: Some(out("")),
             system_sh_version: Some(out("KSH=@(#)MIRBSD KSH R57 2019-03-01 Android\\nBASH=\\n")),
             toybox_list: Some(out(
@@ -743,6 +757,7 @@ mod tests {
     fn termux_probe_yields_the_termux_tier_with_bash() {
         let probe = ProbeOutput {
             su: None,
+            su_path: None,
             bash_path: Some(out("/data/data/com.termux/files/usr/bin/bash\n")),
             system_sh_version: Some(out("KSH=@(#)MIRBSD KSH R57 2019-03-01 Android\nBASH=\n")),
             termux_prefix: Some("/data/data/com.termux/files/usr".to_string()),
@@ -776,10 +791,43 @@ mod tests {
     /// installed software that neither probe item 5a (`command -v bash`) nor item 13 (`$PREFIX`)
     /// had observed. The name lands in `HostSummary.profile` and in every exec record, so the
     /// fabrication was reported upstream on every call.
+    /// The root tier used to be unreachable from a probe.
+    ///
+    /// `RootShellBackend` refuses to be built without `paths.su`, and `assemble()` never
+    /// filled that field, so a rooted device that had answered every probe correctly still
+    /// could not get a backend — only a hand-written profile could. That is the shape of bug
+    /// a fixture hides: every fixture that needed a `su` path had set it by hand.
+    #[test]
+    fn the_root_tier_carries_a_su_path_a_backend_can_actually_use() {
+        let probe = rooted_probe();
+        let p = HostProfile::assemble(&probe, "com.example.agent");
+        assert_eq!(p.name, HostProfileName::RootShell);
+        assert_eq!(
+            p.paths.su,
+            Some(PathBuf::from("/sbin/su")),
+            "the resolved su must reach the profile, or the tier it names is not buildable"
+        );
+    }
+
+    #[test]
+    fn a_su_lookup_that_found_nothing_leaves_no_path() {
+        // `command -v su` exits 1 and prints nothing on a device with no su. Neither half of
+        // that may become a path: `Some("")` would satisfy the backend's presence check and
+        // then fail to exec.
+        let probe = ProbeOutput {
+            su: Some(out("127\n")),
+            su_path: Some(out("")),
+            ..rooted_probe()
+        };
+        let p = HostProfile::assemble(&probe, "com.example.agent");
+        assert_eq!(p.paths.su, None);
+    }
+
     #[test]
     fn a_shell_without_termux_markers_is_the_system_shell_tier() {
         let probe = ProbeOutput {
             su: None,
+            su_path: None,
             bash_path: None,
             termux_prefix: None,
             system_sh_version: Some(out("KSH=@(#)MIRBSD KSH R57 2019-03-01 Android\nBASH=\n")),
@@ -827,6 +875,7 @@ mod tests {
         let probe = ProbeOutput {
             id: Some(out("10233\n")),
             su: None,
+            su_path: None,
             bash_path: Some(out("")),
             system_sh_version: None,
             termux_prefix: None,

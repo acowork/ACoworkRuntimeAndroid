@@ -23,6 +23,7 @@ pub fn probe_of(pairs: &[(ProbeCommand, &str)]) -> ProbeOutput {
             ProbeCommand::GetEnforce => out.getenforce = Some(value),
             ProbeCommand::AttrCurrent => out.attr_current = Some(value),
             ProbeCommand::Su => out.su = Some(value),
+            ProbeCommand::SuPath => out.su_path = Some(value),
             ProbeCommand::BashPath => out.bash_path = Some(value),
             ProbeCommand::SystemShVersion => out.system_sh_version = Some(value),
             ProbeCommand::ToyboxList => out.toybox_list = Some(value),
@@ -109,6 +110,9 @@ pub fn rooted_probe() -> ProbeOutput {
             "u:r:untrusted_app:s0:c123,c456\n",
         ),
         (ProbeCommand::Su, "0\nu:r:magisk:s0\n"),
+        // A rooted device has `su` on `PATH`; without this, `assemble()` leaves
+        // `paths.su` empty and the root tier cannot be built from a probe at all.
+        (ProbeCommand::SuPath, "/sbin/su\n"),
         (ProbeCommand::SystemShVersion, SYSTEM_SH_VERSION),
         (ProbeCommand::ToyboxList, TOYBOX_LIST),
         (

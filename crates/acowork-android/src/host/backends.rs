@@ -420,10 +420,11 @@ impl<R: SpawnRunner> RootShellBackend<R> {
         }
         let su = profile.paths.su.clone().ok_or_else(|| {
             BackendError::EscalationUnavailable(
-                "the probe recorded that `su` works but not where it is, and a backend that \
-                 clears the child's environment cannot exec a bare command name. Supply \
-                 `HostProfile::paths.su` — `ShellPaths::resolve_su()` finds it without \
-                 escalating"
+                "probe item 4 says the helper works but item 4a (`command -v` for it) did not \
+                 return a path, and a backend that clears the child's environment cannot exec a \
+                 bare command name. Re-run the probe with item 4a included, or supply \
+                 `HostProfile::paths.su` — `ShellPaths::resolve_su()` finds it by stat, but only \
+                 when this process is running on the device itself"
                     .to_string(),
             )
         })?;
@@ -886,12 +887,14 @@ mod tests {
 
     #[test]
     fn a_root_backend_needs_to_know_where_su_is() {
-        // The documented gap: probe item 4 records that su works, not where it is.
+        // Item 4 proves the helper works; item 4a proves where it is. A profile with the first
+        // and not the second cannot be turned into a backend, and has to say which is missing.
         let mut profile = rooted_profile();
         profile.paths.su = None;
         let err = RootShellBackend::with_runner(profile, ProcessSpawnRunner::new()).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("not where it is"), "{msg}");
+        assert!(msg.contains("item 4a"), "{msg}");
+        assert!(msg.contains("command -v"), "{msg}");
         assert!(msg.contains("ShellPaths::resolve_su"), "{msg}");
     }
 

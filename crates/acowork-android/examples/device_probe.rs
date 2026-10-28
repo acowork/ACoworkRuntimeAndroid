@@ -135,8 +135,12 @@ fn report_probe(probe: &ProbeOutput) {
     field("getenforce", &probe.getenforce);
     field("attr/current", &probe.attr_current);
     field("su", &probe.su);
+    field("su on PATH", &probe.su_path);
     field("bash", &probe.bash_path);
-    field("sh --version", &probe.system_sh_version);
+    // Not "sh --version": that option is an error on Android's mksh, and what runs here is
+    // the dialect-variable probe (item 5b). The old label described the command the fixtures
+    // claimed, not the one the device was asked.
+    field("sh dialect", &probe.system_sh_version);
     field("toybox list", &probe.toybox_list);
     field("busybox list", &probe.busybox_list);
     field("mounts", &probe.mount_table);

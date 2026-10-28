@@ -61,6 +61,8 @@ pub enum ProbeCommand {
     AttrCurrent,
     /// Item 4 — `su -c 'id -u; cat /proc/self/attr/current'`.
     Su,
+    /// Item 4a — where `su` is, if the shell can find one at all.
+    SuPath,
     /// Item 5a — `command -v bash`.
     BashPath,
     /// Item 5b — ask `/system/bin/sh` which dialect it is, by having it run a script.
@@ -108,6 +110,18 @@ impl ProbeCommand {
             ProbeCommand::GetEnforce => "getenforce",
             ProbeCommand::AttrCurrent => "cat /proc/self/attr/current",
             ProbeCommand::Su => "su -c 'id -u; cat /proc/self/attr/current'",
+            // Item 4a. `command -v` rather than a `stat` over a candidate list, for two
+            // reasons. A helper can live anywhere on `PATH` — the device measured here has
+            // `/sbin`, `/system/xbin`, `/vendor/bin`, `/vendor/xbin` and three apex dirs on
+            // it — and a fixed list that misses it reports "no su" on a rooted phone. And a
+            // `stat` is only honest when this process is on the target: the adb harness runs
+            // on the machine *next to* the phone, where `Path::exists()` would be asking
+            // about the wrong filesystem.
+            //
+            // Verified on that device: `command -v cat` echoes `/system/bin/cat` and exits 0,
+            // `command -v su` prints nothing and exits 1, so exit code plus non-empty stdout
+            // is a sound presence test — the same shape item 5a already relies on.
+            ProbeCommand::SuPath => "command -v su",
             ProbeCommand::BashPath => "command -v bash",
             // NOT `/system/bin/sh --version`. Android's mksh is built without the version
             // option, and on a real device the attempt is an error rather than a banner —
@@ -166,6 +180,7 @@ pub fn all_commands() -> Vec<ProbeCommand> {
         ProbeCommand::GetEnforce,
         ProbeCommand::AttrCurrent,
         ProbeCommand::Su,
+        ProbeCommand::SuPath,
         ProbeCommand::BashPath,
         ProbeCommand::SystemShVersion,
         ProbeCommand::ToyboxList,
@@ -257,6 +272,8 @@ pub struct ProbeOutput {
     pub attr_current: Option<CommandOutput>,
     /// Item 4 — the `su -c` escalation probe.
     pub su: Option<CommandOutput>,
+    /// Item 4a — the resolved `su`, when the shell's `PATH` has one.
+    pub su_path: Option<CommandOutput>,
     /// Item 5a — `command -v bash`.
     pub bash_path: Option<CommandOutput>,
     /// Item 5b — the dialect variables read out of `/system/bin/sh`.
@@ -417,6 +434,7 @@ fn route(output: &mut ProbeOutput, command: ProbeCommand, result: Option<Command
         ProbeCommand::GetEnforce => output.getenforce = result,
         ProbeCommand::AttrCurrent => output.attr_current = result,
         ProbeCommand::Su => output.su = result,
+        ProbeCommand::SuPath => output.su_path = result,
         ProbeCommand::BashPath => output.bash_path = result,
         ProbeCommand::SystemShVersion => output.system_sh_version = result,
         ProbeCommand::ToyboxList => output.toybox_list = result,
