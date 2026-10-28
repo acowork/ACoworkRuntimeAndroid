@@ -25,7 +25,7 @@ use acowork_android::host::probe::{CommandOutput, ProbeOutput, run_probe};
 use acowork_android::host::spawn::{SpawnInvocation, SpawnRunner};
 use acowork_android::host::{
     AdbTransport, ExecRequest, ExecutionBackend, HostProfile, ProbeCommand, ShellBackend,
-    check_script,
+    check_script, shell_tools,
 };
 use acowork_platform_contract::HostDescription;
 
@@ -119,6 +119,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
         report_exec(&profile, &transport).await;
         println!("\n── 4. §4.4 guardrails ──────────────────────────────");
         report_guardrails(&profile, &transport).await;
+        println!("\n── 5. §4.5 tool registration ────────────────────────");
+        for tool in shell_tools(&profile) {
+            println!("  {} -> {}", tool.name, tool.path.display());
+            for line in tool.description.lines() {
+                println!("      {line}");
+            }
+        }
     }
 
     Ok(())

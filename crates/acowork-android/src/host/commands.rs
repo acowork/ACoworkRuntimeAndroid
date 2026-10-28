@@ -904,6 +904,27 @@ const READ_SUBCOMMANDS: &[&str] = &[
 /// fstab, `-r` and `-o` accompany a real mount, and `-t` names a filesystem type for one.
 const MOUNT_READ_FLAGS: &[&str] = &["-l", "-s", "--"];
 
+/// §4.4's read vocabulary, verbatim: the commands the auto-pass tier claims to cover.
+///
+/// These are the first seven entries of [`READ_ONLY`]; everything after them in that table is
+/// justified a different way (the probe runs it itself, or it only filters text). A tool
+/// description reports on *this* list, because it is the list the ADR commits to — so the
+/// two must not drift, which `the_tier_vocabulary_matches_the_classifier` pins.
+pub const READ_TIER_COMMANDS: &[&str] = &[
+    "getprop",
+    "dumpsys",
+    "logcat",
+    "ps",
+    "df",
+    "mount",
+    "getenforce",
+];
+
+/// §4.4's write vocabulary, verbatim: each of these needs approval when the classifier sees
+/// it. `am` and `pm` are here as subcommand dispatchers — the classifier decides by the
+/// subcommand, and `pm list` is a read.
+pub const WRITE_TIER_COMMANDS: &[&str] = &["setprop", "am", "pm", "settings", "input"];
+
 /// Read-only commands.
 ///
 /// The first seven are ADR-AND-001 §4.4's list verbatim. What follows is justified one way
@@ -1085,6 +1106,25 @@ mod tests {
             .into_iter()
             .next()
             .unwrap_or_else(|| panic!("no finding for {script:?}"))
+    }
+
+    #[test]
+    fn the_tier_vocabulary_matches_the_classifier() {
+        // READ_TIER_COMMANDS / WRITE_TIER_COMMANDS are what a tool description tells the
+        // model exists. If they drift from the tables the classifier actually consults, the
+        // description promises a command the gate will refuse, or hides one it would allow.
+        for name in READ_TIER_COMMANDS {
+            assert!(
+                READ_ONLY.contains(name),
+                "`{name}` is advertised as read-tier but the classifier does not treat it as read-only"
+            );
+        }
+        for name in WRITE_TIER_COMMANDS {
+            assert!(
+                SHELL_WRITE.contains(name) || DISPATCHERS.contains(name),
+                "`{name}` is advertised as needing approval but the classifier has no rule for it"
+            );
+        }
     }
 
     // ── §4.4: the read allow-list, which is what the auto-pass buys ──────────

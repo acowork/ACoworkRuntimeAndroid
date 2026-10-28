@@ -22,7 +22,13 @@
 //! | Collection | [`probe`] | Which commands to run, the budget, routing results | Contract + routing |
 //! | Aggregate | [`profile`] | Assemble facts into the session-immutable `HostProfile` | Pure |
 //! | Derivation | [`capability`] | Capabilities as a function of facts, never of config | Pure |
+//! | Content check | [`commands`] | What a script actually does, independent of the label claiming it | Pure |
+//! | Presentation | [`tools`] | ADR-AND-001 §4.5 tool registration text, from measured facts | Pure |
+//! | Assembly | [`script`] | Render a request into the script a shell runs, with the identity probe | Pure |
+//! | Process | [`spawn`] | The one seam that touches an OS: `SpawnRunner`, plus the tokio impl | I/O |
 //! | Contract | [`backend`] | `ExecutionBackend`, and the gate that composes both authorities | Pure gate + async trait |
+//! | Backends | [`backends`] | The tier-specific `ExecutionBackend` implementations | Composes script + spawn + commands |
+//! | Transport | [`adb`] | Drive a device from the host over `adb` (feature `device`) | I/O |
 //! | Feedback | [`denial`] | `avc: denied` → an actionable next step | Pure, plus a session ledger |
 //!
 //! Keeping the parsers pure is not tidiness for its own sake: it is what makes the
@@ -54,6 +60,7 @@ pub mod probe;
 pub mod profile;
 pub mod script;
 pub mod spawn;
+pub mod tools;
 
 #[cfg(feature = "device")]
 pub mod adb;
@@ -91,3 +98,4 @@ pub use spawn::{
     DynamicSpawnRunner, ProcessSpawnRunner, RawOutput, ScriptedSpawnRunner, SpawnError,
     SpawnInvocation, SpawnRunner, scripted_output,
 };
+pub use tools::{ShellTool, shell_tools};
