@@ -649,8 +649,10 @@ fn split(toks: Vec<Tok>) -> Result<Vec<Command>, Finding> {
                 if output_to.is_some() {
                     return Err(Finding::opaque(
                         ">",
-                        "two output redirections in one command — the port does not model \
-                         which file wins",
+                        "every redirection is applied — `cmd > a > b` truncates `a` and sends \
+                         stdout to `b`, so two files change — and the rollback ledger snapshots \
+                         one target per command, so the port would be approving a write it \
+                         cannot fully put back",
                     ));
                 }
                 output_to = Some(target);
@@ -808,6 +810,14 @@ fn destination(target: &str) -> Destination {
     if target.contains(['$', '`']) || target.starts_with('~') {
         return Destination::Unknown;
     }
+    // A path that does not start at the root is resolved against a working directory this port
+    // never sees, and `resolve_path` cannot help: it reads `./f` as `/f`, which is what the
+    // shell would say only from `/`. So `echo x > ./f` is not a write to the root, and not a
+    // write to `/data/local/tmp/f` either — it is a write to wherever the device was sitting,
+    // which the approval does not describe. Bare `f` and `../../etc/f` go the same way.
+    if !target.starts_with('/') {
+        return Destination::Unknown;
+    }
     let Some(first) = target.find(['*', '?', '[']) else {
         return Destination::Known(target.to_string());
     };
@@ -836,11 +846,28 @@ pub fn file_write_effect(target: &str) -> Effect {
 fn effect_at(path: &str) -> Effect {
     if is_block_device(path) {
         Effect::Banned
-    } else if is_partition_path(path) {
+    } else if is_partition_path(path) || is_app_data_path(path) {
         Effect::SystemWrite
     } else {
         Effect::FileWrite
     }
+}
+
+/// Paths that hold one application's private files.
+///
+/// `android:fs:outside-app` is named for exactly the thing these are not: writes outside app
+/// data. `/data/local/tmp` is the shell's own scratch and belongs to the light tier; a path under
+/// another uid's home does not, and treating it the same way would let a capability whose name
+/// promises containment approve reading a bank app's database into the open. There is no app-data
+/// tier in this port's vocabulary yet (that is question B2 of the upstream review), so it borrows
+/// the heavier one rather than the lighter: the cost is an approval the caller might not need,
+/// the alternative is a permission nobody asked for.
+fn is_app_data_path(path: &str) -> bool {
+    let path = super::script::resolve_path(path);
+    const APP_DATA_ROOTS: &[&str] = &["/data/data", "/data/user", "/data/user_de"];
+    APP_DATA_ROOTS
+        .iter()
+        .any(|root| path.starts_with(&format!("{root}/")))
 }
 
 /// Effect of writing to a path: partition and device nodes are the heavier tiers, writing a
@@ -888,6 +915,17 @@ fn destination_is_in_a_flag(args: &[String]) -> bool {
 /// operand puts its result in a working directory this port never observes. Refusing that is the
 /// same rule already applied to `sed -i` — a classifier that guesses which file a human approved
 /// has approved an operation nobody looked at.
+/// Whether an operand could name a file.
+///
+/// A path is rooted or has a separator in it; a bare word is as likely to be a mode (`755`), a
+/// timestamp (`202401010000`) or an user name (`root`). This is not a permission test — it decides
+/// which words the classifier reads as destinations, and an operand it does not read is not
+/// therefore allowed: a write command whose operands are *all* bare words names no file at all and
+/// is refused as opaque.
+fn looks_like_path(operand: &str) -> bool {
+    operand.starts_with('/') || operand.starts_with('.') || operand.contains('/')
+}
+
 fn written_targets<'a>(head: &str, operands: &[&'a str]) -> Option<Vec<&'a str>> {
     match head {
         "cp" | "ln" if operands.len() > 1 => operands.last().copied().map(|t| vec![t]),
@@ -1121,10 +1159,17 @@ fn effect_of(head: &str, args: &[String]) -> Finding {
         // "the file", which for `cp`, `mv` and `ln` is the source — so the destination was never
         // classified at all, and `cp /data/local/tmp/x /system/bin/y` cost the lightest write
         // tier available while changing a partition.
+        //
+        // Only operands that could be paths are read as files. `chmod 755 /system/bin/x` has a
+        // mode where a name goes and `touch -t 202401010000 f` has a timestamp; counting those as
+        // destinations is what made a tier depend on a word that is not a path at all. Dropping
+        // them is safe in the approving direction only because nothing is left when *no* operand
+        // looks like a path: the request then has no named file, which is refused below.
         let operands: Vec<&str> = args
             .iter()
             .filter(|a| !a.starts_with('-'))
             .map(String::as_str)
+            .filter(|a| looks_like_path(a))
             .collect();
         if matches!(head, "cp" | "mv" | "ln") && destination_is_in_a_flag(args) {
             return Finding::opaque(
@@ -1377,9 +1422,13 @@ fn is_partition_path(path: &str) -> bool {
         "/product",
         "/system_ext",
         "/oem",
+        "/odm",
         "/boot",
         "/recovery",
+        "/persist",
+        "/mnt/vendor",
         "/firmware",
+        "/dsp",
         "/dev",
         "/sys",
         "/proc",
@@ -2165,5 +2214,106 @@ mod tests {
         // Rule R5 refuses an unregistered capability. Producing a second, different refusal
         // here would make the same request fail two ways depending on call order.
         assert!(check("setprop a b", None).is_ok());
+    }
+
+    #[test]
+    fn a_relative_write_target_belongs_to_a_directory_nobody_sees() {
+        // `resolve_path` reads `./f` as `/f`, which is only true from `/`. The port does not know
+        // where the shell is sitting, so it must not turn that unknown into an approval.
+        for script in [
+            "echo x > ./f",
+            "echo x > f",
+            "echo x > sub/f",
+            "echo x > ../../system/f",
+            "cp a b",
+            "chmod 755 f",
+            "dd if=./a of=./b",
+        ] {
+            let v = classify(script);
+            assert_eq!(
+                v.strongest(),
+                Effect::Opaque,
+                "`{script}` claims a destination the device picks"
+            );
+            assert_eq!(v.strongest().capability(), None);
+        }
+        // A relative *source* does not move the destination: `cp` is classified by what it
+        // creates, and a mode word is not a file the command changes.
+        assert_eq!(
+            classify("cp ./a /data/local/tmp/b").strongest(),
+            Effect::FileWrite
+        );
+        assert_eq!(
+            classify("chmod 755 /system/bin/x").strongest(),
+            Effect::SystemWrite
+        );
+        assert_eq!(
+            classify("touch -t 202401010000 /data/local/tmp/f").strongest(),
+            Effect::FileWrite
+        );
+        // Absolute spelling is still read normally, and `.` inside an absolute path still means
+        // nothing: this is the same path from both sides of the fix.
+        assert_eq!(
+            classify("echo x > /data/local/tmp/f").strongest(),
+            Effect::FileWrite
+        );
+        assert_eq!(
+            classify("echo x > /data/local/tmp/./f").strongest(),
+            Effect::FileWrite
+        );
+    }
+
+    #[test]
+    fn the_persistent_image_partitions_are_the_heavier_tier() {
+        // /persist holds modem calibration and /odm the vendor overlay: neither is a user's file,
+        // and neither was in the list this port grew out of a /system-and-/vendor reading.
+        for script in [
+            "printf %s x >> /persist/f",
+            "echo x > /odm/overlay.apk",
+            "echo x > /mnt/vendor/persist/f",
+            "echo x > /dsp/firmware.bin",
+            "echo x > /system/../persist/f",
+        ] {
+            assert_eq!(
+                classify(script).strongest(),
+                Effect::SystemWrite,
+                "`{script}` writes a partition root"
+            );
+        }
+        // Deleting them is banned outright, the way /system deletion is.
+        assert_eq!(
+            classify("rm -rf /persist/modem").strongest(),
+            Effect::Banned
+        );
+        // The shell's own scratch is unaffected.
+        assert_eq!(
+            classify("rm -f /data/local/tmp/f").strongest(),
+            Effect::FileWrite
+        );
+    }
+
+    #[test]
+    fn writing_inside_an_app_private_home_is_not_an_outside_app_write() {
+        for script in [
+            "echo x > /data/data/com.foo/databases/app.db",
+            "echo x > /data/user/0/com.foo/shared_prefs/p.xml",
+            "echo x > /data/user_de/0/com.foo/f",
+        ] {
+            assert_eq!(
+                classify(script).strongest(),
+                Effect::SystemWrite,
+                "`{script}` needs more than the outside-app tier"
+            );
+        }
+        // `/data/local/tmp` is the outside-app area the capability is named for, and a path that
+        // merely *starts with* a root's name is not under it.
+        assert_eq!(
+            classify("echo x > /data/local/tmp/f").strongest(),
+            Effect::FileWrite
+        );
+        assert_eq!(
+            classify("echo x > /data/database.txt").strongest(),
+            Effect::FileWrite
+        );
     }
 }
