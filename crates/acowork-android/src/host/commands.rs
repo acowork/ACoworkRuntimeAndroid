@@ -1163,6 +1163,7 @@ fn is_block_device(path: &str) -> bool {
         "/dev/loop",
         "/dev/zram",
     ];
+    let path = super::script::resolve_path(path);
     BLOCK_PREFIXES.iter().any(|p| path.starts_with(p))
 }
 
@@ -1181,6 +1182,7 @@ fn is_partition_path(path: &str) -> bool {
         "/sys",
         "/proc",
     ];
+    let path = super::script::resolve_path(path);
     SYSTEM_ROOTS
         .iter()
         .any(|root| path == *root || path.starts_with(&format!("{root}/")))
@@ -1188,6 +1190,7 @@ fn is_partition_path(path: &str) -> bool {
 
 /// The roots `rm` is hard-banned for, §4.6.3 item 3's `rm -rf /data`.
 fn is_destructive_root(path: &str) -> bool {
+    let path = super::script::resolve_path(path);
     path == "/" || path == "/data" || path == "/sdcard" || path == "/storage"
 }
 
@@ -1472,6 +1475,99 @@ mod tests {
         assert_eq!(effect("getprop >> /dev/block/mmcblk0"), Effect::Banned);
         assert_eq!(effect("echo hi > /dev/null"), Effect::ReadOnly);
         assert_eq!(effect("logcat -d 2>&1"), Effect::ReadOnly);
+    }
+
+    // ── Path aliasing ────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_write_that_walks_back_into_a_partition_is_a_system_write() {
+        // The device opens the path it *resolves*, not the string it was handed. Prefix matching
+        // on the literal text therefore asks for the weaker capability for a write that lands in
+        // /system, which is the one place a classifier can be talked out of its own decision
+        // without the device knowing anything unusual was asked for.
+        //
+        // Four segments to climb from /data/local/tmp to /: the count is the point, see
+        // `a_walk_that_stops_short_of_the_root_is_not_a_system_write`.
+        assert_eq!(
+            effect("getprop > /data/local/tmp/../../../system/x"),
+            Effect::SystemWrite
+        );
+        assert_eq!(
+            effect("echo x > /system/../system/bin/y"),
+            Effect::SystemWrite,
+            "a `..` that cancels out still names /system"
+        );
+        assert_eq!(
+            effect("getprop > /data/local/../../system/x"),
+            Effect::SystemWrite,
+            "two segments up from /data/local is /, and `/../system` still names /system"
+        );
+    }
+
+    #[test]
+    fn a_walk_that_stops_short_of_the_root_is_not_a_system_write() {
+        // The resolver has to resolve, not spot the word "system". `/data/local/tmp/../../system`
+        // is `/data/system` — a real directory, owned by a real app's data, and *not* the system
+        // partition. Classifying it as a system write would ask the caller to approve something
+        // the script never did.
+        assert_eq!(
+            effect("getprop > /data/local/tmp/../../system/x"),
+            Effect::FileWrite
+        );
+        assert_eq!(
+            effect("rm -fr /data/local/tmp/../../data"),
+            Effect::FileWrite
+        );
+    }
+
+    #[test]
+    fn a_block_device_reached_through_dotdot_is_still_banned() {
+        assert_eq!(
+            effect("getprop > /data/local/tmp/../../../../dev/block/mmcblk0"),
+            Effect::Banned
+        );
+        assert_eq!(
+            effect("dd if=/dev/zero of=/data/local/tmp/../../../../dev/block/mmcblk0"),
+            Effect::Banned
+        );
+        // Climbing past the root stops at the root, exactly as the kernel does it.
+        assert_eq!(effect("getprop > /../../dev/block/mmcblk0"), Effect::Banned);
+    }
+
+    #[test]
+    fn a_removal_that_walks_back_to_a_destructive_root_is_banned() {
+        // `-fr` and `-rf` are one option cluster: the ban is about the target, never the spelling.
+        assert_eq!(
+            effect("rm -fr /data/local/tmp/../../../data"),
+            Effect::Banned,
+            "the target resolves to the destructive root itself"
+        );
+        assert_eq!(effect("rm -fr /data/local/tmp/../../../"), Effect::Banned);
+    }
+
+    #[test]
+    fn an_ordinary_dotdot_stays_an_ordinary_path() {
+        // Over-blocking is its own defect: this is a normal file in a normal directory, and a
+        // classifier that turned it into a system write would cost the caller an approval it
+        // should never have been asked for.
+        assert_eq!(
+            effect("logcat -d > /data/local/tmp/../local/tmp/log.txt"),
+            Effect::FileWrite
+        );
+        assert_eq!(effect("echo hi > /data/local/tmp/./x"), Effect::FileWrite);
+        assert_eq!(effect("echo hi > /data/local/tmp/x/.."), Effect::FileWrite);
+    }
+
+    #[test]
+    fn a_quoted_write_target_is_classified_by_where_it_lands() {
+        // Shell authors quote paths; the classifier sees the word after the quotes are gone. If
+        // it did not, `> '/system/x'` would be a FileWrite whose target begins with a quote.
+        assert_eq!(effect("echo x > '/system/x'"), Effect::SystemWrite);
+        assert_eq!(effect("echo x > \"/system/x\""), Effect::SystemWrite);
+        assert_eq!(
+            effect("echo x > '/data/local/tmp/../../../system/x'"),
+            Effect::SystemWrite
+        );
     }
 
     // ── Flag and subcommand rules ────────────────────────────────────────────

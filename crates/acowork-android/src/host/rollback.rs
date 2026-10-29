@@ -416,8 +416,16 @@ impl Capture {
 
 /// Whether a redirect target can be snapshotted. See [`Capture::from_redirect`].
 fn is_snapshotable_path(path: &str) -> bool {
+    // The `/dev` test runs on the *resolved* path. Snapshotting is not a permission decision —
+    // the gate has already refused an aliased block-device write by then — but a planner that
+    // reads `/data/local/tmp/../../../dev/block/mmcblk0` as an ordinary file would ask the
+    // device to `base64` a raw block device and put `rm -f` on a device node in the undo ledger.
+    // The character checks below stay on the raw spelling on purpose: they are about whether the
+    // name survives being re-quoted on the way back, which is a property of the text.
+    let resolved = crate::host::script::resolve_path(path);
     path.starts_with('/')
-        && !path.starts_with("/dev/")
+        && resolved != "/dev"
+        && !resolved.starts_with("/dev/")
         && !path.contains('~')
         && !path.contains('$')
         && !path.contains('`')
@@ -2666,6 +2674,36 @@ mod tests {
                 .iter()
                 .any(|s| s.script == "rm -f '/data/local/tmp/created.txt'")
         );
+    }
+
+    #[test]
+    fn a_device_node_reached_through_dotdot_is_not_snapshotable() {
+        // The gate bans the write. The planner is a separate decision and must not independently
+        // decide that `/dev/block/mmcblk0` is a file worth backing up: doing so would ask the
+        // device to `base64` a raw block device and put `rm -f` on a device node in the ledger.
+        let plan = plan("echo x > /data/local/tmp/../../../dev/block/mmcblk0");
+        assert!(
+            plan.captures.is_empty(),
+            "a block device was modelled as a snapshotable file: {:?}",
+            plan.captures
+        );
+        assert_eq!(
+            plan.unundoable.len(),
+            1,
+            "and it is still named at teardown"
+        );
+    }
+
+    #[test]
+    fn a_path_through_dotdot_is_still_snapshotable() {
+        // The planner resolves too, so an ordinary file spelled awkwardly is still an ordinary
+        // file: refusing it would cost a backup the port is able to do.
+        let plan = plan("echo x > /data/local/tmp/../local/tmp/x.txt");
+        assert_eq!(plan.captures.len(), 1, "{:?}", plan.unundoable);
+        assert!(matches!(
+            plan.captures[0].target,
+            UndoTarget::File(ref p) if p == "/data/local/tmp/../local/tmp/x.txt"
+        ));
     }
 
     #[tokio::test]

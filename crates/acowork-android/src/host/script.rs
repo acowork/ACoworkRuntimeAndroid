@@ -164,6 +164,51 @@ pub fn quote_posix(value: &str) -> String {
     out
 }
 
+/// The path a device will open, resolved lexically.
+///
+/// Two consumers need this and must not disagree: the classifier, which decides which capability
+/// a write costs, and the rollback planner, which decides whether a target is worth snapshotting.
+/// Both are prefix tests against protected roots, and a prefix test run on the literal text is a
+/// test of the *spelling* rather than of the destination:
+/// `/data/local/tmp/../../../dev/block/mmcblk0` begins in the directory the shell owns and ends
+/// on a raw block device. The kernel walks `..` on the device's behalf, so a port that does not
+/// is letting the wording of a request decide what it was allowed to ask for — and a hard ban
+/// (§4.6.3 item 3) that can be dodged by adding three path segments is not a ban.
+///
+/// Resolution also goes the other way, which is what makes it a resolver rather than a scanner
+/// for scary substrings: `/data/local/tmp/../../system` is `/data/system`, a directory that
+/// belongs to no partition, and calling it a system write would cost the caller an approval for
+/// something the script never did.
+///
+/// Only the lexical form is resolved. A symlink is not, because nothing here can see the
+/// filesystem: `test -L` means a round trip per classified word, and `O_NOFOLLOW` is not
+/// available to a script that is being handed to `/system/bin/sh`. The residual is recorded in
+/// the readiness assessment instead of being answered by a check this port cannot verify.
+///
+/// A relative path is resolved against `/` rather than against a working directory, which is the
+/// interpretation under which `..` climbs furthest: it can ask for a stronger capability than a
+/// script happened to need, and cannot be talked into a weaker one. Nothing this port generates
+/// is affected — backend and rollback scripts always name absolute paths.
+pub fn resolve_path(path: &str) -> String {
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            // Empty covers both a leading slash and a doubled one; `.` changes nothing.
+            "" | "." => {}
+            // Popping an empty stack is how POSIX treats a `..` at the root: it stays at the
+            // root, so `/../../dev/block/mmcblk0` is still `/dev/block/mmcblk0`.
+            ".." => {
+                segments.pop();
+            }
+            other => segments.push(other),
+        }
+    }
+    let mut out = String::with_capacity(path.len());
+    out.push('/');
+    out.push_str(&segments.join("/"));
+    out
+}
+
 /// True when `key` can be exported by a POSIX shell.
 pub fn is_valid_env_key(key: &str) -> bool {
     let mut chars = key.chars();
@@ -329,6 +374,59 @@ fn ascii_trim(bytes: &[u8]) -> &[u8] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn path_resolution_matches_what_the_kernel_walks() {
+        // The counts matter more than the shapes: three segments climb out of /data/local/tmp,
+        // two do not. A resolver that got this backwards would be a scanner for alarming
+        // substrings, which is the failure mode on the over-blocking side.
+        assert_eq!(
+            resolve_path("/data/local/tmp/../../system/x"),
+            "/data/system/x",
+            "two `..` stop inside /data"
+        );
+        assert_eq!(
+            resolve_path("/data/local/tmp/../../../system/x"),
+            "/system/x",
+            "three reach the root and then go back down"
+        );
+        assert_eq!(resolve_path("/system/../system/bin/sh"), "/system/bin/sh");
+        assert_eq!(
+            resolve_path("/data/local/tmp/../local/tmp/x"),
+            "/data/local/local/tmp/x",
+            "one `..` undoes `tmp`, it does not undo the whole directory"
+        );
+    }
+
+    #[test]
+    fn a_walk_past_the_root_stays_at_the_root() {
+        assert_eq!(
+            resolve_path("/../../dev/block/mmcblk0"),
+            "/dev/block/mmcblk0"
+        );
+        assert_eq!(resolve_path("/"), "/");
+        assert_eq!(resolve_path("/.."), "/");
+    }
+
+    #[test]
+    fn redundant_path_components_do_not_change_the_destination() {
+        assert_eq!(resolve_path("/data/local/tmp/./x"), "/data/local/tmp/x");
+        assert_eq!(resolve_path("/data//local///tmp/x"), "/data/local/tmp/x");
+        assert_eq!(
+            resolve_path("/data/local/tmp/"),
+            "/data/local/tmp",
+            "a trailing slash names the directory, not a child of it"
+        );
+    }
+
+    #[test]
+    fn a_relative_target_is_resolved_against_the_root() {
+        // Deliberate, and the reason is in `resolve_path`: the working directory is not
+        // something the classifier can see, so this is the reading under which `..` climbs
+        // furthest. It can over-ask; it cannot be talked into under-asking.
+        assert_eq!(resolve_path("../../../system/x"), "/system/x");
+        assert_eq!(resolve_path("tmp/x"), "/tmp/x");
+    }
+
     use super::*;
 
     fn env(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
