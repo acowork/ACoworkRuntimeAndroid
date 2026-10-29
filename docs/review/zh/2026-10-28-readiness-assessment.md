@@ -224,7 +224,7 @@ ADR §7.4 只裁定了 `fs:system` 与 `selinux:permissive` 两条需要 owner �
 | P0 | 修正 ADR 日期、把 §7.1/§7.4 标注为待对齐 | 本仓库 | ✅ 已完成 |
 | P1 | 与 mobile app 负责人对齐 B4 的 APK 形态归属 | 需产品 | ⬜ 未开始 |
 | P1 | 回写 probe §3（B8 `dialects`、B12 shell 前置条件）与 §4（B10 ledger） | 本仓库 | ✅ 已完成（2026-10-29） |
-| — | 抽出平台中立契约层，使规则不绑在 Android 上（规避 B3、为第二个端口打样） | 本仓库 | ✅ 已完成 —— [ADR-AND-002](../../adr/zh/ADR-AND-002-platform-contract-layer.md)，471 测试 |
+| — | 抽出平台中立契约层，使规则不绑在 Android 上（规避 B3、为第二个端口打样） | 本仓库 | ✅ 已完成 —— [ADR-AND-002](../../adr/zh/ADR-AND-002-platform-contract-layer.md)，476 测试 |
 | — | 在真实嵌入式 target 上验证 R12（ESP32-C3 `riscv32imac-unknown-none-elf` 或 `riscv32imac-esp-espidf`） | 本仓库 | ⚠️ 部分 —— 已在更严格的 `riscv32imc`（无原子）上编译通过；`imac` 与 ESP-IDF 的 rust-std 组件下载被网络策略阻断 |
 | P2 | 实现只读档 backend（`ShellBackend` / `RootShellBackend` / `AppSandboxBackend`）+ adb 传输层 + 真机 harness | 本仓库，不被阻塞 | ✅ 已完成（2026-10-30）—— 20 条只读探测（原 18，后加 13 / 13b 两项证据面探测）+ `assemble` + 真实命令在 BLA-AL00 上跑通，~120ms / exit 0 / uid 2000。**getprop 与 mount 已实测**；`logcat` / `dumpsys` 此前是**手工**实测可读、不属于探测集——现已由探测项 6c 收进集合（真机 10 项抽查中 8 项不在任何 `--list` 输出里，含 §4.4 点名却谁都看不见的 `settings`） |
 | P2 | §4.4 只读白名单按**脚本内容**判定（自称 read 的写命令在执行前被拒），§4.6.3 硬禁列表任何档位拒绝 | 本仓库，不被阻塞 | ✅ 已完成（2026-10-31）—— [`host/commands.rs`](../../../crates/acowork-android/src/host/commands.rs)，29 个新测试；BLA-AL00 实测 `settings put` 挂 read 标签被拒并指名 `android:shell:write`，`toybox rm -rf` 设备根在任何档位被拒 |

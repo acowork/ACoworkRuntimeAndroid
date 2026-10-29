@@ -1,6 +1,6 @@
 # ADR-AND-002: 平台中立契约层 `acowork-platform-contract`
 
-- **状态**：Accepted —— 已落地，471 测试通过（契约层 83 + Android 单元 290 + Android 契约 27 + Android 规则一致性 43 + 真进程 13 + 真机地面实况 15），clippy `-D warnings` 零告警（host 与裸机 target 各自验证），`--no-default-features` 下 `no_std` 构建通过，且已在 `riscv32imc-unknown-none-elf`（无 OS、无原子指令）上编译通过
+- **状态**：Accepted —— 已落地，476 测试通过（契约层 86 + Android 单元 292 + Android 契约 27 + Android 规则一致性 43 + 真进程 13 + 真机地面实况 15），clippy `-D warnings` 零告警（host 与裸机 target 各自验证），`--no-default-features` 下 `no_std` 构建通过，且已在 `riscv32imc-unknown-none-elf`（无 OS、无原子指令）上编译通过
 - **日期**：2026-10-29
 - **相关**：[ADR-AND-001](ADR-AND-001-android-host-profiles-and-execution-backend.md)（本 ADR 改变其 §7.1 / §7.4 的**落点**、把 §4.4 的散文式权限描述**细化**为四轴，不推翻其决策）、[android-host-probe.md](../../design/zh/android-host-probe.md)、[开发就绪度评估](../../review/zh/2026-10-28-readiness-assessment.md) B1/B2/B3
 - **实现**：`crates/acowork-platform-contract/`（规则）、`crates/acowork-android/src/host/`（事实与机制）、`crates/acowork-android/tests/rules_conformance.rs`（一致性证据）
@@ -157,6 +157,8 @@ R12 此前只用「特征图里没有 std 边 + `#![no_std]` 能编译」间接�
 修法是把这一个输入映射到可表示的最大持有值：它读回来比真值早 1 毫秒（无害），而读成 `FREE` 会放进第二个写者（R11 禁止）。**失效方向被刻意选成「保持锁定」，永远不是「打开」。**
 
 三个缺陷都补了回归测试（`acquisition_at_the_counter_maximum_still_locks`、`elapsed_time_survives_a_counter_wrap`）。注意第二、三个是在修第一个的过程中被推理出来的——如果只把 `AtomicU64` 换成 `AtomicUsize` 就收工，会留下一个每月失效一次、且失效方式是**静默允许并发写**的锁。
+
+**R11 后来补了两个原语，因为端口在凑合**（2026-11-01）。契约层最初的锁只有 `try_acquire` 与 `release`，而 ADR-AND-001 §7.2 要求「每条 mutating 命令执行时自动续期」——没有续期原语，端口只能用 release 再 acquire 拼出来，那是「解锁一小段时间」外加「解锁别人的锁」。同时 `release` 的文档承诺「释放一个你已经不再持有的锁不会解放别人的锁」，实现是无条件 store。**规则写在契约里、机制留给端口，前提是契约真的给得出机制**：一条没有原语支撑的规则会被端口用即兴代码满足，而即兴代码的失效方向通常正是那条规则要防的。现在 `renew(at, now)` 只延长还没过 TTL 的那一次持有（续期不是重新获取），`release(at) -> bool` 比对持有瞬间、不是自己的就不动，身份用持有时间戳而不是 session 字符串（否则 Android 的会话模型会被塞给未必有它的目标）。
 
 **还有一项限制被显式记录而非糊过去**：`riscv32imc` 连原子指令都没有（`max_atomic_width = 0`），CAS 无从表达。`ResourceLock` 因此按 `target_has_atomic = "ptr"` 条件编译。这**不使 R11 变成可选**：无原子的目标实践上是单核协作式调度，互斥要么平凡、要么属于端口已有的临界区。规则归契约，那一种无锁编码只是参考机制。
 

@@ -3,7 +3,7 @@
 - **状态**：**部分 Accepted** —— §1–§6（宿主档位、一个引擎、工具级提权、`ExecutionBackend` 契约）有效并已落地 P0；档位由三档扩到四档，见 §4.3；⚠️ **§7.1 与 §7.4 待与上游对齐**，二者被晚于本 ADR 的上游文档推翻，详见下方「上游冲突」与 [开发就绪度评估](../../review/zh/2026-10-28-readiness-assessment.md) B1/B2。
 - **日期**：2026-10-20（原标 `2026-05-15` 有误：正文引用了 2026-09-13 才创建的 ADR-075、2026-10-05 的 ADR-087、2026-10-09 的 ADR-090，该日期不可能成立）
 - **相关**：[README.md](../../../README.md)、上游 `docs/design/zh/12-tool-system.md`（平台支持矩阵与运行时平台检测）、上游 `core/acowork-runtime/src/tools/builtin/shell.rs`（多 shell 注册范式）、上游 ADR-087（node/agent 归属与门控）、上游 `docs/design/zh/30-runtime-protocol-and-pluggable-engine.md`（能力注册表与可插拔引擎，**v0.2 直接点名本 ADR**）、session 参数 `shellApprovalThreshold` / `approvalTimeoutSecs`
-- **实现**：P0 已交付，并按 [ADR-AND-002](ADR-AND-002-platform-contract-layer.md) 拆成两层 —— 规则在 `crates/acowork-platform-contract/`（平台中立，只依赖 serde，可在裸机 target 编译），Android 的事实与机制在 `crates/acowork-android/src/host/`（探测解析器、capability 取值、`su -c` 包装、`avc` 回灌）。471 测试通过，clippy `-D warnings` 零告警，并在华为 BLA-AL00 上端到端验证。本 ADR §7.1/§7.4 的门控落点已从 `backend.rs` 迁至契约层 `gate.rs`，§4.4 的权限描述已细化为四轴 `CapabilitySpec`——**决策内容不变**，详见 ADR-AND-002 §4
+- **实现**：P0 已交付，并按 [ADR-AND-002](ADR-AND-002-platform-contract-layer.md) 拆成两层 —— 规则在 `crates/acowork-platform-contract/`（平台中立，只依赖 serde，可在裸机 target 编译），Android 的事实与机制在 `crates/acowork-android/src/host/`（探测解析器、capability 取值、`su -c` 包装、`avc` 回灌）。476 测试通过，clippy `-D warnings` 零告警，并在华为 BLA-AL00 上端到端验证。本 ADR §7.1/§7.4 的门控落点已从 `backend.rs` 迁至契约层 `gate.rs`，§4.4 的权限描述已细化为四轴 `CapabilitySpec`——**决策内容不变**，详见 ADR-AND-002 §4
 - **EN mirror**：待补 `docs/adr/en/`（上游 `AGENTS.md:142` 要求中英 ADR 同一 commit 更新；本仓库尚未采用该约定，见评估 B7）
 
 > ### ⚠️ 上游冲突（2026-10-28 核对）
@@ -308,6 +308,8 @@ exec {
 
 > **实现落点补注（2026-10-29，见 [ADR-AND-002](ADR-AND-002-platform-contract-layer.md)）**：本节语义已拆成两层。TTL、不排队、不抢占、过期回收是**平台无关规则**（R11），落在契约层 `exec::ResourceLock`；「持有者是 session」和「错误里含持有者标识」是**端口概念**——契约层的锁没有身份，因为 session 在别的平台上未必存在。Android 侧 `SessionWriteLock` 包一层契约锁，只加 session 身份。
 > 这个拆分正是本节「拿不到锁要含持有者标识」这条要求逼出来的：契约锁若自带身份，就等于把 Android 的 session 模型强加给 ESP32。
+
+> **续期与释放的所有权（2026-11-01）**：表里「每条 mutating 命令执行时自动续期」这一行原先没有可实现的机制——契约层的 `ResourceLock` 只有 `try_acquire` 与 `release`，端口只能用「先 release 再 try_acquire」来凑出续期，而那两步之间设备是**开着的**，并且 release 会释放**别人**的锁。更糟的是 `release` 的注释写着「释放一个你已经不再持有的锁不会解放别人的锁」，代码是无条件的 `store(FREE)`：注释描述了一个不存在的保证，而下一个人会信它。现在契约层有 `renew(at, now)`（只延长**这个** `at` 对应的、且还没过 TTL 的持有；续期不是重新获取， stalled 过 TTL 的调用方已被推定死亡，碰一下就能复活等于把 TTL 变成建议）与 `release(at) -> bool`（比对持有瞬间，不是自己的就不动）。身份就是那个 `at`：锁里不存 session 字符串，因为「session」是端口概念、R11 说的是平台无关规则，一个自带身份的锁会把 Android 的会话模型强加给未必有它的目标；代价是 `at` 不是唯一 token（同一瞬间的两次获取是同一次持有），除了 TTL=0 那种「谁都能立刻回收」的情形——那里互斥本来就不成立。端口侧 `SessionWriteLock` 因此把身份从 `Option<String>` 改成 `Option<Hold{session, at}>`，并让**每个复合操作整体持有那把身份 mutex**：先取契约锁、再写身份是两步，窗口里一个持有已过期的会话会读到仍然写着自己是持有者，于是把别人合法回收的锁 release 掉。那个交错是真实存在的，但窄到无法用线程稳定复现，所以测试钉的是**不变量**而不是竞态：过期会话的 `renew` 会指名活着的持有者、它的 `release` 不会让设备变空、而没人等待时过期会话可以走回普通 `try_acquire` 把锁拿回来——过期是死亡的推定，不是判决，回收规则是两种读法相遇的地方。
 
 ### 7.3 dangerous-mode 是否需要 APK UI 开关 → **不做，首版仅 CLI flag**
 
