@@ -21,7 +21,7 @@
 > Rust libraries: the platform-neutral contract layer (`acowork-platform-contract`) and the Android host
 > layer (`acowork-android`, the P0 slice — HostProfile probe, script assembly, process spawn and
 > `ExecutionBackend` implementations, the §4.4 read-tier guardrail, the §4.5 tool
-> descriptions, the §4.6.1 audit outlet, the measured evidence surface and the §4.6.4 rollback ledger). 477 tests pass, the contract layer also builds for a bare-metal RISC-V
+> descriptions, the §4.6.1 audit outlet, the measured evidence surface and the §4.6.4 rollback ledger). 484 tests pass, the contract layer also builds for a bare-metal RISC-V
 > target, and the chain has been run against a physical device — a Huawei BLA-AL00 over adb:
 > 20 read-only probes → `HostProfile` → real commands, exit 0 in ~120 ms, including `logcat`,
 > which only works because the probe spot-checks for it. **No node binary exists yet** (the
@@ -206,7 +206,7 @@ itself — is the artifact a second port should copy.
 | 5c | The **three outlets** of the §7.1 reporting boundary: capability summary / backend error text / a command's own stdout·stderr | ✅ **Delivered** — the third was found by measuring, not by thinking: 181 avc audit records from a single `logcat -d` were crossing the port verbatim, and the guard test asserted on the JSON of a `Vec<u8>`, which serde writes as an array of numbers, so **any content passed**. Audit records are now rewritten at the projection into permissions + object class + target type; user, role, MLS range and path stay on the device. Non-record lines such as a `ps -Z` row survive byte-for-byte |
 | 8 | `root-shell` profile, **read-only capabilities** (`logcat` / `dumpsys` / `getprop`) | 🚧 **Mostly delivered** — the read tier is now enforced on script content, not on the caller's label ([`host/commands.rs`](crates/acowork-android/src/host/commands.rs)), and the commands it covers are probed rather than assumed (item 6c); verified end to end on a BLA-AL00. Remaining: `RootShellBackend` on a rooted device — it has never been run against a real `su` |
 | 9 | Android debugging toolset (screencap, ANR / tombstone / bugreport capture) + command audit log | 🚧 **Half delivered** — the audit log is ([`host/audit.rs`](crates/acowork-android/src/host/audit.rs)): `AuditedBackend` writes an `attempted` record before the device is touched and a terminal one after, and a sink that cannot take the opening record stops the command. The evidence surface itself is now measured (probe items 13 / 13b): on a `user` build with no root, **none** of the six sources ADR §4.6 item 6 commits to can yield contents — `/data/anr` gives up filenames only, and `dumpsys` is 246 services each with its own answer. The capture actions (screencap plumbing, `bugreportz` orchestration) are still planned (depends on #8) |
-| 10 | Write capabilities: approval gating, per-device write lock, prop / file auto-rollback | ⛔ **Blocked (B1)** — ADR §7.4's owner conjunct conflicts with upstream ADR-087 D1/D5; the gate is implemented per the two-authority decomposition and awaits upstream confirmation. **The rollback half is no longer part of the blocker**: §4.6.4 ships as `host/rollback.rs` (capture pre-state → inverse → LIFO restore), so what still keeps the write tier closed is approval ownership and the device write lock, not the absence of an undo path |
+| 10 | Write capabilities: approval gating, per-device write lock, prop / file auto-rollback | ⛔ **Blocked (B1)** — ADR §7.4's owner conjunct conflicts with upstream ADR-087 D1/D5; the gate is implemented per the two-authority decomposition and awaits upstream confirmation. **The rollback half is no longer part of the blocker**: §4.6.4 ships as `host/rollback.rs` (capture pre-state → inverse → LIFO restore) for **both** kinds of write — property inverses and file snapshots, where the bytes travel as base64, live in the Agent's own workspace, are written back in 48 KiB chunks and must match the digest the device reported before the write (verified on hardware: a 61440-byte random file overwritten with 9 bytes and restored byte-for-byte). What still keeps the write tier closed is approval ownership and the device write lock, not the absence of an undo path |
 | 11 | Magisk-module form factor for always-on debug fleets — **only if that need is real** | ⬜ Deferred |
 
 Ordering is deliberate: **read-only before writable**. The read-only root profile already covers most
@@ -226,7 +226,7 @@ Both crates are plain Rust libraries with no platform-specific code, so they bui
 
 ```bash
 cargo build                                        # build
-cargo test                                         # 477 tests (android unit 293 + contract 86 + contract integration 27 + rule conformance 43 + real-process 13 + device ground truth 15)
+cargo test                                         # 484 tests (android unit 300 + contract 86 + contract integration 27 + rule conformance 43 + real-process 13 + device ground truth 15)
 cargo clippy --all-targets -- -D warnings          # upstream CI convention; must be warning-free
 cargo fmt --check
 ```
