@@ -141,6 +141,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
         report_file_snapshot(&profile, &transport).await?;
         println!("\n── 12. §4.6 item 6 evidence capture ───────────────");
         report_evidence_capture(&profile, &transport).await?;
+        println!("\n── 13. §4.6.4 pm / am / input surface ─────────────");
+        report_package_writes(&profile, &transport).await?;
     }
 
     Ok(())
@@ -488,8 +490,8 @@ async fn report_rollback(profile: &HostProfile, transport: &AdbTransport) {
                 acowork_android::host::UndoResult::NothingToUndo(why) => {
                     println!("    nothing to undo: {why}");
                 }
-                acowork_android::host::UndoResult::CannotUndo(why) => {
-                    println!("    NO UNDO POSSIBLE: {why}");
+                acowork_android::host::UndoResult::CannotUndo { kind, why } => {
+                    println!("    NO UNDO POSSIBLE [{}]: {why}", kind.label());
                 }
             }
         }
@@ -725,9 +727,9 @@ async fn report_rollback_roundtrip(
     profile: &HostProfile,
     transport: &AdbTransport,
 ) -> Result<(), Box<dyn Error>> {
-    use std::sync::Arc;
-
     use acowork_android::host::ApprovalToken;
+
+    use std::sync::Arc;
 
     let shell: Arc<dyn ExecutionBackend> = Arc::new(ShellBackend::with_runner(
         profile.clone(),
@@ -835,7 +837,7 @@ async fn report_rollback_roundtrip(
     for value in ["harness-1", "harness-2"] {
         let script = format!("setprop {prop} {value}");
         let mut request = ExecRequest::new(Capability::ShellWrite, script.clone(), session);
-        request.approval_token = Some(ApprovalToken::new("harness"));
+        request.approval_token = Some(acowork_android::host::ApprovalToken::new("harness"));
         match roundtrip.exec(request).await {
             Ok(r) if r.succeeded() => {
                 let now = read_prop(&audited, prop).await;
@@ -886,7 +888,7 @@ async fn report_rollback_roundtrip(
     // ledger was drained by the restore above, so anything in it now is a phantom undo.
     let doomed = "setprop persist.sys.acowork.probe 1".to_string();
     let mut request = ExecRequest::new(Capability::ShellWrite, doomed.clone(), session);
-    request.approval_token = Some(ApprovalToken::new("harness"));
+    request.approval_token = Some(acowork_android::host::ApprovalToken::new("harness"));
     let outcome = match roundtrip.exec(request).await {
         Ok(r) => format!(
             "exit {:?} {}",
@@ -904,7 +906,7 @@ async fn report_rollback_roundtrip(
     let path = "/data/local/tmp/acowork-probe.txt";
     let write = format!("echo harness > {path}");
     let mut request = ExecRequest::new(Capability::FsOutsideApp, write.clone(), session);
-    request.approval_token = Some(ApprovalToken::new("harness"));
+    request.approval_token = Some(acowork_android::host::ApprovalToken::new("harness"));
     match gate.decide(&request, None, ready) {
         GateDecision::Allow { .. } => match chain.exec(request).await {
             Ok(r) if r.succeeded() => println!(
@@ -985,8 +987,6 @@ async fn report_file_snapshot(
 ) -> Result<(), Box<dyn Error>> {
     use std::sync::Arc;
 
-    use acowork_android::host::ApprovalToken;
-
     let session = "harness-files";
     let path = "/data/local/tmp/acowork-snap.bin";
     let sink = Arc::new(MemoryAuditSink::new());
@@ -995,32 +995,6 @@ async fn report_file_snapshot(
         profile.clone(),
         transport.clone(),
     )?);
-
-    async fn observe(shell: &Arc<dyn ExecutionBackend>, script: String) -> String {
-        match shell
-            .exec(ExecRequest::read(script, "harness-observer"))
-            .await
-        {
-            Ok(r) if r.succeeded() => r.stdout.trim().to_string(),
-            Ok(r) => format!("<exit {:?}: {}>", r.exit_code, r.stderr.trim()),
-            Err(e) => format!("<{e}>"),
-        }
-    }
-    async fn write(chain: &ReversibleBackend, script: &str, session: &str) -> Result<(), String> {
-        // Claim what the classifier says the script actually needs, the same way §9 does: a
-        // redirect is an `fs:outside-app` write, and mislabelling it is refused, not ignored.
-        let claimed = acowork_android::host::classify_script(script)
-            .strongest()
-            .capability()
-            .unwrap_or(Capability::ShellWrite);
-        let mut request = ExecRequest::new(claimed, script.to_string(), session);
-        request.approval_token = Some(ApprovalToken::new("harness"));
-        chain
-            .exec(request)
-            .await
-            .map(|_| ())
-            .map_err(|e| format!("{e}"))
-    }
 
     // 1. Create a file that was not there. The observed pre-state is *absence*, so the undo is
     //    a removal, not a restore.
@@ -1468,4 +1442,217 @@ async fn report_evidence_capture(
         sink.len()
     );
     Ok(())
+}
+
+async fn observe(
+    shell: &std::sync::Arc<dyn ExecutionBackend>,
+    script: impl Into<String>,
+) -> String {
+    match shell
+        .exec(ExecRequest::read(script.into(), "harness-observer"))
+        .await
+    {
+        Ok(r) if r.succeeded() => r.stdout.trim().to_string(),
+        Ok(r) => format!("<exit {:?}: {}>", r.exit_code, r.stderr.trim()),
+        Err(e) => format!("<{e}>"),
+    }
+}
+async fn write(chain: &ReversibleBackend, script: &str, session: &str) -> Result<(), String> {
+    write_record(chain, script, session).await.map(|_| ())
+}
+
+/// The same write, keeping the record so a section can report an exit code instead of
+/// silently treating "the device refused this" as "this worked".
+async fn write_record(
+    chain: &ReversibleBackend,
+    script: &str,
+    session: &str,
+) -> Result<acowork_android::host::ExecRecord, String> {
+    // Claim what the classifier says the script actually needs, the same way §9 does: a
+    // redirect is an `fs:outside-app` write, and mislabelling it is refused, not ignored.
+    let claimed = acowork_android::host::classify_script(script)
+        .strongest()
+        .capability()
+        .unwrap_or(Capability::ShellWrite);
+    let mut request = ExecRequest::new(claimed, script.to_string(), session);
+    request.approval_token = Some(acowork_android::host::ApprovalToken::new("harness"));
+    chain.exec(request).await.map_err(|e| format!("{e}"))
+}
+
+/// §4.6.4's remaining `pm` / `am` / `input` surface, measured rather than assumed.
+///
+/// Three things are checked and nothing more: that the planner's reasons match what this
+/// device's own `pm help` offers, that the generated package-presence probe is a script this
+/// device's read tier will actually run, and that a `pm` write which is really a Settings row
+/// round-trips through that row's own inverse.
+///
+/// Installing or uninstalling a package is deliberately **not** attempted. The undo leg of that
+/// path could only be verified by changing what is installed on someone's phone, and an
+/// undo nobody has run is exactly the kind of promise this ledger exists to stop making.
+async fn report_package_writes(
+    profile: &HostProfile,
+    transport: &AdbTransport,
+) -> Result<(), Box<dyn Error>> {
+    use std::sync::Arc;
+
+    println!("  ── what the planner says about the surface it does not reverse ──");
+    for script in [
+        "pm clear com.android.settings",
+        "pm uninstall com.example.app",
+        "pm install /data/local/tmp/x.apk",
+        "pm install --pkg com.example.new /data/local/tmp/x.apk",
+        "pm disable com.android.bluetooth",
+        "pm set-home-activity com.example.launcher/.MainActivity",
+        "am force-stop com.example.app",
+        "input tap 540 960",
+    ] {
+        let planned = acowork_android::host::plan_rollback(script);
+        println!("    {script}");
+        for capture in &planned.captures {
+            println!(
+                "      captures {} — read `{}`",
+                capture.target.describe(),
+                capture.read
+            );
+        }
+        for left in &planned.unundoable {
+            println!("      leaves behind [{}]:", left.kind.label());
+            for line in wrap_text(left.why.trim(), 74) {
+                println!("        {line}");
+            }
+        }
+    }
+
+    // The presence probe is generated from the command's own `--pkg` value, so what matters on
+    // a real device is not the string but whether the read tier accepts it and whether the
+    // envelope distinguishes the two cases the undo decision turns on.
+    println!("  ── the generated presence probe, run against this device ──");
+    let observer: Arc<dyn ExecutionBackend> = Arc::new(ShellBackend::with_runner(
+        profile.clone(),
+        transport.clone(),
+    )?);
+    for name in ["com.android.settings", "com.acowork.not.installed"] {
+        let script = acowork_android::host::plan_rollback(&format!(
+            "pm install --pkg {name} /data/local/tmp/x.apk"
+        ))
+        .captures
+        .first()
+        .map(|c| c.read.clone())
+        .unwrap_or_default();
+        let outcome = observer
+            .exec(ExecRequest::read(script.clone(), "harness-package"))
+            .await;
+        match outcome {
+            Ok(record) if record.succeeded() => println!(
+                "  {name}: {:?} -> {}",
+                record.stdout.trim(),
+                if record.stdout.trim() == "PRESENT" {
+                    "installed, so a fresh install would be a replace"
+                } else {
+                    "absent, so an install has a real inverse"
+                }
+            ),
+            Ok(record) => println!(
+                "  {name}: read refused or failed (exit {:?}): {}",
+                record.exit_code,
+                excerpt(&record.stdout, &record.stderr)
+            ),
+            Err(e) => println!("  {name}: the read tier rejected the generated probe: {e}"),
+        }
+    }
+
+    // `pm set-install-location` is a Settings row. Proving that on the device means proving the
+    // row round-trips through the *row's* inverse — `settings delete` for a row that was unset.
+    println!("  ── `pm set-install-location` from this uid ──");
+    let session = "harness-package";
+    let sink = Arc::new(MemoryAuditSink::new());
+    let chain = writable_chain(profile, transport, sink.clone()).await?;
+    let before = observe(&observer, "settings get global install_location").await;
+    println!("  the row it writes reads {before:?}");
+    match write_record(&chain, "pm set-install-location 1", session).await {
+        Ok(record) => println!(
+            "  the command itself: exit {:?} — {}",
+            record.exit_code,
+            excerpt(&record.stdout, &record.stderr)
+        ),
+        Err(e) => println!("  the command itself was refused before running: {e}"),
+    }
+    println!(
+        "  ledger after that write: {} undo(s)",
+        pending_for(&chain, session)
+    );
+    // A write the device refused changed nothing, so an undo for it would be a command to put
+    // back a value nobody replaced. Zero is the correct answer and it is worth printing,
+    // because the failure mode of a rollback ledger is recording too much, not too little.
+    println!(
+        "  row now reads {:?}",
+        observe(&observer, "settings get global install_location").await
+    );
+
+    println!("  ── the same row written the way this uid can: settings put global ──");
+    let row_session = "harness-row";
+    write(
+        &chain,
+        "settings put global install_location 1",
+        row_session,
+    )
+    .await?;
+    println!(
+        "  after the write: {:?}",
+        observe(&observer, "settings get global install_location").await
+    );
+    println!(
+        "  ledger holds: {}",
+        chain
+            .ledger()
+            .lock()
+            .map(|l| l
+                .pending_for(row_session)
+                .iter()
+                .map(|u| u.describe())
+                .collect::<Vec<_>>()
+                .join(", "))
+            .unwrap_or_default()
+    );
+    let restored = chain.restore(row_session).await;
+    println!(
+        "  restore: {} run, {} failed",
+        restored.restored.len(),
+        restored.failed.len()
+    );
+    for line in &restored.restored {
+        println!("    restored {line}");
+    }
+    for (target, why) in &restored.failed {
+        println!("    FAILED to restore {target}: {why}");
+    }
+    let after = observe(&observer, "settings get global install_location").await;
+    println!("  post-state: {after:?}");
+    assert_eq!(
+        before, after,
+        "the row did not come back to what the capture observed"
+    );
+    println!("  matches the observed pre-state: an unset row is restored by deleting it, not by");
+    println!("  writing the literal string {before:?} back");
+    println!("  audit records: {} (capture reads included)", sink.len());
+    Ok(())
+}
+
+/// Wrap at word boundaries for the harness's own output.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.len() + word.len() + 1 > width && !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }

@@ -150,6 +150,32 @@ impl SnapshotStore {
     }
 }
 
+/// The value of a long flag in an argument vector: `--pkg com.foo` → `com.foo`.
+///
+/// A flag whose value is another flag (`--pkg --user 0`) is treated as absent rather than
+/// returning `--user`: a package name that starts with `-` is not a package name, and reading
+/// it as one would build a capture against a target the command never named.
+fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
+        .filter(|v| !v.starts_with('-'))
+}
+
+/// Whether a string can be trusted as a package name in a generated script.
+///
+/// The shell-quoting helper makes any of these safe to *embed*, but a name containing a slash
+/// or a space is a mis-parse rather than a package, and a capture built on one reads the state
+/// of something the write did not touch.
+fn is_package_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() < 200
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'))
+}
+
 fn sanitize(input: &str, max: usize, pad: char) -> String {
     let mut out: String = input
         .chars()
@@ -191,6 +217,12 @@ pub enum UndoTarget {
     /// the one the script overwrote, and a rollback that restores the wrong file is worse than
     /// no rollback at all.
     File(String),
+    /// An installed package, addressed by the name the command itself stated.
+    ///
+    /// Only `pm install --pkg NAME` reaches this: an install given a path names the package
+    /// *inside* the APK, not on the command line, so the capture cannot say which package it
+    /// would remove. A capture that cannot name its target must not build an undo for it.
+    Package(String),
 }
 
 impl UndoTarget {
@@ -202,6 +234,7 @@ impl UndoTarget {
             UndoTarget::Setting { table, key } => format!("settings {table}/{key}"),
             UndoTarget::SelinuxMode => "SELinux enforcing mode".to_string(),
             UndoTarget::File(path) => format!("file {path}"),
+            UndoTarget::Package(name) => format!("package {name}"),
         }
     }
 }
@@ -379,6 +412,55 @@ impl Undo {
     }
 }
 
+/// Why a write cannot be put back.
+///
+/// The distinction is the whole point of this enum. "No inverse is modelled" is an admission
+/// about this port; "there is nothing to restore" is a fact about the command. Printed as one
+/// sentence, the second reads like the first, an operator stops trusting the teardown, and the
+/// session ends with the agent claiming it cleaned up something that was never undoable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnundoableKind {
+    /// This port has no model for the command *yet*. The only kind that is a gap in the port
+    /// rather than a fact about the device, and the only one worth a follow-up issue.
+    NotModelled,
+    /// The command destroys state the device keeps no copy of. Nothing can put it back; a
+    /// backup taken after it ran is a backup of the emptied state.
+    DestroysData,
+    /// The command removes state that could only be re-created by another write needing its
+    /// own approval (uninstall drops the binary; re-installing it is a new action).
+    NoRestorableState,
+    /// The command is an event, not a state change. There is nothing to restore, and the
+    /// opposite gesture is a *new* action, not an undo.
+    NotAStateChange,
+    /// The write happened, but which object it touched is not derivable from the command text,
+    /// so a capture taken before it would not describe the thing the write changed.
+    IndeterminateTarget,
+    /// The before-state was never observed — the probe failed, was refused, or printed
+    /// something this capture cannot interpret. Its own kind because it is the one refusal that
+    /// says nothing about whether the change *could* have been undone: the port simply did not
+    /// see it, and inventing a value to restore is a new write wearing a rollback's name.
+    Unobserved,
+    /// The write did not change anything: the device already held the value. Not a failure to
+    /// undo, and it must not be labelled like one — a teardown that calls a no-op "unundoable"
+    /// teaches the reader to ignore the list.
+    NoChange,
+}
+
+impl UnundoableKind {
+    /// The label the teardown line opens with.
+    pub fn label(self) -> &'static str {
+        match self {
+            UnundoableKind::NotModelled => "no inverse modelled",
+            UnundoableKind::DestroysData => "destroys data",
+            UnundoableKind::NoRestorableState => "no restorable state",
+            UnundoableKind::NotAStateChange => "not a state change",
+            UnundoableKind::IndeterminateTarget => "target not identifiable",
+            UnundoableKind::Unobserved => "before-state not observed",
+            UnundoableKind::NoChange => "no change to undo",
+        }
+    }
+}
+
 /// A mutation with no modelled inverse, kept so the session's teardown can say what it is
 /// leaving behind.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -387,6 +469,190 @@ pub struct Unundoable {
     pub command: String,
     /// What it does, and why there is no undo. Reaches the node, not the wire.
     pub why: String,
+    /// Whether the reason is a fact about the command or a gap in this port.
+    pub kind: UnundoableKind,
+}
+
+impl Unundoable {
+    /// The one line the teardown prints.
+    ///
+    /// Living on the type rather than at each call site because the category is the part a
+    /// reader needs and the part most easily dropped: a consumer that formats `command` and
+    /// `why` alone produces a log where "the device cannot put this back" and "this port has
+    /// not modelled it" are indistinguishable — which is the exact failure the enum exists to
+    /// prevent.
+    pub fn summary(&self) -> String {
+        format!("[{}] {}: {}", self.kind.label(), self.command, self.why)
+    }
+}
+
+/// The `pm` / `am` writes that have no inverse, and the reason for each.
+///
+/// A table rather than a match because the reasons are the deliverable: they are what turns
+/// "we did not get to it" into "here is the fact about this command, and here is what you would
+/// have to supply to undo it". Every entry was checked against the BLA-AL00 `pm help` output
+/// and the device's actual read surface, not against AOSP documentation — which is why, for
+/// example, `pm install-existing` is described as "not present on every build" instead of
+/// assumed available: it is absent from this build's help text.
+/// The enabled-state family shares one reason: the commands pair up, but the read does not
+/// distinguish the modes, so no inverse can be named. Kept as one string because four copies of
+/// a sentence drift four ways.
+const ENABLED_STATE_REASON: &str = "the commands pair up, but no read on this device reports      *which* disabled mode a package is in — `pm list packages -d` folds `disabled`,      `disabled-user` and `disable-until-used` into one list (measured on BLA-AL00: 0 rows      against 300 enabled packages), so restoring the flag can set a different mode than the one      observed. That is a second unapproved change, not a rollback";
+
+const IRREVERSIBLE: &[(&str, &str, UnundoableKind, &str)] = &[
+    (
+        "pm",
+        "enable",
+        UnundoableKind::NotModelled,
+        ENABLED_STATE_REASON,
+    ),
+    (
+        "pm",
+        "disable",
+        UnundoableKind::NotModelled,
+        ENABLED_STATE_REASON,
+    ),
+    (
+        "pm",
+        "disable-user",
+        UnundoableKind::NotModelled,
+        ENABLED_STATE_REASON,
+    ),
+    (
+        "pm",
+        "disable-until-used",
+        UnundoableKind::NotModelled,
+        ENABLED_STATE_REASON,
+    ),
+    (
+        "pm",
+        "default-state",
+        UnundoableKind::NotModelled,
+        ENABLED_STATE_REASON,
+    ),
+    (
+        "pm",
+        "install",
+        UnundoableKind::IndeterminateTarget,
+        "the package name lives inside the APK, not on the command line, so nothing captured \
+         beforehand could name the package this write created. `pm install --pkg NAME` does name \
+         it, and then an undo can be planned",
+    ),
+    (
+        "pm",
+        "uninstall",
+        UnundoableKind::NoRestorableState,
+        "the device does not retain an uninstalled package's binary. Putting it back means \
+         installing an APK again — a new write with its own approval — and `pm install-existing`, \
+         the only primitive that restores a system package without an APK, is not present on \
+         every build this port targets (it is absent from this device's `pm help`)",
+    ),
+    (
+        "pm",
+        "clear",
+        UnundoableKind::DestroysData,
+        "deletes everything the app holds: databases, preferences, accounts it configured, files \
+         in its private directory. Nothing on the device can bring that back, and a snapshot \
+         taken after this command runs captures the empty state",
+    ),
+    (
+        "pm",
+        "remove-user",
+        UnundoableKind::DestroysData,
+        "deletes the user and everything stored under it",
+    ),
+    (
+        "pm",
+        "create-user",
+        UnundoableKind::IndeterminateTarget,
+        "its inverse `remove-user` takes the numeric user id, which `create-user` prints in its \
+         output rather than accepting as an argument — the planner plans from the command text, \
+         and inventing an id to remove is how a rollback deletes the wrong user",
+    ),
+    (
+        "pm",
+        "trim-caches",
+        UnundoableKind::DestroysData,
+        "deletes cache files. They are regenerable in principle, but not by this port: what gets \
+         rebuilt depends on what each app does next",
+    ),
+    (
+        "pm",
+        "install-commit",
+        UnundoableKind::IndeterminateTarget,
+        "a staged session names its payload by session id and the package only becomes known when \
+         the commit reads the APK. `install-abandon` cancels a session that has not committed, \
+         which is a cancel, not an inverse of one that has",
+    ),
+    (
+        "pm",
+        "grant",
+        UnundoableKind::NotModelled,
+        "the pair is named, but the pre-state is the set of permissions one app holds, and reading \
+         it means parsing `dumpsys package`, whose field names are OEM-modified. A parser that \
+         guesses here grants or revokes the wrong permission",
+    ),
+    (
+        "am",
+        "start",
+        UnundoableKind::NoRestorableState,
+        "the activity stack that was on screen is not something a command can put back. Forcing \
+         the foreground app to stop is a different change, not an inverse, and it destroys state \
+         this write never touched",
+    ),
+    (
+        "am",
+        "force-stop",
+        UnundoableKind::NoRestorableState,
+        "the process and everything in its memory are gone. Relaunching the app starts from a \
+         different state than the one observed, so the ledger would be recording a change it \
+         cannot describe",
+    ),
+    (
+        "am",
+        "broadcast",
+        UnundoableKind::NotAStateChange,
+        "delivers an intent and lets the receivers decide what happens; none of those effects are \
+         visible to the planner. There is nothing here to restore, and the opposite action would \
+         be another broadcast needing its own approval",
+    ),
+];
+
+/// Commands where every write is irreversible the same way, whatever the argument is.
+const HEAD_IRREVERSIBLE: &[(&str, UnundoableKind, &str)] = &[(
+    "input",
+    UnundoableKind::NotAStateChange,
+    "injects a key, tap or gesture — an event, not a state change. There is no previous value to \
+     put back, the app on the other end decides what the event causes, and those downstream \
+     effects are not undone either. The opposite gesture is a new action requiring its own \
+     approval, not a rollback",
+)];
+
+/// Why this write cannot be put back, if the table knows. `None` means the planner has no
+/// specific fact to offer, which is reported as [`UnundoableKind::NotModelled`] — the one kind
+/// that is an admission about this port rather than about the command.
+fn irreversible(head: &str, sub: Option<&str>) -> Option<(UnundoableKind, String)> {
+    if let Some(sub) = sub
+        && let Some((_, _, kind, why)) = IRREVERSIBLE
+            .iter()
+            .find(|(h, s, _, _)| *h == head && *s == sub)
+    {
+        return Some((*kind, why.to_string()));
+    }
+    // A command whose *every* write is the same kind of irreversible does not need a
+    // subcommand to be recognised: `input` has no read-only form at all.
+    HEAD_IRREVERSIBLE
+        .iter()
+        .find(|(h, _, _)| *h == head)
+        .map(|(_, kind, why)| (*kind, why.to_string()))
+}
+
+/// The subcommand of a dispatcher like `pm`/`am`, skipping any flags that come before it.
+fn subcommand(args: &[String]) -> Option<&str> {
+    args.get(1..)?
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .map(String::as_str)
 }
 
 /// What a script needs before it runs, and what it will leave unundoable.
@@ -423,6 +689,7 @@ pub fn plan(script: &str) -> Plan {
                   it changes — an empty undo list here means the planner was blind, not that \
                   the session is clean"
                 .to_string(),
+            kind: UnundoableKind::IndeterminateTarget,
         });
         return out;
     };
@@ -449,15 +716,33 @@ pub fn plan(script: &str) -> Plan {
                     "redirects to {:?}, which is not a plain absolute path — a relative name, a                      glob or a `$variable` names a file this capture cannot identify, so no                      snapshot was taken and this change stays after the session ends",
                     command.redirect.as_deref().unwrap_or("")
                 ),
+                kind: UnundoableKind::IndeterminateTarget,
             }),
-            None => out.unundoable.push(Unundoable {
-                command: finding.command.clone(),
-                why: format!(
-                    "{} — and no inverse is modelled for it, so this change stays after the \
-                     session ends",
-                    finding.detail
-                ),
-            }),
+            None => {
+                // The dispatcher tables answer this before the planner falls back to admitting
+                // it has no model. Getting the two apart is the point: `input tap` does not
+                // "leave a change behind" that the session failed to clean, and saying so would
+                // teach the operator to distrust every line in the teardown.
+                let (kind, why) = irreversible(
+                    command.words.first().map(String::as_str).unwrap_or(""),
+                    subcommand(&command.words),
+                )
+                .unwrap_or_else(|| {
+                    (
+                        UnundoableKind::NotModelled,
+                        format!(
+                            "{} — this port has no inverse modelled for it yet, so the change \
+                             stays after the session ends",
+                            finding.detail
+                        ),
+                    )
+                });
+                out.unundoable.push(Unundoable {
+                    command: finding.command.clone(),
+                    why,
+                    kind,
+                })
+            }
         }
     }
     out
@@ -515,6 +800,52 @@ impl Capture {
                     persists_reboot: false,
                 })
             }
+            // `pm set-install-location` is a Settings write wearing a package-manager uniform.
+            // The table is not a guess: driving it on BLA-AL00 produced a SecurityException whose
+            // stack runs through `SettingsProvider.insertGlobalSetting`, and the row reads back
+            // as `global/install_location`. That is also the reason the arm below can be *right*
+            // while the command still does nothing on this phone — the shell uid (2000) is
+            // refused ("Package android does not belong to 2000"), the write fails, and a failed
+            // write records no undo. The row itself round-trips, which is what this mapping is
+            // for; inventing a second target type for a Settings row would duplicate a path that
+            // already works.
+            ("pm", Some("set-install-location"))
+                if args.len() == 3
+                    && matches!(
+                        args[2].as_str(),
+                        "0" | "1" | "2" | "auto" | "internal" | "external"
+                    ) =>
+            {
+                Some(Capture {
+                    target: UndoTarget::Setting {
+                        table: "global".to_string(),
+                        key: "install_location".to_string(),
+                    },
+                    read: "settings get global install_location".to_string(),
+                    writing: Writing::Set(args[2].to_string()),
+                    persists_reboot: true,
+                })
+            }
+            // An install whose package the command itself names. Without `--pkg` the name is
+            // inside the APK, so this arm deliberately does not fire and the write is reported
+            // as IndeterminateTarget rather than planned against a guessed package.
+            ("pm", Some("install")) => {
+                let name = flag_value(args, "--pkg").filter(|n| is_package_name(n))?;
+                Some(Capture {
+                    target: UndoTarget::Package(name.to_string()),
+                    // Absence has to be a *successful* read, not a non-zero exit: `pm path` on a
+                    // package that is not installed prints nothing and exits 1, and an
+                    // unenveloped read would be treated as "pre-state not observed" — which
+                    // means no undo, for the one case where an undo exists.
+                    read: format!(
+                        "pm path {} 2>/dev/null | grep -q . && printf 'PRESENT\\n' || printf \
+                         'ABSENT\\n'",
+                        quote_posix(name)
+                    ),
+                    writing: Writing::Unknown,
+                    persists_reboot: true,
+                })
+            }
             _ => None,
         }
     }
@@ -532,6 +863,24 @@ pub enum PreState {
     Value(String),
     /// What a file capture found.
     File(FilePreState),
+    /// What a package capture found.
+    Package(PackagePreState),
+}
+
+/// Whether the package was installed when the capture ran.
+///
+/// Deliberately thinner than [`FilePreState`]: there is no content to snapshot here, so the
+/// only thing worth knowing is whether the write created the package or replaced one that
+/// already existed. That single bit decides whether an inverse exists at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackagePreState {
+    /// Not installed. The inverse is removing what the install creates.
+    Absent,
+    /// Already installed — so the write is a reinstall or an update, and the binary it
+    /// replaced is not kept anywhere the port can reach.
+    Present,
+    /// The presence probe did not print the envelope. Treated as "not observed".
+    Unknown(String),
 }
 
 /// What a file capture found, and what was done about it.
@@ -579,7 +928,12 @@ pub enum UndoResult {
     /// A change we cannot put back, discovered only once the pre-state was in hand. The
     /// planner cannot have known: `setenforce 1` is undoable on an enforcing device and not on
     /// one whose SELinux is disabled, and only the device knows which it is.
-    CannotUndo(String),
+    CannotUndo {
+        /// Whether the reason is a fact about the command or a gap in this port.
+        kind: UnundoableKind,
+        /// What could not be put back, and why. Reaches the node, not the wire.
+        why: String,
+    },
 }
 
 /// Turn a captured pre-state into the inverse, or explain why there is none.
@@ -598,19 +952,25 @@ pub fn undo_for(
     if let UndoTarget::File(path) = &capture.target {
         return undo_for_file(capture, path, observed, request);
     }
+    if matches!(capture.target, UndoTarget::Package(_)) {
+        return undo_for_package(capture, observed, request);
+    }
 
     let Some(raw) = (match observed {
         Some(PreState::Value(value)) => Some(value),
         // A `File` pre-state against a non-file capture means the backend and the planner
         // disagree about what the target is. Refusing is the only honest reading.
-        Some(PreState::File(_)) | None => None,
+        Some(PreState::File(_) | PreState::Package(_)) | None => None,
     }) else {
-        return UndoResult::CannotUndo(format!(
-            "{}: the pre-state read (`{}`) did not return a value, and restoring to a value \
+        return UndoResult::CannotUndo {
+            kind: UnundoableKind::Unobserved,
+            why: format!(
+                "{}: the pre-state read (`{}`) did not return a value, and restoring to a value \
              that was never observed would be a new change, not a rollback",
-            capture.target.describe(),
-            capture.read
-        ));
+                capture.target.describe(),
+                capture.read
+            ),
+        };
     };
     let current = raw.trim();
 
@@ -708,12 +1068,14 @@ pub fn undo_for(
                 // A disabled SELinux is set at boot, from the kernel command line or by a
                 // permissive build. `setenforce` cannot re-disable it, and no script on this
                 // device can — so the promise to put things back is one this port must not make.
-                "Disabled" => UndoResult::CannotUndo(
-                    "SELinux is *disabled* on this device, not enforcing; `setenforce` cannot \
+                "Disabled" => UndoResult::CannotUndo {
+                    kind: UnundoableKind::NoRestorableState,
+                    why:
+                        "SELinux is *disabled* on this device, not enforcing; `setenforce` cannot \
                      restore a disabled state (it is set at boot), so this change cannot be \
                      undone from the shell"
-                        .to_string(),
-                ),
+                            .to_string(),
+                },
                 _ => UndoResult::Undo(Undo {
                     session_id: request.session_id.clone(),
                     target: capture.target.clone(),
@@ -734,17 +1096,26 @@ pub fn undo_for(
         // Unreachable by construction — `undo_for` dispatches on the target before this match.
         // Kept as a refusal rather than an unreachable! because the cost of being wrong about
         // that is a device left in a state nobody can name.
-        (UndoTarget::File(_), _) => UndoResult::CannotUndo(
-            "a file capture reached the value branch of the undo builder".to_string(),
-        ),
-        (target, Writing::Unknown) => UndoResult::CannotUndo(format!(
-            "{}: the write's new value is not knowable in advance and no snapshot was taken",
-            target.describe()
-        )),
-        (target, Writing::Delete) => UndoResult::CannotUndo(format!(
-            "{}: no delete-inverse is modelled for this target",
-            target.describe()
-        )),
+        // Both dispatched above; reaching either here means the backend and the planner
+        // disagree about the target, which is refused rather than guessed at.
+        (UndoTarget::File(_) | UndoTarget::Package(_), _) => UndoResult::CannotUndo {
+            kind: UnundoableKind::IndeterminateTarget,
+            why: "a file capture reached the value branch of the undo builder".to_string(),
+        },
+        (target, Writing::Unknown) => UndoResult::CannotUndo {
+            kind: UnundoableKind::NotModelled,
+            why: format!(
+                "{}: the write's new value is not knowable in advance and no snapshot was taken",
+                target.describe()
+            ),
+        },
+        (target, Writing::Delete) => UndoResult::CannotUndo {
+            kind: UnundoableKind::NotModelled,
+            why: format!(
+                "{}: no delete-inverse is modelled for this target",
+                target.describe()
+            ),
+        },
     }
 }
 
@@ -753,6 +1124,64 @@ pub fn undo_for(
 /// Note what is *not* here: no `NothingToUndo`. A redirect's new content is not knowable
 /// before the command runs, so there is no comparison to make and no way to claim the write
 /// changed nothing. Every successful file write therefore records something to put back.
+fn undo_for_package(
+    capture: &Capture,
+    observed: Option<PreState>,
+    request: &ExecRequest,
+) -> UndoResult {
+    let UndoTarget::Package(name) = &capture.target else {
+        return UndoResult::CannotUndo {
+            kind: UnundoableKind::IndeterminateTarget,
+            why: "a package undo was requested for a non-package target".to_string(),
+        };
+    };
+    match observed {
+        // The package was not there before, so removing it returns the observed state.
+        // Not marked faithful: the install may have granted runtime permissions, created
+        // directories on shared storage or registered accounts, and none of that is undone
+        // by `pm uninstall`. The package entity returns; the surroundings may not.
+        Some(PreState::Package(PackagePreState::Absent)) => UndoResult::Undo(Undo {
+            session_id: request.session_id.clone(),
+            target: capture.target.clone(),
+            action: UndoAction::Script(format!("pm uninstall {}", quote_posix(name))),
+            old_value: String::new(),
+            faithful: false,
+            persists_reboot: capture.persists_reboot,
+            capability: request
+                .android_capability()
+                .unwrap_or(Capability::ShellWrite),
+            token: request.approval_token.clone(),
+        }),
+        // Already installed: this write replaced a binary the device does not keep. The
+        // inverse would be "install the previous APK again", and the previous APK is not
+        // something the port has — offering an undo here would mean inventing one.
+        Some(PreState::Package(PackagePreState::Present)) => UndoResult::CannotUndo {
+            kind: UnundoableKind::NoRestorableState,
+            why: format!(
+                "{} was already installed before this write. `pm install` replaced its binary, \
+                 and the replaced binary is not retained anywhere this port can reach — the undo \
+                 would have to be an APK the session never had",
+                capture.target.describe()
+            ),
+        },
+        Some(PreState::Package(PackagePreState::Unknown(text))) => UndoResult::CannotUndo {
+            kind: UnundoableKind::Unobserved,
+            why: format!(
+                "the package presence probe printed {text:?}, which is not the envelope this \
+                 capture expects, so nothing is known about what this install replaced"
+            ),
+        },
+        // `None` belongs here: no pre-state observed means the presence probe never
+        // answered, and an install with no observed before-state has no defensible inverse.
+        other => UndoResult::CannotUndo {
+            kind: UnundoableKind::Unobserved,
+            why: format!(
+                "a package capture was handed a pre-state that is not a package read ({other:?})"
+            ),
+        },
+    }
+}
+
 fn undo_for_file(
     capture: &Capture,
     path: &str,
@@ -760,11 +1189,14 @@ fn undo_for_file(
     request: &ExecRequest,
 ) -> UndoResult {
     let Some(PreState::File(state)) = observed else {
-        return UndoResult::CannotUndo(format!(
-            "file {path}: the snapshot read did not complete, so nothing is known about what \
+        return UndoResult::CannotUndo {
+            kind: UnundoableKind::Unobserved,
+            why: format!(
+                "file {path}: the snapshot read did not complete, so nothing is known about what \
              is at that path. Restoring a file to a state nobody observed would be a new \
              change wearing a rollback's name"
-        ));
+            ),
+        };
     };
     let undo = |action, old_value: String, faithful: bool| {
         UndoResult::Undo(Undo {
@@ -807,18 +1239,25 @@ fn undo_for_file(
                 false,
             )
         }
-        FilePreState::TooBig { bytes } => UndoResult::CannotUndo(format!(
-            "holds {bytes} bytes, over the {SNAPSHOT_BUDGET_BYTES}-byte snapshot \
+        FilePreState::TooBig { bytes } => UndoResult::CannotUndo {
+            kind: UnundoableKind::NoRestorableState,
+            why: format!(
+                "holds {bytes} bytes, over the {SNAPSHOT_BUDGET_BYTES}-byte snapshot \
              budget; a truncated backup is a second change, so nothing was saved, and this \
              write will still be there when the session ends"
-        )),
-        FilePreState::Unreadable => UndoResult::CannotUndo(format!(
-            "file {path} exists but this shell cannot read it; its previous content is \
+            ),
+        },
+        FilePreState::Unreadable => UndoResult::CannotUndo {
+            kind: UnundoableKind::Unobserved,
+            why: format!(
+                "file {path} exists but this shell cannot read it; its previous content is \
              unknown, so it cannot be put back"
-        )),
-        FilePreState::NotSaved { reason } => UndoResult::CannotUndo(format!(
-            "file {path} was readable but no snapshot was kept: {reason}"
-        )),
+            ),
+        },
+        FilePreState::NotSaved { reason } => UndoResult::CannotUndo {
+            kind: UnundoableKind::NoRestorableState,
+            why: format!("file {path} was readable but no snapshot was kept: {reason}"),
+        },
     }
 }
 
@@ -1016,6 +1455,13 @@ impl ReversibleBackend {
     /// undo", not as "the value was empty".
     async fn read_pre_state(&self, capture: &Capture, session: &str) -> Option<PreState> {
         let record = self.read(&capture.read, session).await?;
+        if matches!(capture.target, UndoTarget::Package(_)) {
+            return Some(PreState::Package(match record.stdout.trim() {
+                "PRESENT" => PackagePreState::Present,
+                "ABSENT" => PackagePreState::Absent,
+                other => PackagePreState::Unknown(other.to_string()),
+            }));
+        }
         if !matches!(capture.target, UndoTarget::File(_)) {
             return Some(PreState::Value(record.stdout));
         }
@@ -1403,12 +1849,23 @@ impl ExecutionBackend for ReversibleBackend {
                     // Both of these are the teardown's business, not the caller's: "nothing to
                     // undo" and "no undo possible" read the same in a log and mean opposite
                     // things to whoever is deciding whether to trust this session's cleanup.
-                    UndoResult::NothingToUndo(why) | UndoResult::CannotUndo(why) => {
+                    UndoResult::NothingToUndo(why) => {
                         ledger.record_unundoable(
                             &session,
                             &[Unundoable {
                                 command: capture.target.describe(),
                                 why,
+                                kind: UnundoableKind::NoChange,
+                            }],
+                        );
+                    }
+                    UndoResult::CannotUndo { kind, why } => {
+                        ledger.record_unundoable(
+                            &session,
+                            &[Unundoable {
+                                command: capture.target.describe(),
+                                why,
+                                kind,
                             }],
                         );
                     }
@@ -1436,6 +1893,7 @@ impl std::fmt::Debug for ReversibleBackend {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     /// A fresh directory per call, so a test that writes a snapshot cannot read another's.
@@ -1543,6 +2001,15 @@ mod tests {
         }
     }
 
+    /// The refusal text, for assertions that care about both the category and the sentence.
+    fn result_why(result: &UndoResult) -> String {
+        match result {
+            UndoResult::CannotUndo { why, .. } => why.clone(),
+            UndoResult::NothingToUndo(why) => why.clone(),
+            other => format!("{other:?}"),
+        }
+    }
+
     fn write_request(script: &str, capability: Capability) -> ExecRequest {
         let mut request = ExecRequest::new(capability, script, "session-alpha");
         request.approval_token = Some(ApprovalToken::new("tok-1"));
@@ -1603,9 +2070,23 @@ mod tests {
         assert!(planned.captures.is_empty());
         assert_eq!(planned.unundoable.len(), 1);
         assert_eq!(planned.unundoable[0].command, "am broadcast");
+        // This one is *not* a gap in the port, and the old message said it was. A broadcast is
+        // an event: there is no previous value to put back. Saying "no inverse is modelled, so
+        // this change stays after the session ends" describes a change that was never made and
+        // admits a gap that does not exist.
+        assert_eq!(planned.unundoable[0].kind, UnundoableKind::NotAStateChange);
         assert!(
-            planned.unundoable[0].why.contains("no inverse is modelled"),
+            planned.unundoable[0]
+                .why
+                .contains("nothing here to restore"),
             "{:?}",
+            planned.unundoable[0]
+        );
+        assert!(
+            !planned.unundoable[0]
+                .why
+                .contains("stays after the session"),
+            "an event must not be reported as a leftover change: {:?}",
             planned.unundoable[0]
         );
 
@@ -1720,7 +2201,13 @@ mod tests {
         // value that was there all along. That is a second, unapproved change.
         let result = undo_of("setprop debug.foo 1", "getprop 'debug.foo'", None);
         assert!(
-            matches!(&result, UndoResult::CannotUndo(why) if why.contains("never observed")),
+            matches!(
+                &result,
+                UndoResult::CannotUndo {
+                    kind: UnundoableKind::Unobserved,
+                    ..
+                } if result_why(&result).contains("never observed")
+            ),
             "{result:?}"
         );
     }
@@ -1837,7 +2324,13 @@ mod tests {
         // success while the kernel stays permissive.
         let result = undo_of("setenforce 0", "getenforce", Some("Disabled\n"));
         assert!(
-            matches!(&result, UndoResult::CannotUndo(why) if why.contains("disabled")),
+            matches!(
+                &result,
+                UndoResult::CannotUndo {
+                    kind: UnundoableKind::NoRestorableState,
+                    ..
+                } if result_why(&result).contains("disabled")
+            ),
             "{result:?}"
         );
     }
@@ -2350,5 +2843,273 @@ mod tests {
         let ledger = backend.ledger();
         let guard = ledger.lock().unwrap();
         assert_eq!(guard.pending_for("session-beta").len(), 1);
+    }
+
+    // ── the `pm` / `am` / `input` surface ────────────────────────────────────
+    //
+    // These tests exist because the old behaviour was worse than no behaviour: one sentence
+    // covered "this port has not modelled it", "nothing on the device can put it back" and
+    // "there was never any state to restore". The three read identically in a log and mean
+    // opposite things to whoever decides whether the session cleaned up after itself.
+
+    #[test]
+    fn a_destructive_pm_write_is_named_as_one() {
+        let planned = plan("pm clear com.example.app");
+        assert!(planned.captures.is_empty());
+        assert_eq!(planned.unundoable[0].kind, UnundoableKind::DestroysData);
+        assert!(
+            planned.unundoable[0]
+                .why
+                .contains("a snapshot taken after this command runs"),
+            "{:?}",
+            planned.unundoable[0]
+        );
+
+        // Uninstall is not the same fact: the data is gone *and* the binary is not retained,
+        // but the operator's next step differs (re-supply an APK vs restore a backup).
+        let planned = plan("pm uninstall com.example.app");
+        assert_eq!(
+            planned.unundoable[0].kind,
+            UnundoableKind::NoRestorableState
+        );
+    }
+
+    #[test]
+    fn an_install_without_a_named_package_has_no_target_to_undo() {
+        // The package name is inside the APK. A capture taken here would read the state of
+        // nothing in particular, so the planner declines to plan one.
+        let planned = plan("pm install /data/local/tmp/x.apk");
+        assert!(planned.captures.is_empty());
+        assert_eq!(
+            planned.unundoable[0].kind,
+            UnundoableKind::IndeterminateTarget
+        );
+    }
+
+    #[test]
+    fn an_install_that_names_its_package_is_planned() {
+        let planned = plan("pm install --pkg com.example.new /data/local/tmp/x.apk");
+        assert_eq!(planned.captures.len(), 1, "{:?}", planned.captures);
+        let capture = &planned.captures[0];
+        assert_eq!(
+            capture.target,
+            UndoTarget::Package("com.example.new".to_string())
+        );
+        // Absence has to come back as a successful read, so the probe is enveloped rather than
+        // being `pm path` alone — which exits 1 for exactly the case that has an inverse.
+        assert!(
+            capture.read.contains("pm path 'com.example.new'"),
+            "{}",
+            capture.read
+        );
+        assert!(capture.read.contains("PRESENT"), "{}", capture.read);
+        assert!(capture.read.contains("ABSENT"), "{}", capture.read);
+    }
+
+    #[test]
+    fn a_flag_cannot_become_a_package_name() {
+        // `--pkg --user 0` names no package. Reading `--user` as one would build a capture
+        // against a target the command never named, and the undo would uninstall something
+        // the session did not install.
+        let planned = plan("pm install --pkg --user 0 /data/local/tmp/x.apk");
+        assert!(planned.captures.is_empty());
+        assert_eq!(
+            planned.unundoable[0].kind,
+            UnundoableKind::IndeterminateTarget
+        );
+
+        // A value that is not a package name shape is refused for the same reason, even though
+        // shell-quoting would have made it *safe* to embed. Safe to embed is not the test;
+        // naming a real package is.
+        let planned = plan("pm install --pkg ../etc /data/local/tmp/x.apk");
+        assert!(planned.captures.is_empty());
+    }
+
+    #[test]
+    fn installing_into_an_absent_package_uninstalls_it() {
+        let planned = plan("pm install --pkg com.example.new /data/local/tmp/x.apk");
+        let result = undo_for(
+            &planned.captures[0],
+            Some(PreState::Package(PackagePreState::Absent)),
+            &request_for("pm install --pkg com.example.new /data/local/tmp/x.apk"),
+        );
+        let UndoResult::Undo(undo) = result else {
+            panic!("an absent package has a real inverse: {result:?}");
+        };
+        assert_eq!(
+            undo.action,
+            UndoAction::Script("pm uninstall 'com.example.new'".to_string())
+        );
+        // Not faithful: the package entity returns, but runtime permissions granted at install
+        // time, directories on shared storage and accounts it registered do not.
+        assert!(!undo.faithful);
+        assert!(undo.persists_reboot);
+    }
+
+    #[test]
+    fn reinstalling_an_installed_package_offers_no_undo() {
+        let planned = plan("pm install --pkg com.example.new /data/local/tmp/x.apk");
+        let request = request_for("pm install --pkg com.example.new /data/local/tmp/x.apk");
+
+        let result = undo_for(
+            &planned.captures[0],
+            Some(PreState::Package(PackagePreState::Present)),
+            &request,
+        );
+        assert!(
+            matches!(
+                &result,
+                UndoResult::CannotUndo {
+                    kind: UnundoableKind::NoRestorableState,
+                    ..
+                }
+            ),
+            "{result:?}"
+        );
+        assert!(
+            result_why(&result).contains("replaced its binary"),
+            "{}",
+            result_why(&result)
+        );
+
+        // And a probe that never answered is its own category — the port did not see the
+        // before-state, which is a different problem from there being nothing to restore.
+        let result = undo_for(
+            &planned.captures[0],
+            Some(PreState::Package(PackagePreState::Unknown(
+                "error: package unknown".to_string(),
+            ))),
+            &request,
+        );
+        assert!(
+            matches!(
+                &result,
+                UndoResult::CannotUndo {
+                    kind: UnundoableKind::Unobserved,
+                    ..
+                }
+            ),
+            "{result:?}"
+        );
+
+        let result = undo_for(&planned.captures[0], None, &request);
+        assert!(
+            matches!(
+                &result,
+                UndoResult::CannotUndo {
+                    kind: UnundoableKind::Unobserved,
+                    ..
+                }
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn set_install_location_is_recognised_as_the_settings_write_it_is() {
+        // `pm set-install-location` writes Settings.Global.install_location — measured, not
+        // assumed: driving it on BLA-AL00 threw a SecurityException whose stack goes through
+        // `insertGlobalSetting`. Recognising the row means the undo reuses the settings path,
+        // including the `null` means-absent rule, instead of inventing a second model for the
+        // same device state.
+        let planned = plan("pm set-install-location 1");
+        assert_eq!(planned.captures.len(), 1, "{:?}", planned.captures);
+        assert_eq!(
+            planned.captures[0].target,
+            UndoTarget::Setting {
+                table: "global".to_string(),
+                key: "install_location".to_string(),
+            }
+        );
+        assert_eq!(
+            planned.captures[0].read,
+            "settings get global install_location"
+        );
+
+        // Measured on BLA-AL00: the row reads `null` before anything sets it, so the undo of a
+        // first write is a delete, not a put of the string "null".
+        let result = undo_for(
+            &planned.captures[0],
+            Some(PreState::Value("null\n".to_string())),
+            &request_for("pm set-install-location 1"),
+        );
+        let UndoResult::Undo(undo) = result else {
+            panic!("an unset row has an exact inverse: {result:?}");
+        };
+        assert_eq!(
+            undo.action,
+            UndoAction::Script("settings delete 'global' 'install_location'".to_string())
+        );
+        assert!(undo.faithful);
+
+        // A value the command would not accept is not planned at all: an undo for a write the
+        // device rejects would put a value in the ledger that nothing ever replaced.
+        let planned = plan("pm set-install-location 7");
+        assert!(planned.captures.is_empty());
+        assert_eq!(
+            planned.unundoable[0].kind,
+            UnundoableKind::NotModelled,
+            "{:?}",
+            planned.unundoable[0]
+        );
+    }
+
+    #[test]
+    fn an_unmodelled_write_still_admits_it_is_the_ports_gap() {
+        // The category that *is* an admission. It has to stay distinguishable from the facts
+        // about commands, or the port can quietly reclassify its own gaps as impossibilities.
+        let planned = plan("pm set-home-activity com.example.launcher/.MainActivity");
+        assert!(planned.captures.is_empty());
+        assert_eq!(planned.unundoable[0].kind, UnundoableKind::NotModelled);
+        assert!(
+            planned.unundoable[0]
+                .why
+                .contains("no inverse modelled for it yet"),
+            "{:?}",
+            planned.unundoable[0]
+        );
+
+        // `pm enable`/`pm disable` look trivially reversible and are not, on this device: the
+        // read cannot tell `disabled` from `disabled-user`, so the "inverse" can set a
+        // different mode than the one observed. Recorded as a gap, with the reason.
+        let planned = plan("pm disable com.example.app");
+        assert_eq!(planned.unundoable[0].kind, UnundoableKind::NotModelled);
+        assert!(planned.unundoable[0].why.contains("disabled-user"));
+    }
+
+    #[test]
+    fn injected_events_are_not_reported_as_leftover_state() {
+        for script in ["input tap 540 960", "input keyevent 26", "input text hello"] {
+            let planned = plan(script);
+            assert!(planned.captures.is_empty(), "{script}");
+            assert_eq!(
+                planned.unundoable[0].kind,
+                UnundoableKind::NotAStateChange,
+                "{script}"
+            );
+            assert!(
+                !planned.unundoable[0]
+                    .why
+                    .contains("stays after the session"),
+                "{script}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_kind_is_said_in_its_own_words() {
+        // The labels reach a human. Two kinds sharing a label would make the list lie.
+        let all = [
+            UnundoableKind::NotModelled,
+            UnundoableKind::DestroysData,
+            UnundoableKind::NoRestorableState,
+            UnundoableKind::NotAStateChange,
+            UnundoableKind::IndeterminateTarget,
+            UnundoableKind::Unobserved,
+            UnundoableKind::NoChange,
+        ];
+        let labels: Vec<&str> = all.iter().map(|k| k.label()).collect();
+        let unique: std::collections::HashSet<&str> = labels.iter().copied().collect();
+        assert_eq!(labels.len(), unique.len(), "{labels:?}");
     }
 }
