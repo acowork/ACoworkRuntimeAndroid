@@ -253,14 +253,24 @@ fn capture_note(profile: &HostProfile) -> String {
     }
     // Stated as a rate, not as a size: the chunk size is this port's constant, the artifact
     // size is the device's business.
+    // A service dump is the one source whose name is not a path, so the profile's evidence
+    // table cannot answer "is it there": a name the device does not have exits 0 and prints its
+    // own refusal, which would otherwise arrive as a small success.
+    let services = profile
+        .evidence
+        .dumpsys_services
+        .map(|n| format!("{n} services are listed above; "))
+        .unwrap_or_default();
     format!(
         "Capture: a source that yields content comes back as a file in the Agent workspace \
          (a source that does not is named above, and capturing one of those is a refusal, not \
          an empty file). Bytes travel base64 because this channel decodes stdout as text — \
          reading a binary through it is not reading it — at one command per {} KiB, and the \
          artifact is kept only if it hashes to the digest the device computed before the \
-         transfer.",
-        EVIDENCE_CHUNK_BYTES / 1024
+         transfer. For a service dump, {}a name the device does not have comes back as a \
+         refusal rather than a file.",
+        EVIDENCE_CHUNK_BYTES / 1024,
+        services
     )
 }
 

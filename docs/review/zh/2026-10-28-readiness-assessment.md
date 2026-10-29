@@ -268,6 +268,10 @@ ADR §7.4 只裁定了 `fs:system` 与 `selinux:permissive` 两条需要 owner �
 
 **还欠着的**（除命名一条外，都需要设备或上游）：
 
+一台设备都不在手的时段里，本表新增的行会显式写出「仅单元验证」，而不是把 harness 的旧结论
+当作本轮的结论：伪造的 fixture 只能证明解析器与自己自洽，证明不了它对上了任何一台设备；
+设备重新接上之后，这些行要按 harness 重跑一遍才算数。
+
 | 缺口 | 现状 | 需要什么 |
 |---|---|---|
 | `su` 拒绝措辞 | `parse_su_probe` 认 `denied` / `permission denied` / `not allowed` / `rejected` / `cancelled` 五种，全部是推断；`su_prompt_denied` 与 `su_helper_missing` 的分类表同理 | 一台装了 Magisk / KernelSU 的设备，实测弹窗拒绝与 helper 缺失各自的 stderr |
@@ -278,6 +282,7 @@ ADR §7.4 只裁定了 `fs:system` 与 `selinux:permissive` 两条需要 owner �
 | SELinux 拒绝明细经**命令输出**上线 | **已修复**（§7.1 的第三个出口，也是最大的一个）：`ExecRecord::to_contract()` 原样搬运 stdout/stderr。avc 审计记录是内核写进 audit log 的，所以它到达本进程的方式不是「后端出错」而是 §4.6 item 6 第一条取证命令的输出——BLA-AL00 实测一次 `logcat -d -b events -t 400` 带 181 条记录（175 denied + 6 granted）、181 处 `u:r:`、234 处 `u:object_r:`、23 处 `s0:c` 与第三方应用私有目录路径，全部过线。现在投影处重写审计记录：保留权限集 / 对象类 / 目标类型（平台 sepolicy 词表），丢掉 user / role / MLS 区间 / 路径；非记录行逐字节不动（`ps -Z` 保留）。**守门测试当时结构上不可能发现**：断言写在 `serde_json::to_string(&outcome)` 上，而 `ExecOutput.bytes` 是 `Vec<u8>`，序列化成数字数组，任何内容都能通过 | 无 |
 | 证据源能不能采集 | **已实现两半**：探测项 13 / 13b 逐源实测「在不在 / 能不能列 / 几条 / 能不能读」，`dumpsys -l` 数服务清单；采集动作由 [`host/evidence.rs`](../../../crates/acowork-android/src/host/evidence.rs) 落地（2026-11-01，harness 第 12 节真机）。原结论「无 root 时六个源没有一个能取到内容」**是说过头了**——它量的是文件源，说的却是六个源。分开之后：四个取得到（`screencap -p` 1 377 361 字节 PNG / 6 次读、`logcat -d -t 400` 46 346 字节、`dumpsys <service>` 逐服务、`bugreportz` 4 101 144 字节 zip / 1m44s 生成 + 16 次读），两个取不到（`/data/anr`、`/data/tombstones`：列目录能过、开文件被拒，设备原话 `Permission denied`）。产物以 base64 过桥（exec 通道 `from_utf8_lossy`，经它读二进制不等于读它），按 256 KiB 分片（读方向的上限是 1 MiB 输出上限，不是写方向的 printf 参数上限），并用**设备传输前自算的 sha256** 验收：丢片即 `DigestMismatch`，不留半个 PNG。§4.5 的工具描述按实测访问级逐源点名，`not probed` 也占位 | 有 root 的设备上重测那两个文件源（预期 `readable`）；`dumpsys` 的逐服务可达性仍要一台台问；关联分析（产物交给分析步骤）未做 |
 | `dumpsys` / `logcat` | 在同一设备上手工实测：shell uid 在 user 版上 `logcat -d` **读到的是全量缓冲区**（拿到了别的进程的日志行），`dumpsys -l` 能列服务。**「它们不属于探测集」这句已作废**——探测项 6c 已把两者收进集合，且实测证明必须收：二者都不是 toybox applet，批量列表看不见它们。仍未验证的是单个 service 的转储（`dumpsys package` 等）；若要作为工具开放，需按工具而非按档位来记 | 逐项 service 验证 |
+| `dumpsys` 单个服务不存在时 | **已修复（2026-11-01，仅单元验证）**：设备对不存在的服务是 **exit 0 + stdout 就是 `Can't find service: <name>`**——拒绝的内容就是全部输出。采集器原先只看退出码，于是这行会被分片取回、写成一个几百字节的"成功"artifact，调用方只有打开文件才知道被骗。现在转储前先 `head -c 128` 看一眼 artifact 自己的开头（这是唯一能抓住它的时刻，因为拒绝不是错误码而是输出本身），命中就返回新错误变体 `CaptureError::DeviceRefused`，一个字节都不搬、目录都不建。哨兵字符串不是新发明：`parse_dumpsys_inventory` 早就拒绝把这一行解析成服务清单，两处现在共用同一个形状。**只匹配实测过的那一条**——猜别的措辞会造出一个放过真拒绝的过滤器，而放过的代价是谎报成功。**同时刻意没上**的是 `dumpsys -t <secs> <service>`：给服务自己的工作量上限在原理上是对的（主机超时只停止我们等，不停止手机继续产出），但 `-t` 的参数顺序是 AOSP 知识而非本机实测，而 EMUI 的 dumpsys 是改过的——猜错的后果不是"没省下"，而是把今天能用的采集搞坏。尺寸风险改用可验证的方式兜住：超预算的转储在搬第一个字节之前就被拒。| 需要设备：把 `-t` 的参数顺序实测出来，并跑 harness 第 3b 节（`battery` 成功 / `powermem` 拒绝）确认这两条在硬件上成立 |
 | 第四档命名 | `system-shell` 描述的是"无 Termux 的普通 shell"，与 adb 无关（adb 只是这次到达它的方式） | 若上游摘要要按档位做调度，命名需与上游对齐 |
 
 **新增的一条**：`crates/acowork-android/tests/rules_conformance.rs` 是第二个端口的**模板**，不是普通测试文件。任何新平台接入时应复制它、保留 `r1_*`…`r13_*` 命名、替换 fixture；某条规则在该平台不适用时要显式说明而非删除。详见 ADR-AND-002 §3。

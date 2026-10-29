@@ -1370,6 +1370,38 @@ async fn report_evidence_capture(
         }
     }
 
+    // 3b. Service dumps, both directions. `dumpsys battery` names a service on the inventory;
+    // `dumpsys powermem` does not, and the device answers with exit 0 plus the words
+    // "Can't find service: powermem" — the refusal is the entire output. Before this port looked
+    // at the head of the artifact, that came back as a small "successful" capture. Both lines
+    // below are the device's own answers, not the fake's.
+    for service in ["battery", "powermem"] {
+        match capture_evidence(
+            &backend,
+            &EvidenceSource::Dumpsys {
+                service: service.to_string(),
+            },
+            session,
+            &dir,
+            Some(&token),
+            DEFAULT_EVIDENCE_BUDGET,
+        )
+        .await
+        {
+            Ok(artifact) => println!(
+                "  dumpsys {service} -> {} bytes in {} reads, digest {:?} verified",
+                artifact.bytes,
+                artifact.reads,
+                &artifact.digest[..12]
+            ),
+            Err(CaptureError::DeviceRefused { message, .. }) => println!(
+                "  dumpsys {service} -> refusal, not an artifact: the device said {:?}",
+                message
+            ),
+            Err(e) => println!("  dumpsys {service} -> {e}"),
+        }
+    }
+
     // 4. Staging hygiene: nothing of ours is left on the device.
     let observer: Arc<dyn ExecutionBackend> = Arc::new(ShellBackend::with_runner(
         profile.clone(),

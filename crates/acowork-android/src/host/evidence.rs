@@ -187,7 +187,18 @@ impl Source {
             }
             Source::Dumpsys { service } => {
                 let service = safe_name(service, "dumpsys service")?;
-                Ok(format!("dumpsys {service} > {}", quote_posix(stage)))
+                // Not `dumpsys -t <secs> <service>`: bounding the service's own work would be
+                // right (the host deadline stops us waiting, it does not stop the phone
+                // producing, and `dumpsys package` measures 4 977 211 bytes on BLA-AL00 — bigger
+                // than a bugreport), but `-t`'s argument order is AOSP knowledge rather than
+                // something measured here, and EMUI ships a modified dumpsys. A wrong guess does
+                // not merely fail to bound: it breaks a capture that works today. Needs a device
+                // to verify before it can be worth the risk.
+                Ok(format!(
+                    "dumpsys {} > {}",
+                    quote_posix(&service),
+                    quote_posix(stage)
+                ))
             }
             // Read in place: copying a file the caller cannot read would fail the same way,
             // with a worse error message.
@@ -265,6 +276,18 @@ pub enum CaptureError {
         /// The device's own words, e.g. `Permission denied`.
         reason: String,
     },
+    /// The command exited 0 and produced bytes, but those bytes *are* the refusal. `dumpsys` of a
+    /// service the device does not have is the case this shape was added for: it exits 0 and
+    /// prints `Can't find service: <name>` — the same line `facts::parse_dumpsys_inventory`
+    /// already refuses to parse as an inventory. Transferring it and handing back a small
+    /// "successful" artifact reports a refusal as a result, and the caller only learns by opening
+    /// the file.
+    DeviceRefused {
+        /// What was asked for.
+        command: String,
+        /// The device's own words, taken from the head of the artifact.
+        message: String,
+    },
     /// `bugreportz` exited 0 without the `OK:<path>` line its protocol promises.
     NoReportPath(
         /// The first 200 characters of what it printed instead.
@@ -320,6 +343,12 @@ impl fmt::Display for CaptureError {
                 f,
                 "the device will not open {path}: {reason} — listing it and reading it are \
                  different permissions on Android, and this is the difference"
+            ),
+            CaptureError::DeviceRefused { command, message } => write!(
+                f,
+                "`{command}` printed {message:?} and exited 0 — the device refused the request \
+                 inside its own output, so no artifact was transferred. `dumpsys -l` lists what \
+                 this device actually has; the count is already in the profile"
             ),
             CaptureError::NoReportPath(out) => write!(
                 f,
@@ -440,6 +469,44 @@ async fn run(
         .exec(request)
         .await
         .map_err(|e| CaptureError::Backend(e.to_string()))
+}
+
+/// The device's own marker for "there is no such service here".
+///
+/// This is the sentinel the probe layer already knows about: `parse_dumpsys_inventory` treats a
+/// dumpsys run whose whole output is this line as "the inventory was not answered", so the shape
+/// is not speculation about Android in general but about the device this port is verified
+/// against. Only it is matched. Guessing at sibling wordings would build a filter that silently
+/// passes the real one, and the cost of passing it is a reported success.
+fn dumpsys_refusal(head: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(head);
+    let line = text.lines().next()?.trim();
+    line.strip_prefix("Can't find service:")
+        .map(|rest| rest.trim().to_string())
+}
+
+/// Read the first `limit` bytes of a staged file.
+async fn read_head(
+    backend: &Arc<dyn ExecutionBackend>,
+    path: &str,
+    limit: u64,
+    session: &str,
+) -> Result<Vec<u8>, CaptureError> {
+    let record = run(
+        backend,
+        &format!("head -c {} < {}", limit, quote_posix(path)),
+        session,
+        None,
+        QUICK_TIMEOUT,
+    )
+    .await?;
+    if record.exit_code != Some(0) {
+        return Err(CaptureError::Unreadable {
+            path: path.to_string(),
+            reason: record.stderr.trim().to_string(),
+        });
+    }
+    Ok(record.stdout.into_bytes())
 }
 
 /// Size and digest, as the device sees them.
@@ -600,6 +667,17 @@ impl Job<'_> {
                 budget: self.budget,
             });
         }
+        // One small read before committing to the chunked transfer. This is the only place the
+        // "exit 0 but refused" shape can be caught, because the refusal *is* the output.
+        if matches!(self.source, Source::Dumpsys { .. }) {
+            let head = read_head(self.backend, &path, 128, self.session).await?;
+            if let Some(message) = dumpsys_refusal(&head) {
+                return Err(CaptureError::DeviceRefused {
+                    command: self.source.describe(),
+                    message,
+                });
+            }
+        }
         let got = read_chunks(self.backend, &path, bytes, self.session).await?;
 
         let mut hasher = Sha256::new();
@@ -717,6 +795,8 @@ mod tests {
 
     /// A device with a filesystem, a permission model, and one deliberate fault injection.
     struct Device {
+        /// Override for the staged artifact's content.
+        staged: Option<String>,
         profile: HostProfile,
         files: std::sync::Mutex<BTreeMap<String, Vec<u8>>>,
         unreadable: Vec<String>,
@@ -732,12 +812,20 @@ mod tests {
                 files: std::sync::Mutex::new(BTreeMap::new()),
                 unreadable: Vec::new(),
                 corrupt_chunk: None,
+                staged: None,
                 seen: std::sync::Mutex::new(Vec::new()),
             }
         }
 
         fn with_unreadable(mut self, path: &str) -> Self {
             self.unreadable.push(path.to_string());
+            self
+        }
+
+        /// Stage exactly these bytes instead of the fake's deterministic artifact, for the case
+        /// where what matters is *what* the device wrote rather than how much.
+        fn staging(mut self, body: &str) -> Self {
+            self.staged = Some(body.to_string());
             self
         }
 
@@ -805,9 +893,29 @@ mod tests {
 
             if let Some(target) = redirect_target(&script) {
                 // Whatever is being staged, the fake device produces deterministic bytes for it.
-                let body = format!("artifact for {target}");
+                let body = self
+                    .staged
+                    .clone()
+                    .unwrap_or_else(|| format!("artifact for {target}"));
                 self.put(&target, body.as_bytes());
                 return Ok(record(String::new(), 0, String::new()));
+            }
+            if let Some(rest) = script.strip_prefix("head -c ") {
+                // `head -c N < 'path'` — the pre-transfer look at the artifact's own words.
+                let (limit, rest) = rest.split_once(" < ").unwrap();
+                let path = rest.trim().trim_matches('\'');
+                return match self.read(path) {
+                    Some(bytes) => {
+                        let n: usize = limit.trim().parse().unwrap();
+                        let head = &bytes[..bytes.len().min(n)];
+                        Ok(record(
+                            String::from_utf8_lossy(head).to_string(),
+                            0,
+                            String::new(),
+                        ))
+                    }
+                    None => Ok(record(String::new(), 1, "No such file or directory".into())),
+                };
             }
             if let Some(rest) = script.strip_prefix("wc -c < ") {
                 let path = rest.trim().trim_matches('\'');
@@ -895,6 +1003,99 @@ mod tests {
     ) -> Result<Artifact, CaptureError> {
         let inner = Arc::clone(device) as Arc<dyn ExecutionBackend>;
         capture(&inner, source, session, dir, None, budget).await
+    }
+
+    #[tokio::test]
+    async fn a_dumpsys_capture_asks_for_the_service_by_name() {
+        let device = device();
+        let dir = dir("dumpsys-bound");
+        let artifact = capture_on(
+            &device,
+            &Source::Dumpsys {
+                service: "package".to_string(),
+            },
+            "s-1",
+            &dir,
+            DEFAULT_EVIDENCE_BUDGET,
+        )
+        .await
+        .unwrap();
+
+        let scripts = device.scripts();
+        let dump = scripts
+            .iter()
+            .find(|s| s.starts_with("dumpsys "))
+            .expect("the service was dumped");
+        // Only a form measured on a device is emitted. `-t` would bound the service's own work
+        // (a host deadline stops us waiting, not the phone producing) but its argument order is
+        // AOSP knowledge, not a measurement, and EMUI's dumpsys is modified — a wrong guess
+        // breaks a capture that works today. See `resolve`.
+        assert!(
+            !dump.contains("-t "),
+            "an unverified flag must not reach a shipped command form: {dump}"
+        );
+        assert!(
+            dump.contains("'package'"),
+            "the service name is quoted: {dump}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(artifact.source, "dumpsys package");
+    }
+
+    #[tokio::test]
+    async fn a_service_this_device_does_not_have_is_a_refusal_not_an_artifact() {
+        // The refusal arrives as the entire output, with exit 0: the same line
+        // `parse_dumpsys_inventory` already refuses to read as an inventory.
+        let device = Arc::new(Device::new().staging("Can't find service: powermem\n"));
+        let dir = dir("dumpsys-absent");
+        let error = capture_on(
+            &device,
+            &Source::Dumpsys {
+                service: "powermem".to_string(),
+            },
+            "s-1",
+            &dir,
+            DEFAULT_EVIDENCE_BUDGET,
+        )
+        .await
+        .expect_err("the device refused");
+
+        match error {
+            CaptureError::DeviceRefused { command, message } => {
+                assert_eq!(command, "dumpsys powermem");
+                assert_eq!(message, "powermem");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+
+        // Nothing was transferred and nothing was written: the caller never receives a file to
+        // open and mistake for a report.
+        assert!(
+            !device.scripts().iter().any(|s| s.starts_with("dd if=")),
+            "a refused dump must not be chunk-read"
+        );
+        assert!(
+            !dir.exists(),
+            "a refusal must not create the artifact directory at all: {}",
+            dir.display()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn only_the_measured_sentinel_is_read_as_a_refusal() {
+        // Guessing at other refusal wordings would build a filter that silently passes the one
+        // this device actually prints.
+        assert_eq!(
+            dumpsys_refusal(b"Can't find service: powermem\n").as_deref(),
+            Some("powermem")
+        );
+        assert_eq!(dumpsys_refusal(b"Can't find service:").as_deref(), Some(""));
+        assert!(dumpsys_refusal(b"Service powermem:").is_none());
+        assert!(dumpsys_refusal(b"\n").is_none());
+        assert!(dumpsys_refusal(b"").is_none());
+        // A real dump starts with the service's own output.
+        assert!(dumpsys_refusal(b"CURRENT TIME:\nDUMP OF SERVICE activity:\n").is_none());
     }
 
     #[tokio::test]
