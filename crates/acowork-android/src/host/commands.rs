@@ -271,6 +271,12 @@ pub enum RefusalKind {
     Mismatch,
     /// The content could not be analysed, so it was not allowed.
     Opaque,
+    /// The capability was never declared on this device (§4.2), so nothing labelled with it
+    /// can run here whatever it contains. Not a content verdict — the label may match the
+    /// script exactly. It is the device that cannot hold the label, which is why it is counted
+    /// separately: a log full of `mismatch` says the model is guessing tiers, a log full of
+    /// `undeclared` says something is driving a backend past the gate.
+    Undeclared,
 }
 
 impl Refusal {

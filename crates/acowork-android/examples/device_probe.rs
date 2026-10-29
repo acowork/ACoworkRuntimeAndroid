@@ -25,7 +25,8 @@ use acowork_android::host::probe::{CommandOutput, ProbeOutput, run_probe};
 use acowork_android::host::spawn::{SpawnInvocation, SpawnRunner};
 use acowork_android::host::{
     AdbTransport, AuditedBackend, BackendError, ExecRequest, ExecutionBackend, FileAuditSink,
-    HostProfile, ProbeCommand, ShellBackend, check_script, shell_tools,
+    HostProfile, MemoryAuditSink, ProbeCommand, ReversibleBackend, ShellBackend, check_script,
+    shell_tools,
 };
 use acowork_platform_contract::HostDescription;
 
@@ -134,6 +135,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
         report_projection(&profile, &transport).await;
         println!("\n── 9. §4.6.4 rollback planner ─────────────────────");
         report_rollback(&profile, &transport).await;
+        println!("\n── 10. §4.6.4 write → restore round trip ──────────");
+        report_rollback_roundtrip(&profile, &transport).await?;
     }
 
     Ok(())
@@ -652,4 +655,277 @@ async fn report_audit(
     }
     println!("  sink failures: {}", sink.failures());
     Ok(())
+}
+use acowork_platform_contract::{Gate, GateDecision, LocalReadiness, LockState};
+
+/// §4.6.4 run against the phone instead of against a fake.
+///
+/// The unit tests prove the ledger's bookkeeping. They cannot prove that the inverse script
+/// this port generates actually puts *this device* back: `setprop 'k' ''` is an approximation
+/// the module admits to (`faithful: false`), and whether Android's property implementation
+/// treats that as "unset" is a fact about the device, not about our parsing. Only a round trip
+/// on hardware says which one it is.
+///
+/// The key is `debug.acowork.probe` — a `debug.*` property nothing on the device reads. That
+/// choice is the only thing standing between a demonstration and an incident, because this
+/// section really does write to a live phone.
+async fn report_rollback_roundtrip(
+    profile: &HostProfile,
+    transport: &AdbTransport,
+) -> Result<(), Box<dyn Error>> {
+    use std::sync::Arc;
+
+    use acowork_android::host::ApprovalToken;
+
+    let shell: Arc<dyn ExecutionBackend> = Arc::new(ShellBackend::with_runner(
+        profile.clone(),
+        transport.clone(),
+    )?);
+    let sink = Arc::new(MemoryAuditSink::new());
+    // Order matters and is the point: the rollback decorator sits *outside* the audit
+    // decorator, so its capture reads and its inverse writes are records like any other.
+    // Compose it the other way round and the teardown becomes the one part of a write
+    // session that leaves no trace.
+    let audited: Arc<dyn ExecutionBackend> =
+        Arc::new(AuditedBackend::new(shell.clone(), sink.clone()));
+    let chain = ReversibleBackend::new(Arc::clone(&audited));
+
+    // Observers read through the audit decorator but not through the rollback decorator: an
+    // observation must not add ledger entries, and nothing that touches the device should
+    // escape the trail — including the harness's own probes. A demo that reads the phone
+    // outside the log it prints would be teaching the wrong lesson about §4.6.1.
+    async fn read_prop(shell: &Arc<dyn ExecutionBackend>, name: &str) -> String {
+        match shell
+            .exec(ExecRequest::read(
+                format!("getprop {name}"),
+                "harness-observer",
+            ))
+            .await
+        {
+            Ok(r) => r.stdout.trim().to_string(),
+            Err(e) => format!("<unreadable: {e}>"),
+        }
+    }
+
+    async fn read_file(shell: &Arc<dyn ExecutionBackend>, path: &str) -> String {
+        match shell
+            .exec(ExecRequest::read(format!("cat {path}"), "harness-observer"))
+            .await
+        {
+            Ok(r) if r.succeeded() => r.stdout.trim().to_string(),
+            Ok(r) => format!("<exit {:?}>", r.exit_code),
+            Err(e) => format!("<{e}>"),
+        }
+    }
+
+    let gate = Gate::new(profile);
+    let ready = LocalReadiness {
+        dangerous_session: false,
+        approval_presented: true,
+        lock: LockState::Available,
+    };
+
+    // ── the floor, on the real profile ────────────────────────────────────────
+    let prop = "debug.acowork.probe";
+    let session = "harness-roundtrip";
+    let mut probe_request = ExecRequest::new(
+        Capability::ShellWrite,
+        format!("setprop {prop} harness-1"),
+        session,
+    );
+    probe_request.approval_token = Some(ApprovalToken::new("harness"));
+    match gate.decide(&probe_request, None, ready) {
+        GateDecision::Allow { hold_lock, .. } => {
+            println!("  gate allows `android:shell:write` here (hold_lock: {hold_lock})");
+        }
+        other => println!(
+            "  gate refuses `android:shell:write` on this tier: {:?}",
+            other.refusal()
+        ),
+    }
+    // The same request, one layer down, with the gate deliberately not consulted. This is the
+    // hole the backend check was added for: the harness below found it by *working* — a caller
+    // that skipped `decide` used to get a real write out of a device whose profile never
+    // demonstrated the tier.
+    match chain.exec(probe_request).await {
+        Err(BackendError::Refused { reason, kind }) => {
+            println!("  backend refuses it too ({kind:?}) without spawning anything:\n    {reason}")
+        }
+        Ok(r) => println!(
+            "  backend RAN it (exit {:?}) — the declaration floor is not holding",
+            r.exit_code
+        ),
+        Err(e) => println!("  backend: {e}"),
+    }
+
+    // ── the round trip, on a hand-declared profile ────────────────────────────
+    // What this section exists to prove is whether the inverse script puts *this phone* back,
+    // and the floor above would refuse the write before it could be tested. Declaring the tier
+    // here is a fixture, not a claim about the device — and the phone settles that question on
+    // its own terms anyway: uid 2000 under enforcing really can write `debug.*` properties, so
+    // the refusal above is policy, not physics. Per-property SELinux types are not something
+    // this port probes, and a write tier granted on "some props happen to be writable" would be
+    // a tier granted on luck.
+    let mut grant_profile = profile.clone();
+    grant_profile
+        .caps
+        .declare(Capability::ShellWrite.id())
+        .map_err(|e| format!("cannot hand-declare the write tier: {e}"))?;
+    let grant_shell: Arc<dyn ExecutionBackend> =
+        Arc::new(ShellBackend::with_runner(grant_profile, transport.clone())?);
+    let grant_audited: Arc<dyn ExecutionBackend> =
+        Arc::new(AuditedBackend::new(grant_shell, sink.clone()));
+    let roundtrip = ReversibleBackend::new(grant_audited);
+
+    let before = read_prop(&audited, prop).await;
+    println!("  {prop} before  = {before:?}");
+
+    for value in ["harness-1", "harness-2"] {
+        let script = format!("setprop {prop} {value}");
+        let mut request = ExecRequest::new(Capability::ShellWrite, script.clone(), session);
+        request.approval_token = Some(ApprovalToken::new("harness"));
+        match roundtrip.exec(request).await {
+            Ok(r) if r.succeeded() => {
+                let now = read_prop(&audited, prop).await;
+                println!("  wrote {value:?} -> device now holds {now:?}");
+            }
+            Ok(r) => println!(
+                "  {script} -> exit {:?} {}",
+                r.exit_code,
+                r.stderr.trim().chars().take(70).collect::<String>()
+            ),
+            Err(e) => println!("  {script} -> {e}"),
+        }
+    }
+
+    let pending = pending_for(&roundtrip, session);
+    println!("  ledger holds {pending} undo(es) for this session");
+    let report = roundtrip.restore(session).await;
+    let after = read_prop(&audited, prop).await;
+    println!(
+        "  restore: {} run, {} failed -> device now holds {after:?}",
+        report.restored.len(),
+        report.failed.len()
+    );
+    for line in &report.restored {
+        println!("    restored {line}");
+    }
+    for (target, why) in &report.failed {
+        println!("    FAILED to restore {target}: {why}");
+    }
+    println!(
+        "  {}",
+        if after == before {
+            format!("MATCH: back to the value it was found with ({before:?})")
+        } else {
+            format!(
+                "MISMATCH: found {before:?}, left {after:?} — the undo does not restore this                  device, and the claim in §4.6.4 is false here"
+            )
+        }
+    );
+    println!(
+        "  (a FIFO teardown would have left `harness-1`: the second capture recorded the value \
+         the first write made, not the value the session found)"
+    );
+
+    // A write the device itself refuses. `persist.sys.*` is not writable by uid 2000 under
+    // this enforcing policy, so the command exits 1 having changed nothing — and §4.6.4's
+    // second step is precisely that the teardown must not invent a write for it. The session's
+    // ledger was drained by the restore above, so anything in it now is a phantom undo.
+    let doomed = "setprop persist.sys.acowork.probe 1".to_string();
+    let mut request = ExecRequest::new(Capability::ShellWrite, doomed.clone(), session);
+    request.approval_token = Some(ApprovalToken::new("harness"));
+    let outcome = match roundtrip.exec(request).await {
+        Ok(r) => format!(
+            "exit {:?} {}",
+            r.exit_code,
+            r.stderr.trim().chars().take(58).collect::<String>()
+        ),
+        Err(e) => e.to_string(),
+    };
+    println!(
+        "  refused write `{doomed}` -> {outcome}; undos this session holds afterwards: {}",
+        pending_for(&roundtrip, session)
+    );
+
+    // ── a write this tier *does* allow, and cannot undo ───────────────────────
+    let path = "/data/local/tmp/acowork-probe.txt";
+    let write = format!("echo harness > {path}");
+    let mut request = ExecRequest::new(Capability::FsOutsideApp, write.clone(), session);
+    request.approval_token = Some(ApprovalToken::new("harness"));
+    match gate.decide(&request, None, ready) {
+        GateDecision::Allow { .. } => match chain.exec(request).await {
+            Ok(r) if r.succeeded() => println!(
+                "\n  gate allows `{write}` (android:fs:outside-app) -> ran, file holds {:?}",
+                read_file(&audited, path).await
+            ),
+            Ok(r) => println!("  `{write}` -> exit {:?}", r.exit_code),
+            Err(e) => println!("  `{write}` -> {e}"),
+        },
+        other => println!("  gate refuses `{write}`: {:?}", other.refusal()),
+    }
+    println!(
+        "  undos the planner offered for it: {}  unundoable it named: {}",
+        pending_for(&chain, session),
+        chain
+            .ledger()
+            .lock()
+            .map(|l| l.leaving_behind(session).len())
+            .unwrap_or(0)
+    );
+    for item in chain
+        .ledger()
+        .lock()
+        .map(|l| l.leaving_behind(session).to_vec())
+        .unwrap_or_default()
+    {
+        println!("    {} — {}", item.command, item.why);
+    }
+    // The file half of §4.6.4 is not implemented, so nothing in this port can put the device
+    // back. The harness cleans up with a write of its own, through the same chain, and lets it
+    // land in the trail: a demo that quietly left no trace would hide the gap it exists to
+    // show — and an unaccounted `rm` is exactly what §4.6.1 refuses to run.
+    let _ = chain
+        .exec(ExecRequest::new(
+            Capability::FsOutsideApp,
+            format!("rm {path}"),
+            session,
+        ))
+        .await;
+    println!(
+        "  after cleanup the file reads {:?} — removed by the harness, not by the port",
+        read_file(&audited, path).await
+    );
+
+    println!("\n  what the audit trail saw ({} records):", sink.len());
+    for event in sink.events() {
+        let outcome = match event.outcome {
+            acowork_android::host::AuditOutcome::Attempted => "attempted".to_string(),
+            acowork_android::host::AuditOutcome::Completed { exit_code, .. } => {
+                format!("completed exit {exit_code:?}")
+            }
+            acowork_android::host::AuditOutcome::Refused { .. } => "refused".to_string(),
+            other => format!("{other:?}")
+                .split('(')
+                .next()
+                .unwrap_or("?")
+                .to_string(),
+        };
+        println!(
+            "    {:<22} {:<26} {}",
+            event.capability,
+            event.command.chars().take(26).collect::<String>(),
+            outcome,
+        );
+    }
+    Ok(())
+}
+
+/// How many undos a session has pending, without holding the lock across an await.
+fn pending_for(chain: &ReversibleBackend, session: &str) -> usize {
+    chain
+        .ledger()
+        .lock()
+        .map(|ledger| ledger.pending_for(session).len())
+        .unwrap_or(0)
 }

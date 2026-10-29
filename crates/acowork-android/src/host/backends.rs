@@ -197,6 +197,43 @@ fn to_record(raw: RawOutput, nonce: &str) -> ExecRecord {
     }
 }
 
+/// Refuse a capability this device never demonstrated, before anything is spawned.
+///
+/// The gate refuses it too, as `NotDeclared`, and this repeats the check one layer down on
+/// purpose. [`Gate::decide`](acowork_platform_contract::Gate::decide) is a pure function a
+/// caller chooses to call, and a control nobody is compelled to walk through is advice. The
+/// device harness found the difference by driving `ShellBackend` directly on a BLA-AL00 whose
+/// profile declares only `android:shell:read` and `android:fs:outside-app`: the phone ran the
+/// `setprop` as though that tier had been granted, because the content check below compares a
+/// script with the label it carries and never asks whether this device can hold that label.
+///
+/// The floor is not the ceiling. Approval, the write lock and attribution stay with the gate —
+/// a request that reaches here has usually passed them, and this refuses only what the probe
+/// never demonstrated. It is deliberately not a second copy of the tier rules either: the
+/// probe output is the single source, so a device that gains root declares more on the next
+/// boot because the probe said so, not because this function was updated.
+fn check_declared(profile: &HostProfile, request: &ExecRequest) -> Result<(), BackendError> {
+    if profile.caps.is_declared(&request.capability) {
+        return Ok(());
+    }
+    let declared = profile.caps.declared_ids();
+    Err(BackendError::Refused {
+        reason: format!(
+            "`{}` was never demonstrated on this device, which declares {} — the backend does \
+             not run a command the profile cannot account for. The gate refuses the same \
+             request as `NotDeclared` and names the missing condition; where that condition is \
+             a superuser grant, the next step is a device that has one, not a retry.",
+            request.capability.as_str(),
+            if declared.is_empty() {
+                "nothing".to_string()
+            } else {
+                declared.join(", ")
+            }
+        ),
+        kind: commands::RefusalKind::Undeclared,
+    })
+}
+
 /// Assemble, run, and record — the part every shell backend does identically.
 ///
 /// `helper` names the privileged program when the invocation goes through one (`Some("su")`),
@@ -206,6 +243,7 @@ fn to_record(raw: RawOutput, nonce: &str) -> ExecRecord {
 /// superuser app and the second by fixing the profile.
 async fn run_script<R: SpawnRunner>(
     runner: &R,
+    profile: &HostProfile,
     request: &ExecRequest,
     file: PathBuf,
     args: &[&str],
@@ -221,6 +259,12 @@ async fn run_script<R: SpawnRunner>(
             kind: refusal.kind(),
         });
     }
+
+    // Then the device. Order matters for the log rather than for safety: a hard-banned script
+    // stays classified as banned even on a tier that would never have run it, because
+    // "someone reached for a partition-destroying command" and "someone reached for a write
+    // tier this phone does not have" are different things to be counting.
+    check_declared(profile, request)?;
 
     let prepared = script::prepare(&request.script, request.cwd.as_deref(), &request.env)
         .map_err(|e| BackendError::Backend(e.to_string()))?;
@@ -364,6 +408,7 @@ impl<R: SpawnRunner> ExecutionBackend for ShellBackend<R> {
         // script whose first line begins with `-` would be parsed as an option.
         run_script(
             &self.runner,
+            &self.profile,
             &request,
             self.shell.path.clone(),
             &["-s"],
@@ -522,6 +567,7 @@ impl<R: SpawnRunner> ExecutionBackend for RootShellBackend<R> {
 
         let record = run_script(
             &self.runner,
+            &self.profile,
             &request,
             self.su.clone(),
             &args,
@@ -1326,6 +1372,96 @@ mod tests {
         assert!(matches!(err, BackendError::Refused { .. }), "{err:?}");
         assert!(err.to_string().contains("human"), "{err}");
         assert!(backend.runner.invocations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_capability_the_device_never_declared_is_refused_by_the_backend() {
+        // The gate refuses this as `NotDeclared` — but `decide` is a pure function a caller
+        // chooses to call, and a control nobody is compelled to walk through is advice. The
+        // device harness found the hole while proving §4.6.4: it drove `ShellBackend` directly
+        // on a BLA-AL00 whose profile declares only `android:shell:read` and
+        // `android:fs:outside-app`, and the phone ran the `setprop`. The content check could
+        // not have caught it: that check compares a script with the label it carries, and this
+        // label was carried honestly. What is missing is not the right words in the request,
+        // it is a device that demonstrated it.
+        let profile = shell_only_profile();
+        assert!(
+            !profile.caps.is_declared(&Capability::ShellWrite.id()),
+            "the fixture must be a host that never demonstrated the write tier"
+        );
+        let runner = FakeShell::shell_uid().into_runner();
+        let backend = ShellBackend::with_runner(profile, runner).unwrap();
+
+        let mut request = ExecRequest::new(
+            Capability::ShellWrite,
+            "setprop debug.acowork.on 1",
+            "session-1",
+        );
+        // Approved by a caller that then skipped the gate. An approval is not evidence the
+        // device can do the thing: it is evidence a human agreed to try.
+        request.approval_token = Some(crate::host::ApprovalToken::new("gate was never consulted"));
+        let err = backend.exec(request).await.unwrap_err();
+
+        assert!(
+            matches!(&err, BackendError::Refused { kind, .. }
+                if *kind == commands::RefusalKind::Undeclared),
+            "{err:?}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("android:shell:write"), "{text}");
+        assert!(
+            text.contains("android:shell:read"),
+            "the refusal has to say what this device *does* allow, or the caller retries                 harder instead of elsewhere: {text}"
+        );
+        assert!(
+            backend.runner.invocations().is_empty(),
+            "a tier the device never demonstrated must not touch the device"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_banned_script_stays_banned_on_a_tier_that_could_not_have_run_it() {
+        // Which of the two checks fires first is a logging decision, not a safety one — both
+        // refuse. But if the declaration check ran first, every hard-banned attempt on a
+        // low-tier device would be counted as `undeclared`, and the one number anyone actually
+        // wants to watch ("how often is something reaching for a partition-destroying
+        // command?") would go quiet exactly when the fleet gets less capable.
+        let runner = FakeShell::shell_uid().into_runner();
+        let backend = ShellBackend::with_runner(shell_only_profile(), runner).unwrap();
+
+        let err = backend
+            .exec(ExecRequest::new(
+                Capability::ShellWrite,
+                "toybox rm -rf /data",
+                "session-1",
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, BackendError::Refused { kind, .. }
+                if *kind == commands::RefusalKind::Banned),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_declaration_check_refuses_a_capability_that_is_not_even_in_the_vocabulary() {
+        // A request labelled with something Android never defined. `is_declared` answers
+        // false, which is the right refusal — the alternative is a backend that runs whatever
+        // carries an unrecognised string.
+        let runner = FakeShell::shell_uid().into_runner();
+        let backend = ShellBackend::with_runner(shell_only_profile(), runner).unwrap();
+        let mut request = ExecRequest::read("getprop ro.build.type", "session-1");
+        request.capability =
+            acowork_platform_contract::HostCapability::new("symbian", "shell:read")
+                .expect("well-formed id");
+
+        let err = backend.exec(request).await.unwrap_err();
+        assert!(
+            matches!(&err, BackendError::Refused { kind, .. }
+                if *kind == commands::RefusalKind::Undeclared),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
