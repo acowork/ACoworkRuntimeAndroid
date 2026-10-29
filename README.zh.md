@@ -18,7 +18,7 @@
 ---
 
 > **状态：早期开发。** 设计文档齐备，P0 切片（HostProfile 探测、脚本装配、进程生成、
-> `ExecutionBackend` 实现、§4.4 只读档护栏、§4.5 动态工具描述、§4.6.1 审计日志出口、§4.6 item 6 证据面实测）已交付为可构建、可测试的 Rust 库，447 个测试通过，
+> `ExecutionBackend` 实现、§4.4 只读档护栏、§4.5 动态工具描述、§4.6.1 审计日志出口、§4.6 item 6 证据面实测、§4.6.4 写操作可撤销）已交付为可构建、可测试的 Rust 库，468 个测试通过，
 > 且整条链路已在真机上跑通过（华为 BLA-AL00，经 adb：20 条只读探测 → `HostProfile` → 真实命令，
 > ~120ms / exit 0，其中 `logcat` 之所以能跑，是因为探测项 6c 去抽查了它）。
 > **仍无 node 二进制产物**——目前唯一可运行的东西就是那个真机 harness——不适合用于生产环境。
@@ -201,7 +201,7 @@ graph TD
 | 5c | §7.1 上报边界的**三个出口**：能力摘要 / 后端错误文案 / 命令自己的 stdout·stderr | ✅ **已交付** —— 第三个出口是量出来的而不是想出来的：`logcat -d` 的 181 条 avc 审计记录原本原样过线，而守门测试对 `Vec<u8>` 的 JSON 序列化做子串断言，**任何内容都能通过**。现在审计记录在投影处重写成「权限集 + 对象类 + 目标类型」，user / role / MLS 区间与路径留在设备上；`ps -Z` 这类非记录行逐字节不动 |
 | 8 | `root-shell` 宿主档，**仅只读能力**（`logcat` / `dumpsys` / `getprop`） | 🚧 **大部分交付** —— 只读档现在按**脚本内容**放行而非按调用方标签（[`host/commands.rs`](crates/acowork-android/src/host/commands.rs)），且覆盖的命令是被探测出来的而非假定的（探测项 6c）；已在 BLA-AL00 上端到端验证。剩余：`RootShellBackend` 在一台真有 `su` 的设备上跑一次——它至今没碰过真实的 su |
 | 9 | Android 调试工具集（截屏、ANR / tombstone / bugreport 采集）+ 命令审计日志 | 🚧 **交付一半** —— 审计日志已交付（[`host/audit.rs`](crates/acowork-android/src/host/audit.rs)）：`AuditedBackend` 在碰设备**之前**落一条 `attempted`、出结果后落收尾记录；开口记录写不进去就**不执行命令**。证据面本身已实测（探测项 13 / 13b）：无 root 时 ADR §4.6 item 6 那六个源**没有一个能取到内容**，`/data/anr` 只给得出文件名，`dumpsys` 那边是 246 个服务各自一项。采集动作（截屏落地、bugreportz 编排）仍在计划中（依赖 #8） |
-| 10 | 写能力档：审批门控、设备级写锁、prop / 文件自动回滚 | ⛔ **阻塞（B1）** —— ADR §7.4 的 owner 合取项与上游 ADR-087 D1/D5 冲突；门控骨架已按「两权威分解」实现，待上游确认 |
+| 10 | 写能力档：审批门控、设备级写锁、prop / 文件自动回滚 | ⛔ **阻塞（B1）** —— ADR §7.4 的 owner 合取项与上游 ADR-087 D1/D5 冲突；门控骨架已按「两权威分解」实现，待上游确认。**回滚已不在阻塞项里**：§4.6.4 已落地为 [`host/rollback.rs`](crates/acowork-android/src/host/rollback.rs)（捕获前态 → 逆操作 → LIFO 恢复），写档剩下的阻塞是审批归属与设备级写锁，不是「没有撤销路径」 |
 | 11 | Magisk 模块形态，用于长期挂机的调试设备农场 —— **仅当该需求真实成立** | ⬜ 暂缓 |
 
 顺序是刻意安排的：**先只读，后可写**。只读的 root 档已经能覆盖绝大多数系统调试诉求（日志、状态、属性），
@@ -219,7 +219,7 @@ graph TD
 
 ```bash
 cargo build                                        # 构建
-cargo test                                         # 447 个测试（Android 单元 266 + 契约层 83 + 契约集成 27 + 规则一致性 43 + 真进程 13 + 真机地面实况 15）
+cargo test                                         # 468 个测试（Android 单元 287 + 契约层 83 + 契约集成 27 + 规则一致性 43 + 真进程 13 + 真机地面实况 15）
 cargo clippy --all-targets -- -D warnings          # 上游 CI 约定，须零告警
 cargo fmt --check
 ```
