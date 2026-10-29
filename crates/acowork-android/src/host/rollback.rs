@@ -53,6 +53,8 @@
 //! implemented; the planner says so in the text it hands back.
 
 use std::collections::BTreeMap;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::host::backend::{
@@ -63,6 +65,108 @@ use crate::host::commands::{self, Finding};
 use crate::host::facts::ShellDialect;
 use crate::host::profile::HostProfile;
 use crate::host::script::quote_posix;
+
+/// How much file content a snapshot may hold.
+///
+/// A budget, not a limit: a bigger file is still written, it is simply declared unundoable
+/// before the write rather than discovered after it. The number comes from the transport, not
+/// from taste — the capture reads the file as base64 through the exec channel, whose stdout is
+/// capped at [`crate::host::backend::DEFAULT_OUTPUT_CAP`] (1 MiB), and base64 costs 4 bytes per
+/// 3. Leaving room for the envelope and for a device whose `base64` wraps lines differently
+/// lands at a quarter of that. Raising it means raising the output cap, not this constant.
+pub const SNAPSHOT_BUDGET_BYTES: u64 = 64 * 1024;
+
+/// Base64 characters handed to one command when a snapshot is put back.
+///
+/// Measured on a Huawei BLA-AL00 (EMUI, `/system/bin/sh` + toybox): a single argument
+/// of 100 KiB reaches `printf` fine, 128 KiB fails with `Argument list too long` — Android's
+/// `printf` is a real binary, so the payload goes through `execve` and shares the ~128 KiB
+/// budget with the environment. A third of the observed ceiling is the working figure because
+/// the ceiling is not the interface: it moves with the environment block, and a restore that
+/// fails halfway through leaves a file that is neither the old one nor the new one.
+pub const SNAPSHOT_CHUNK_BYTES: usize = 48 * 1024;
+
+/// Where a staged snapshot is reassembled on the device before it is decoded.
+///
+/// `/data/local/tmp` is the one directory measured writable by the shell on every tier this
+/// port runs at; the target path itself is often not writable until the write we are undoing
+/// happens to be privileged.
+pub const SNAPSHOT_STAGING_DIR: &str = "/data/local/tmp";
+
+/// The host-side half of a file undo: where the old content is kept.
+///
+/// §4.6.4 says the backup goes to the Agent workspace, which is a directory the node owns and
+/// the device does not. Keeping the bytes *out* of the ledger is what makes a session with
+/// twelve file edits produce twelve short audit lines instead of twelve copies of the device's
+/// data in the log.
+#[derive(Debug, Clone)]
+pub struct SnapshotStore {
+    dir: PathBuf,
+}
+
+impl SnapshotStore {
+    /// Store snapshots under `dir`, created on first use.
+    pub fn new(dir: impl Into<PathBuf>) -> SnapshotStore {
+        SnapshotStore { dir: dir.into() }
+    }
+
+    /// Where they live.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Write one snapshot, returning its path.
+    ///
+    /// The session id is a caller-supplied string and it becomes a file name, so it is reduced
+    /// to alphanumerics, `-` and `_`. That set has no `.` in it, which is the whole point: a
+    /// name built from it can never be `.` or `..`, and a session called `../../escape` cannot
+    /// move the backup outside the workspace. A backup outside the workspace is device content
+    /// nobody agreed to keep.
+    /// `token` makes the name unique within the session — the script layer's nonce does the
+    /// job, and reusing it keeps snapshot names in step with the capture that produced them.
+    pub fn save(
+        &self,
+        session: &str,
+        token: &str,
+        base64_payload: &str,
+    ) -> std::io::Result<PathBuf> {
+        std::fs::create_dir_all(&self.dir)?;
+        let path = self.dir.join(format!(
+            "{}-{}.b64",
+            sanitize(session, 40, '_'),
+            sanitize(token, 24, '_')
+        ));
+        let mut file = std::fs::File::create(&path)?;
+        file.write_all(base64_payload.as_bytes())?;
+        file.flush()?;
+        Ok(path)
+    }
+
+    /// Drop a snapshot. Best effort: a failure here leaves a stale backup in the workspace,
+    /// which is untidy, not unsafe — and the alternative (reporting it as a rollback failure)
+    /// would say the device was not restored when it was.
+    pub fn discard(&self, path: &Path) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn sanitize(input: &str, max: usize, pad: char) -> String {
+    let mut out: String = input
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                pad
+            }
+        })
+        .take(max)
+        .collect();
+    if out.is_empty() {
+        out.push_str("session");
+    }
+    out
+}
 
 /// The piece of device state an [`Undo`] puts back.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +183,14 @@ pub enum UndoTarget {
     /// The SELinux enforcing mode —整机-wide state, which is why ADR-AND-001 §8 gates it on
     /// `android:selinux:permissive` rather than treating it as one more property.
     SelinuxMode,
+    /// A file on the device, addressed by the absolute path the script named.
+    ///
+    /// Only absolute paths get here. A relative target resolves against the working directory
+    /// of the *write*, which is the caller's business and not something a capture issued
+    /// separately can reproduce — snapshotting `./hosts` could back up a different file than
+    /// the one the script overwrote, and a rollback that restores the wrong file is worse than
+    /// no rollback at all.
+    File(String),
 }
 
 impl UndoTarget {
@@ -89,6 +201,7 @@ impl UndoTarget {
             UndoTarget::Prop(key) => format!("prop {key}"),
             UndoTarget::Setting { table, key } => format!("settings {table}/{key}"),
             UndoTarget::SelinuxMode => "SELinux enforcing mode".to_string(),
+            UndoTarget::File(path) => format!("file {path}"),
         }
     }
 }
@@ -101,6 +214,36 @@ pub enum Writing {
     /// `settings delete` — whose inverse is putting back whatever was there, which is why the
     /// pre-state has to be read for it too.
     Delete,
+    /// Something will be written here, and what it is cannot be known before the command runs.
+    ///
+    /// A redirect is this case: `sha256sum /data > /tmp/sums` writes output the planner has no
+    /// business predicting. It does not need to — the inverse is the snapshot, not the value.
+    Unknown,
+}
+
+/// What a rollback actually does to put one target back.
+///
+/// Two shapes because the two directions of a file are not the same operation: a property is
+/// put back with one short command, while a file is put back by moving bytes that live in the
+/// Agent workspace onto the device. Collapsing both into "a script" would mean either
+/// embedding a snapshot in a command line — `/system/bin/printf` is a real process on Android,
+/// so an argument over ~110 KiB fails with `Argument list too long` — or writing the ledger's
+/// inverse out to disk and losing the property that an `Undo` says everything it needs in
+/// itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UndoAction {
+    /// Run this script through the backend, like any other command.
+    Script(String),
+    /// Put a file back from a snapshot stored in the Agent workspace.
+    Snapshot {
+        /// The host-side file holding the bytes.
+        snapshot: PathBuf,
+        /// How many bytes it held.
+        bytes: u64,
+        /// `sha256` of the file *as the device reported it*, so a restore can be checked
+        /// against the thing it claims to have restored.
+        digest: String,
+    },
 }
 
 /// One read that must happen before the write.
@@ -117,6 +260,75 @@ pub struct Capture {
     pub persists_reboot: bool,
 }
 
+impl Capture {
+    /// The second read for a file capture: fetch the content itself.
+    ///
+    /// Split from [`Capture::read`] on purpose. The first read costs one `wc` and answers the
+    /// only question that decides whether to continue — is there a file, and is it inside the
+    /// snapshot budget? Running `base64` on a 4 GB file to discover it was never going to fit
+    /// would put the cost of the decision on the device.
+    pub fn content_read(&self) -> Option<String> {
+        let UndoTarget::File(path) = &self.target else {
+            return None;
+        };
+        let literal = quote_posix(path);
+        Some(format!("sha256sum < {literal} && base64 < {literal}"))
+    }
+}
+
+impl Capture {
+    /// A write whose target is a file the script redirects into.
+    ///
+    /// Only a *plain absolute path* is modelled. Three cases are refused rather than guessed
+    /// at, and each would break the snapshot in a different way:
+    ///
+    /// - relative paths resolve against the write's working directory, which the capture cannot
+    ///   reproduce, so the backup could be of a different file than the one overwritten;
+    /// - globs and `$variables` name a set or a value the planner cannot see, and `echo x > /a*`
+    ///   may write several files;
+    /// - `/dev/…` is a character device: writing it changes nothing readable afterwards, and
+    ///   `base64` of it would block or spin.
+    fn from_redirect(command: &commands::ParsedCommand) -> Option<Capture> {
+        let path = command.redirect.as_deref()?;
+        if !is_snapshotable_path(path) {
+            return None;
+        }
+        let literal = quote_posix(path);
+        // The envelope is built from ordinary read-tier commands with no subshells and no
+        // braces: `$( )` and `{ }` make a script unanalysable to the classifier, and a capture
+        // the gate refuses is a capture that reports "nothing was observed" — which is the
+        // failure mode this whole module exists to avoid.
+        let probe = format!("test -e {literal}");
+        let read = format!(
+            "{probe} && printf 'PRESENT\n'; {probe} && wc -c < {literal}; {probe} || printf \
+             'ABSENT\n'"
+        );
+        Some(Capture {
+            target: UndoTarget::File(path.to_string()),
+            read,
+            writing: Writing::Unknown,
+            // A file is durable in a way a property is not: it is still there after a reboot
+            // without anyone declaring it so.
+            persists_reboot: true,
+        })
+    }
+}
+
+/// Whether a redirect target can be snapshotted. See [`Capture::from_redirect`].
+fn is_snapshotable_path(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.starts_with("/dev/")
+        && !path.contains('~')
+        && !path.contains('$')
+        && !path.contains('`')
+        && !path.chars().any(|c| {
+            // Quotation marks included: a target the lexer had to strip quotes to produce
+            // could have been assembled from pieces, and a snapshot of the assembled name
+            // would not survive re-quoting on the way back.
+            "*?[]{}()<>|&;".contains(c) || c == '"' || c == '\''
+        })
+}
+
 /// A write this port knows how to put back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Undo {
@@ -124,9 +336,13 @@ pub struct Undo {
     pub session_id: String,
     /// What it puts back.
     pub target: UndoTarget,
-    /// The script that does it.
-    pub inverse: String,
+    /// How it puts it back. See [`UndoAction`].
+    pub action: UndoAction,
     /// The value that was there, verbatim, for whoever has to explain the restore.
+    ///
+    /// For a file this is a *summary* — size and digest — because the bytes themselves live in
+    /// the snapshot store, and a ledger that carried file content would put device data in
+    /// every log line the session produces.
     pub old_value: String,
     /// False when the inverse lands near the original state but not on it. Today that is one
     /// case: a property that was *unset* before, which `setprop key ''` restores as
@@ -141,6 +357,17 @@ pub struct Undo {
 }
 
 impl Undo {
+    /// The script it runs, when the undo is one.
+    ///
+    /// `None` for a snapshot restore: that undo is a path and a digest, not a command line, and
+    /// a caller that needs to *show* it should say so rather than be handed a truncated script.
+    pub fn inverse_script(&self) -> Option<&str> {
+        match &self.action {
+            UndoAction::Script(script) => Some(script),
+            UndoAction::Snapshot { .. } => None,
+        }
+    }
+
     /// `prop persist.sys.foo → "" (approximate)` — for a log or a UI, not for parsing.
     pub fn describe(&self) -> String {
         let approx = if self.faithful { "" } else { " (approximate)" };
@@ -189,7 +416,7 @@ pub fn plan(script: &str) -> Plan {
     // `None` is the unanalysable case, and it is handled before anything else because it is the
     // one where the planner knows least: a script it cannot split may have changed the whole
     // device, and an empty undo list must not be allowed to imply otherwise.
-    let Some(argument_lists) = commands::words(script) else {
+    let Some(parsed) = commands::parsed(script) else {
         out.unundoable.push(Unundoable {
             command: script.trim().to_string(),
             why: "the script could not be split into commands, so nothing is known about what \
@@ -200,17 +427,29 @@ pub fn plan(script: &str) -> Plan {
         return out;
     };
 
-    // `classify` and `words` run the same lexer over the same text, so findings and argument
-    // vectors line up index for index. Zipping rather than re-parsing is what keeps the two
-    // from disagreeing about what `setprop a 'b c'` is — a disagreement that would show up as
-    // a rollback restoring the wrong value.
+    // `classify` and `parsed` run the same lexer over the same text, so findings and commands
+    // line up index for index. Zipping rather than re-parsing is what keeps the two from
+    // disagreeing about what `setprop a 'b c'` is — a disagreement that would show up as a
+    // rollback restoring the wrong value.
     let findings = commands::classify(script).findings;
-    for (args, finding) in argument_lists.iter().zip(findings.iter()) {
+    for (command, finding) in parsed.iter().zip(findings.iter()) {
         if finding.effect.is_read_only() {
             continue;
         }
-        match Capture::from_args(args, finding) {
+        let capture =
+            Capture::from_args(&command.words, finding).or_else(|| Capture::from_redirect(command));
+        match capture {
             Some(capture) => out.captures.push(capture),
+            // A redirect the planner *saw* and rejected deserves its own sentence: "no inverse
+            // is modelled" reads like a gap in the port's ambition, when the real reason is
+            // that the target was not a name the capture could trust.
+            None if command.redirect.is_some() => out.unundoable.push(Unundoable {
+                command: finding.command.clone(),
+                why: format!(
+                    "redirects to {:?}, which is not a plain absolute path — a relative name, a                      glob or a `$variable` names a file this capture cannot identify, so no                      snapshot was taken and this change stays after the session ends",
+                    command.redirect.as_deref().unwrap_or("")
+                ),
+            }),
             None => out.unundoable.push(Unundoable {
                 command: finding.command.clone(),
                 why: format!(
@@ -281,6 +520,54 @@ impl Capture {
     }
 }
 
+/// The pre-state, as observed by the backend.
+///
+/// An enum rather than a `String` because "what was there before" is not always a printable
+/// value, and the difference matters to the decision: a property whose `getprop` came back
+/// empty was *unset*, a file that is missing is *absent*, and a file that exists but cannot be
+/// read is neither — it is a change the port cannot undo, and it has to be said out loud.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreState {
+    /// The stdout of a value read, verbatim.
+    Value(String),
+    /// What a file capture found.
+    File(FilePreState),
+}
+
+/// What a file capture found, and what was done about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilePreState {
+    /// Nothing was there. The inverse is removing what the write creates.
+    Absent,
+    /// Content was read and is now in the snapshot store.
+    Present {
+        /// Bytes on the device before the write.
+        bytes: u64,
+        /// `sha256` the device reported for those bytes.
+        digest: String,
+        /// Where the host copy lives.
+        snapshot: PathBuf,
+    },
+    /// A file exists but is larger than [`SNAPSHOT_BUDGET_BYTES`].
+    ///
+    /// Deliberately not "snapshot the first 64 KiB": a restore that truncates is a *second*
+    /// unapproved change, and the one thing a backup must never be is almost-right.
+    TooBig {
+        /// What the file actually measured.
+        bytes: u64,
+    },
+    /// A path exists that this shell cannot read — a directory, or someone else's file.
+    Unreadable,
+    /// The content was readable but the workspace write failed.
+    ///
+    /// Its own state because the reason reaches the teardown log: "could not read your file"
+    /// and "could not keep a copy of it" are different problems for different people.
+    NotSaved {
+        /// What the filesystem said.
+        reason: String,
+    },
+}
+
 /// What became of one capture once the pre-state was read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UndoResult {
@@ -301,8 +588,23 @@ pub enum UndoResult {
 /// [`UndoResult::CannotUndo`] rather than a guess: an undo built on a value nobody read is a
 /// *new* write wearing a rollback's name, and it is the kind of thing that turns a failed
 /// experiment into a silent two-command incident.
-pub fn undo_for(capture: &Capture, observed: Option<&str>, request: &ExecRequest) -> UndoResult {
-    let Some(raw) = observed else {
+pub fn undo_for(
+    capture: &Capture,
+    observed: Option<PreState>,
+    request: &ExecRequest,
+) -> UndoResult {
+    // A file answers a different question from a property: its inverse is bytes, not a value,
+    // and the bytes are already in the snapshot store by the time this runs.
+    if let UndoTarget::File(path) = &capture.target {
+        return undo_for_file(capture, path, observed, request);
+    }
+
+    let Some(raw) = (match observed {
+        Some(PreState::Value(value)) => Some(value),
+        // A `File` pre-state against a non-file capture means the backend and the planner
+        // disagree about what the target is. Refusing is the only honest reading.
+        Some(PreState::File(_)) | None => None,
+    }) else {
         return UndoResult::CannotUndo(format!(
             "{}: the pre-state read (`{}`) did not return a value, and restoring to a value \
              that was never observed would be a new change, not a rollback",
@@ -326,7 +628,11 @@ pub fn undo_for(capture: &Capture, observed: Option<&str>, request: &ExecRequest
             UndoResult::Undo(Undo {
                 session_id: request.session_id.clone(),
                 target: capture.target.clone(),
-                inverse: format!("setprop {} {}", quote_posix(key), quote_posix(current)),
+                action: UndoAction::Script(format!(
+                    "setprop {} {}",
+                    quote_posix(key),
+                    quote_posix(current)
+                )),
                 old_value: current.to_string(),
                 faithful: !current.is_empty(),
                 persists_reboot: capture.persists_reboot,
@@ -356,7 +662,7 @@ pub fn undo_for(capture: &Capture, observed: Option<&str>, request: &ExecRequest
                     capture.target.describe()
                 ));
             }
-            let inverse = if absent {
+            let action = UndoAction::Script(if absent {
                 format!(
                     "settings delete {} {}",
                     quote_posix(table),
@@ -369,11 +675,11 @@ pub fn undo_for(capture: &Capture, observed: Option<&str>, request: &ExecRequest
                     quote_posix(key),
                     quote_posix(current)
                 )
-            };
+            });
             UndoResult::Undo(Undo {
                 session_id: request.session_id.clone(),
                 target: capture.target.clone(),
-                inverse,
+                action,
                 old_value: current.to_string(),
                 // Putting a row back is exact; the delete branch is exact too, since `null`
                 // really did mean absent.
@@ -411,7 +717,10 @@ pub fn undo_for(capture: &Capture, observed: Option<&str>, request: &ExecRequest
                 _ => UndoResult::Undo(Undo {
                     session_id: request.session_id.clone(),
                     target: capture.target.clone(),
-                    inverse: format!("setenforce {}", if want_permissive { "1" } else { "0" }),
+                    action: UndoAction::Script(format!(
+                        "setenforce {}",
+                        if want_permissive { "1" } else { "0" }
+                    )),
                     old_value: current.to_string(),
                     faithful: true,
                     persists_reboot: capture.persists_reboot,
@@ -422,9 +731,93 @@ pub fn undo_for(capture: &Capture, observed: Option<&str>, request: &ExecRequest
                 }),
             }
         }
+        // Unreachable by construction — `undo_for` dispatches on the target before this match.
+        // Kept as a refusal rather than an unreachable! because the cost of being wrong about
+        // that is a device left in a state nobody can name.
+        (UndoTarget::File(_), _) => UndoResult::CannotUndo(
+            "a file capture reached the value branch of the undo builder".to_string(),
+        ),
+        (target, Writing::Unknown) => UndoResult::CannotUndo(format!(
+            "{}: the write's new value is not knowable in advance and no snapshot was taken",
+            target.describe()
+        )),
         (target, Writing::Delete) => UndoResult::CannotUndo(format!(
             "{}: no delete-inverse is modelled for this target",
             target.describe()
+        )),
+    }
+}
+
+/// The file case of [`undo_for`].
+///
+/// Note what is *not* here: no `NothingToUndo`. A redirect's new content is not knowable
+/// before the command runs, so there is no comparison to make and no way to claim the write
+/// changed nothing. Every successful file write therefore records something to put back.
+fn undo_for_file(
+    capture: &Capture,
+    path: &str,
+    observed: Option<PreState>,
+    request: &ExecRequest,
+) -> UndoResult {
+    let Some(PreState::File(state)) = observed else {
+        return UndoResult::CannotUndo(format!(
+            "file {path}: the snapshot read did not complete, so nothing is known about what \
+             is at that path. Restoring a file to a state nobody observed would be a new \
+             change wearing a rollback's name"
+        ));
+    };
+    let undo = |action, old_value: String, faithful: bool| {
+        UndoResult::Undo(Undo {
+            session_id: request.session_id.clone(),
+            target: capture.target.clone(),
+            action,
+            old_value,
+            faithful,
+            persists_reboot: capture.persists_reboot,
+            capability: request
+                .android_capability()
+                .unwrap_or(Capability::ShellWrite),
+            token: request.approval_token.clone(),
+        })
+    };
+    match state {
+        FilePreState::Absent => undo(
+            UndoAction::Script(format!("rm -f {}", quote_posix(path))),
+            "<absent>".to_string(),
+            true,
+        ),
+        FilePreState::Present {
+            bytes,
+            digest,
+            snapshot,
+        } => {
+            let summary = format!("{bytes} bytes, sha256 {digest}");
+            undo(
+                UndoAction::Snapshot {
+                    snapshot,
+                    bytes,
+                    digest,
+                },
+                summary,
+                // The *content* is restored byte for byte and checked against the digest the
+                // device itself reported. What does not come back is the modification time, and
+                // for a file the write created, the inode: `rm -f` then rewriting is a different
+                // file that happens to hold the same bytes. `faithful` is about the state the
+                // session was found in, and that includes when it was last written.
+                false,
+            )
+        }
+        FilePreState::TooBig { bytes } => UndoResult::CannotUndo(format!(
+            "file {path} holds {bytes} bytes, over the {SNAPSHOT_BUDGET_BYTES}-byte snapshot \
+             budget; a truncated backup is a second change, so nothing was saved, and this \
+             write will still be there when the session ends"
+        )),
+        FilePreState::Unreadable => UndoResult::CannotUndo(format!(
+            "file {path} exists but this shell cannot read it; its previous content is \
+             unknown, so it cannot be put back"
+        )),
+        FilePreState::NotSaved { reason } => UndoResult::CannotUndo(format!(
+            "file {path} was readable but no snapshot was kept: {reason}"
         )),
     }
 }
@@ -561,23 +954,44 @@ impl RestoreReport {
 pub struct ReversibleBackend {
     inner: Arc<dyn ExecutionBackend>,
     ledger: Arc<Mutex<RollbackLedger>>,
+    /// Where file snapshots are kept. Required, not optional: a backend that cannot say where
+    /// it put a backup is a backend that leaves `UndoAction::Snapshot` holding a path nobody
+    /// can find.
+    store: Arc<SnapshotStore>,
 }
 
 impl ReversibleBackend {
-    /// Wrap a backend. The ledger is shared, so the node can inspect it without the backend.
-    pub fn new(inner: Arc<dyn ExecutionBackend>) -> ReversibleBackend {
+    /// Wrap a backend, keeping snapshots under `snapshot_dir`.
+    ///
+    /// The ledger is shared so the node can inspect it without the backend; the snapshot
+    /// directory is the node's own workspace path, which §4.6.4 names as where a backup goes.
+    pub fn new(
+        inner: Arc<dyn ExecutionBackend>,
+        snapshot_dir: impl Into<PathBuf>,
+    ) -> ReversibleBackend {
         ReversibleBackend {
             inner,
             ledger: Arc::new(Mutex::new(RollbackLedger::new())),
+            store: Arc::new(SnapshotStore::new(snapshot_dir)),
         }
     }
 
-    /// Wrap a backend with a ledger the caller already holds.
+    /// Wrap a backend with a ledger and a snapshot store the caller already holds.
     pub fn with_ledger(
         inner: Arc<dyn ExecutionBackend>,
         ledger: Arc<Mutex<RollbackLedger>>,
+        store: Arc<SnapshotStore>,
     ) -> ReversibleBackend {
-        ReversibleBackend { inner, ledger }
+        ReversibleBackend {
+            inner,
+            ledger,
+            store,
+        }
+    }
+
+    /// Where snapshots are kept.
+    pub fn snapshots(&self) -> &SnapshotStore {
+        &self.store
     }
 
     /// The shared ledger.
@@ -596,12 +1010,89 @@ impl ReversibleBackend {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Run one capture read. `None` means no value was observed, which [`undo_for`] treats as
-    /// "do not build an undo", not as "the value was empty".
-    async fn read_pre_state(&self, capture: &Capture, session: &str) -> Option<String> {
-        let request = ExecRequest::read(capture.read.clone(), session);
-        match self.inner.exec(request).await {
-            Ok(record) if record.succeeded() => Some(record.stdout),
+    /// Run one capture read.
+    ///
+    /// `None` means no pre-state was observed, which [`undo_for`] treats as "do not build an
+    /// undo", not as "the value was empty".
+    async fn read_pre_state(&self, capture: &Capture, session: &str) -> Option<PreState> {
+        let record = self.read(&capture.read, session).await?;
+        if !matches!(capture.target, UndoTarget::File(_)) {
+            return Some(PreState::Value(record.stdout));
+        }
+
+        // A file is read in two steps because the second step's cost is unknown until the
+        // first one finishes. The envelope says whether there is a file at all and how big it
+        // is; only then is the content fetched, and a file over the budget is refused here
+        // rather than base64'd into a pipe that would have to be thrown away.
+        let UndoTarget::File(_) = &capture.target else {
+            unreachable!("checked above")
+        };
+        let state = match parse_envelope(&record.stdout) {
+            Envelope::Absent => FilePreState::Absent,
+            Envelope::Size(None) => FilePreState::Unreadable,
+            Envelope::Unparsed(text) => FilePreState::NotSaved {
+                reason: format!(
+                    "the snapshot read printed {text:?}, which is not the envelope this capture \
+                     expects"
+                ),
+            },
+            Envelope::Size(Some(bytes)) if bytes > SNAPSHOT_BUDGET_BYTES => {
+                FilePreState::TooBig { bytes }
+            }
+            Envelope::Size(Some(bytes)) => {
+                let payload = self.read(&capture.content_read()?, session).await?;
+                match parse_snapshot(&payload.stdout) {
+                    None => FilePreState::NotSaved {
+                        reason: "the content read did not come back as a digest line followed \
+                                 by base64"
+                            .to_string(),
+                    },
+                    Some((_digest, body)) if decoded_len_of_base64(&body) != bytes => {
+                        // The payload decodes to a different size than the file measured. That
+                        // is the output cap truncating something the budget said would fit, or
+                        // transit mangling it — either way the bytes we would put back are not
+                        // the bytes that are there, and a partial backup is a second change
+                        // waiting to happen.
+                        FilePreState::NotSaved {
+                            reason: format!(
+                                "the base64 read decoded to {} bytes for a {bytes}-byte file",
+                                decoded_len_of_base64(&body)
+                            ),
+                        }
+                    }
+                    Some((digest, body)) => {
+                        match self
+                            .store
+                            .save(session, &crate::host::script::next_nonce(), &body)
+                        {
+                            Ok(snapshot) => FilePreState::Present {
+                                bytes,
+                                digest,
+                                snapshot,
+                            },
+                            Err(e) => FilePreState::NotSaved {
+                                reason: format!(
+                                    "the snapshot could not be written to {}: {e}",
+                                    self.store.dir().display()
+                                ),
+                            },
+                        }
+                    }
+                }
+            }
+        };
+        Some(PreState::File(state))
+    }
+
+    /// One read-tier command through the inner backend. `None` on any failure, including a
+    /// refusal: a capture that could not run is not evidence about the device.
+    async fn read(&self, script: &str, session: &str) -> Option<ExecRecord> {
+        match self
+            .inner
+            .exec(ExecRequest::read(script.to_string(), session))
+            .await
+        {
+            Ok(record) if record.succeeded() => Some(record),
             _ => None,
         }
     }
@@ -614,23 +1105,40 @@ impl ReversibleBackend {
 
         // Reverse: the last change made is the first one to take back.
         for undo in taken.into_iter().rev() {
-            let mut request = ExecRequest::new(undo.capability, undo.inverse.clone(), session);
-            request.approval_token = undo.token.clone();
-            match self.inner.exec(request).await {
-                Ok(record) if record.succeeded() => report.restored.push(undo.describe()),
-                Ok(record) => {
-                    report.failed.push((
-                        undo.describe(),
-                        format!(
-                            "exit {:?}{}",
-                            record.exit_code,
-                            suffix_if_needed(&record.stderr)
-                        ),
-                    ));
-                    self.ledger_mut().restore_entry(undo);
+            let outcome = match &undo.action {
+                UndoAction::Script(script) => self.run_write(session, &undo, script.clone()).await,
+                UndoAction::Snapshot {
+                    snapshot,
+                    bytes,
+                    digest,
+                } => {
+                    let payload = std::fs::read_to_string(snapshot);
+                    match payload {
+                        Ok(payload) => {
+                            self.restore_snapshot(session, &undo, &payload, *bytes, digest)
+                                .await
+                        }
+                        Err(e) => Err(format!(
+                            "the snapshot at {} could not be read ({e}); the bytes this undo \
+                             would have written are gone",
+                            snapshot.display()
+                        )),
+                    }
                 }
-                Err(e) => {
-                    report.failed.push((undo.describe(), e.to_string()));
+            };
+            match outcome {
+                Ok(()) => {
+                    // The workspace copy has done its job. Keeping device content around after
+                    // the device itself is back would leave a second, unexplained copy of it.
+                    if let UndoAction::Snapshot { snapshot, .. } = &undo.action {
+                        self.store.discard(snapshot);
+                    }
+                    report.restored.push(undo.describe());
+                }
+                Err(why) => {
+                    // Put it back: a failed restore is still a pending change, and the whole
+                    // point of the ledger is that nobody has to guess what is outstanding.
+                    report.failed.push((undo.describe(), why));
                     self.ledger_mut().restore_entry(undo);
                 }
             }
@@ -639,6 +1147,204 @@ impl ReversibleBackend {
         report.still_pending_elsewhere = self.ledger_mut().pending().len();
         report
     }
+
+    /// Run one recorded inverse as a write.
+    async fn run_write(&self, session: &str, undo: &Undo, script: String) -> Result<(), String> {
+        let mut request = ExecRequest::new(undo.capability, script, session);
+        request.approval_token = undo.token.clone();
+        match self.inner.exec(request).await {
+            Ok(record) if record.succeeded() => Ok(()),
+            Ok(record) => Err(format!(
+                "exit {:?}{}",
+                record.exit_code,
+                suffix_if_needed(&record.stderr)
+            )),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Put a file back from its snapshot, then prove it.
+    ///
+    /// The payload travels as base64 in chunks, because the device-side `printf` is an
+    /// `execve` and an argument list over ~110 KiB is refused (see [`SNAPSHOT_CHUNK_BYTES`]).
+    /// Chunking is only tolerable because the last step compares the restored file against the
+    /// digest the device reported *before* the write: an assembly that went wrong is reported
+    /// as a failure instead of silently leaving a corrupt file where a backup was supposed to
+    /// go. That check is the difference between a rollback and a best-efforts write.
+    async fn restore_snapshot(
+        &self,
+        session: &str,
+        undo: &Undo,
+        payload: &str,
+        bytes: u64,
+        digest: &str,
+    ) -> Result<(), String> {
+        let UndoTarget::File(path) = &undo.target else {
+            return Err("a snapshot undo pointed at a non-file target".to_string());
+        };
+        if !is_base64(payload) {
+            return Err(format!(
+                "the snapshot in {} is not base64 any more; refusing to write it to {path}",
+                self.store.dir().display()
+            ));
+        }
+        let literal = quote_posix(path);
+        let staged = quote_posix(&format!(
+            "{SNAPSHOT_STAGING_DIR}/.acowork-snap-{}.b64",
+            crate::host::script::next_nonce()
+        ));
+
+        // An empty file has no chunks to stage, and `base64 -d` of a file that was never
+        // created would fail on the way to restoring a file that holds nothing. Truncate it
+        // directly — the digest check below still has to agree that it is empty.
+        if payload.is_empty() {
+            self.run_write(session, undo, format!("printf '' > {literal}"))
+                .await
+                .map_err(|e| format!("restoring the empty {path}: {e}"))?;
+            return self
+                .verify(session, undo, path, &literal, digest, bytes)
+                .await;
+        }
+
+        for (index, chunk) in payload.as_bytes().chunks(SNAPSHOT_CHUNK_BYTES).enumerate() {
+            let chunk = std::str::from_utf8(chunk).map_err(|_| "snapshot chunk is not utf8")?;
+            // `>` for the first chunk, `>>` for the rest: one staging file, one command per
+            // chunk. Separate commands rather than a shell loop so the audit log shows how
+            // many writes a restore actually made.
+            let redirect = if index == 0 { ">" } else { ">>" };
+            let script = format!("printf '%s' '{chunk}' {redirect} {staged}");
+            if let Err(e) = self.run_write(session, undo, script).await {
+                self.cleanup(session, undo, &staged).await;
+                return Err(format!("while staging a snapshot chunk for {path}: {e}"));
+            }
+        }
+
+        let decoded = self
+            .run_write(session, undo, format!("base64 -d < {staged} > {literal}"))
+            .await;
+        // The staging file goes whether the decode worked: base64 of someone's file sitting in
+        // /data/local/tmp is a copy nobody asked for, and it outlives this session.
+        self.cleanup(session, undo, &staged).await;
+        decoded.map_err(|e| format!("restoring {path}: {e}"))?;
+
+        self.verify(session, undo, path, &literal, digest, bytes)
+            .await
+    }
+
+    /// Check a restored file against the digest the device reported before the write.
+    ///
+    /// This is the step that makes a chunked restore safe to attempt at all. Without it, a
+    /// payload that lost a chunk in transit would leave a file that looks restored, holds the
+    /// wrong bytes, and has a rollback ledger claiming otherwise.
+    async fn verify(
+        &self,
+        session: &str,
+        _undo: &Undo,
+        path: &str,
+        literal: &str,
+        digest: &str,
+        bytes: u64,
+    ) -> Result<(), String> {
+        // Prove it. `sha256sum` is read-tier, so this costs a read and no approval.
+        let record = self
+            .read(&format!("sha256sum < {literal}"), session)
+            .await
+            .ok_or_else(|| {
+                format!(
+                    "{path} was written but cannot be read back to check it, so the restore is \
+                     unverified; the snapshot is kept in {}",
+                    self.store.dir().display()
+                )
+            })?;
+        let observed = record
+            .stdout
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if observed != digest.to_ascii_lowercase() {
+            return Err(format!(
+                "{path} was rewritten but its digest is {observed:?}, not {digest:?}: the file \
+                 does *not* hold the {bytes} bytes this session found. The snapshot is kept in {}",
+                self.store.dir().display()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Remove a staging file, ignoring the outcome. Nothing a caller can do about it, and a
+    /// failure must not be reported as "the device was not restored".
+    async fn cleanup(&self, session: &str, undo: &Undo, staged: &str) {
+        let _ = self
+            .run_write(session, undo, format!("rm -f {staged}"))
+            .await;
+    }
+}
+
+/// What a file capture's first read printed.
+enum Envelope {
+    /// Nothing is at the path.
+    Absent,
+    /// Something is there and this is its size in bytes. `None` is "there, but this shell
+    /// cannot measure it" — a directory, or someone else's file.
+    Size(Option<u64>),
+    /// The read succeeded and printed something that is not the envelope. A protocol mismatch
+    /// is not the same fact as "unreadable", and reporting it as one would send whoever reads
+    /// the log looking at file permissions instead of at this code.
+    Unparsed(String),
+}
+
+/// Parse the envelope [`Capture::read`] prints.
+fn parse_envelope(stdout: &str) -> Envelope {
+    let mut lines = stdout.lines();
+    match lines.next().map(str::trim) {
+        Some("ABSENT") => Envelope::Absent,
+        Some("PRESENT") => match lines.next().and_then(|l| l.trim().parse().ok()) {
+            Some(bytes) => Envelope::Size(Some(bytes)),
+            None => Envelope::Size(None),
+        },
+        Some(other) => Envelope::Unparsed(other.to_string()),
+        None => Envelope::Unparsed(String::new()),
+    }
+}
+
+/// Parse a snapshot read: `<sha256>  -` on the first line, then the base64 body.
+///
+/// `None` means the text is not what the capture protocol promises. The body comes back owned
+/// because it is a whitespace-stripped copy of a capped stdout; borrowing the input instead
+/// would mean keeping the whole read alive for a payload that is at most ~88 KiB.
+fn parse_snapshot(stdout: &str) -> Option<(String, String)> {
+    let (digest_line, rest) = stdout.split_once('\n')?;
+    let digest = digest_line.split_whitespace().next()?;
+    if digest.len() != 64 || !digest.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let body: String = rest.chars().filter(|c| !c.is_whitespace()).collect();
+    if !is_base64(&body) {
+        return None;
+    }
+    Some((digest.to_ascii_lowercase(), body))
+}
+
+/// How many file bytes a base64 payload decodes to.
+///
+/// The exact inverse of the encoder: four characters carry three bytes, less the padding.
+/// Compared against the size the *device* reported, this is what catches a payload truncated
+/// by the output cap — the one failure mode where a snapshot would otherwise be quietly short
+/// and the ledger would still describe it as a backup.
+fn decoded_len_of_base64(body: &str) -> u64 {
+    body.trim_end_matches('=').len() as u64 * 3 / 4
+}
+
+/// True for the base64 alphabet and nothing else, including no whitespace.
+///
+/// The empty string qualifies: it is what an empty file encodes to, and "the file was there and
+/// held nothing" is a state worth putting back.
+fn is_base64(text: &str) -> bool {
+    text.len().is_multiple_of(4)
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
 }
 
 fn suffix_if_needed(stderr: &str) -> String {
@@ -676,7 +1382,7 @@ impl ExecutionBackend for ReversibleBackend {
         // inner backend as a read-tier request, which is what makes it safe to issue here: the
         // §4.4 rule that auto-passes `getprop` is the same rule that would refuse it if the
         // planner ever invented a capture that was not a read.
-        let mut captured: Vec<(Capture, Option<String>)> =
+        let mut captured: Vec<(Capture, Option<PreState>)> =
             Vec::with_capacity(planned.captures.len());
         for capture in &planned.captures {
             let observed = self.read_pre_state(capture, &session).await;
@@ -692,7 +1398,7 @@ impl ExecutionBackend for ReversibleBackend {
             let mut ledger = self.ledger_mut();
             ledger.record_unundoable(&session, &planned.unundoable);
             for (capture, observed) in captured {
-                match undo_for(&capture, observed.as_deref(), &request) {
+                match undo_for(&capture, observed, &request) {
                     UndoResult::Undo(undo) => ledger.record(undo),
                     // Both of these are the teardown's business, not the caller's: "nothing to
                     // undo" and "no undo possible" read the same in a log and mean opposite
@@ -731,6 +1437,13 @@ impl std::fmt::Debug for ReversibleBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fresh directory per call, so a test that writes a snapshot cannot read another's.
+    fn snapshot_dir() -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!("acowork-snapshot-test-{}-{n}", std::process::id()))
+    }
     use crate::host::probe::ProbeOutput;
     use acowork_platform_contract::HostCapability;
     use std::sync::Mutex;
@@ -896,11 +1609,37 @@ mod tests {
             planned.unundoable[0]
         );
 
-        // A file write is §4.6.4's *other* promise — back it up and offer `restore` — which is
-        // not implemented. The plan must not read as though nothing happened.
+        // A file write is §4.6.4's *other* promise — back it up and offer `restore`. It is now
+        // kept for a plain absolute path, so this asserts the capture exists rather than that
+        // it does not, and pairs it with the two file writes that still cannot be modelled.
         let planned = plan("echo note > /data/local/tmp/note.txt");
+        assert_eq!(planned.captures.len(), 1, "{:?}", planned.captures);
+        assert_eq!(
+            planned.captures[0].target,
+            UndoTarget::File("/data/local/tmp/note.txt".to_string())
+        );
+        assert!(planned.unundoable.is_empty());
+
+        // A relative target names a file only in the context of the write's working directory,
+        // which the capture does not share. Refusing is the honest answer; guessing is the one
+        // that restores the wrong file.
+        let planned = plan("echo note > ./note.txt");
         assert!(planned.captures.is_empty());
-        assert_eq!(planned.unundoable.len(), 1, "{:?}", planned.unundoable);
+        assert_eq!(planned.unundoable.len(), 1);
+        assert!(
+            planned.unundoable[0]
+                .why
+                .contains("not a plain absolute path"),
+            "{:?}",
+            planned.unundoable[0]
+        );
+
+        // `rm` deletes a file the script never redirected into: the content is gone by the time
+        // the planner looks, and no capture could have run sooner than the command itself.
+        let planned = plan("rm -f /data/local/tmp/note.txt");
+        assert!(planned.captures.is_empty());
+        assert_eq!(planned.unundoable.len(), 1);
+        assert_eq!(planned.unundoable[0].command, "rm");
     }
 
     #[test]
@@ -947,7 +1686,11 @@ mod tests {
             .strongest()
             .capability()
             .unwrap_or(Capability::ShellWrite);
-        undo_for(capture, observed, &write_request(script, claimed))
+        undo_for(
+            capture,
+            observed.map(|value| PreState::Value(value.to_string())),
+            &write_request(script, claimed),
+        )
     }
 
     #[test]
@@ -959,7 +1702,10 @@ mod tests {
         ) else {
             panic!("expected an undo");
         };
-        assert_eq!(undo.inverse, "setprop 'debug.stagefright.ccodec' '0'");
+        assert_eq!(
+            undo.inverse_script().unwrap(),
+            "setprop 'debug.stagefright.ccodec' '0'"
+        );
         assert_eq!(undo.old_value, "0");
         assert!(undo.faithful);
         assert_eq!(undo.session_id, "session-alpha");
@@ -1001,7 +1747,7 @@ mod tests {
         else {
             panic!("expected an undo");
         };
-        assert_eq!(undo.inverse, "setprop 'debug.foo' ''");
+        assert_eq!(undo.inverse_script().unwrap(), "setprop 'debug.foo' ''");
         assert!(!undo.faithful);
         assert!(
             undo.describe().contains("approximate"),
@@ -1022,7 +1768,10 @@ mod tests {
         ) else {
             panic!("expected an undo");
         };
-        assert_eq!(undo.inverse, "settings delete 'system' 'font_scale'");
+        assert_eq!(
+            undo.inverse_script().unwrap(),
+            "settings delete 'system' 'font_scale'"
+        );
         assert!(undo.faithful, "delete is the exact inverse of absent");
 
         // And a present row comes back with its value quoted, not interpolated.
@@ -1033,7 +1782,10 @@ mod tests {
         ) else {
             panic!("expected an undo");
         };
-        assert_eq!(undo.inverse, "settings put 'system' 'font_scale' '1.0'");
+        assert_eq!(
+            undo.inverse_script().unwrap(),
+            "settings put 'system' 'font_scale' '1.0'"
+        );
     }
 
     #[test]
@@ -1048,10 +1800,13 @@ mod tests {
         ) else {
             panic!("expected an undo");
         };
-        assert_eq!(undo.inverse, "setprop 'debug.foo' 'a b'\\''c'");
+        assert_eq!(
+            undo.inverse_script().unwrap(),
+            "setprop 'debug.foo' 'a b'\\''c'"
+        );
         // Round-trips through the classifier as one command over two arguments.
         assert_eq!(
-            commands::words(&undo.inverse),
+            commands::words(undo.inverse_script().unwrap()),
             Some(vec![vec![
                 "setprop".to_string(),
                 "debug.foo".to_string(),
@@ -1066,7 +1821,7 @@ mod tests {
         else {
             panic!("expected an undo");
         };
-        assert_eq!(undo.inverse, "setenforce 1");
+        assert_eq!(undo.inverse_script().unwrap(), "setenforce 1");
         assert_eq!(undo.capability, Capability::SelinuxPermissive);
         assert_eq!(undo.old_value, "Enforcing");
 
@@ -1092,7 +1847,7 @@ mod tests {
     #[tokio::test]
     async fn the_pre_state_is_read_before_the_device_is_written_to() {
         let fake = Fake::answering(&[("getprop 'debug.foo'", "0")]);
-        let backend = ReversibleBackend::new(fake.clone());
+        let backend = ReversibleBackend::new(fake.clone(), snapshot_dir());
 
         backend
             .exec(request_for("setprop debug.foo 1"))
@@ -1118,9 +1873,303 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_file_write_is_snapshotted_and_put_back_by_digest() {
+        // §4.6.4's other half: the file is copied into the Agent workspace *before* the write,
+        // and the restore is checked against the digest the device gave up beforehand. The
+        // check is the load-bearing part — chunked transport without it would let a lost chunk
+        // be reported as a successful rollback.
+        let script = "echo changed > /data/local/tmp/note.txt";
+        let digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let planned = plan(script);
+        let capture = &planned.captures[0];
+        let read = capture.read.clone();
+        let content = capture.content_read().unwrap();
+        let verify = format!("sha256sum < '{}'", "/data/local/tmp/note.txt");
+
+        let dir = snapshot_dir();
+        let fake = Fake::answering(&[
+            (&read, "PRESENT\n3\n"),
+            (&content, &format!("{digest}  -\nYWJj")),
+            (&verify, &format!("{digest}  -")),
+            (script, ""),
+        ]);
+        let backend = ReversibleBackend::new(fake.clone(), dir.clone());
+
+        backend
+            .exec(request_for(script))
+            .await
+            .expect("the write itself succeeds");
+
+        let snapshots: Vec<_> = std::fs::read_dir(&dir)
+            .expect("the store was created")
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(snapshots.len(), 1, "one file, one backup");
+        assert_eq!(
+            std::fs::read_to_string(&snapshots[0]).unwrap(),
+            "YWJj",
+            "the backup holds the base64 the device sent"
+        );
+
+        let report = backend.restore("session-alpha").await;
+        assert!(report.clean(), "{:?}", report.failed);
+        assert_eq!(report.restored.len(), 1);
+        assert!(
+            report.restored[0].contains("/data/local/tmp/note.txt"),
+            "{}",
+            report.restored[0]
+        );
+
+        // The order the whole design rests on: measure, fetch, *then* write.
+        let seen = fake.sequence();
+        let scripts: Vec<&str> = seen.iter().map(|s| s.script.as_str()).collect();
+        assert_eq!(
+            &scripts[..3],
+            &[read.as_str(), content.as_str(), script],
+            "capture before the write, in that order"
+        );
+        // Verified, so the workspace copy has done its job and is not kept as a second copy of
+        // the device's data.
+        assert!(
+            !snapshots[0].exists(),
+            "a restore that checked out discards its snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_larger_than_the_argument_ceiling_is_staged_in_chunks() {
+        // The device refuses an argument over ~110 KiB, so a payload of several chunks is the
+        // normal case, not the edge case. Two properties matter and both are invisible in the
+        // ledger: the first chunk must *create* the staging file and the rest must *append*
+        // (`>` twice would silently drop everything before the last chunk), and the digest
+        // check must be the thing that decides whether the restore worked.
+        let script = "echo changed > /data/local/tmp/many.bin";
+        let capture = &plan(script).captures[0];
+        let read = capture.read.clone();
+        let content = capture.content_read().unwrap();
+        let verify = "sha256sum < '/data/local/tmp/many.bin'".to_string();
+        let payload = "A".repeat(SNAPSHOT_CHUNK_BYTES + 4);
+        let device_bytes = decoded_len_of_base64(&payload);
+        let digest = "c".repeat(64);
+        let envelope = format!("PRESENT\n{device_bytes}\n");
+        let body = format!("{digest}  -\n{payload}");
+        let fake = Fake::answering(&[
+            (&read, &envelope),
+            (&content, &body),
+            (&verify, &format!("{digest}  -")),
+            (script, ""),
+        ]);
+        let backend = ReversibleBackend::new(fake.clone(), snapshot_dir());
+        backend.exec(request_for(script)).await.unwrap();
+        let report = backend.restore("session-alpha").await;
+        assert!(report.clean(), "{:?}", report.failed);
+
+        let staged: Vec<String> = fake
+            .sequence()
+            .iter()
+            .map(|s| s.script.clone())
+            .filter(|s| s.contains(".acowork-snap-") && s.starts_with("printf"))
+            .collect();
+        assert_eq!(staged.len(), 2, "{staged:?}");
+        assert!(
+            staged[0].contains("' > '"),
+            "first chunk creates: {}",
+            staged[0]
+        );
+        assert!(
+            staged[1].contains("' >> '"),
+            "second chunk appends, or the head of the file is lost: {}",
+            staged[1]
+        );
+        // Pull the quoted payload back out of each staging command. `printf '%s' 'X' > 'P'` is
+        // the whole shape, so the payload is what sits between the second and third quote.
+        let carried = |script: &str| -> String {
+            // `printf '%s' 'CHUNK' > 'PATH'` splits on the quotes as
+            // ["printf ", "%s", " ", CHUNK, " > ", PATH, ""] — the payload is field 3.
+            script.split('\'').nth(3).unwrap_or("").to_string()
+        };
+        assert_eq!(
+            carried(&staged[0]).len(),
+            SNAPSHOT_CHUNK_BYTES,
+            "the first chunk is a full one"
+        );
+        assert_eq!(
+            carried(&staged[0]).len() + carried(&staged[1]).len(),
+            payload.len(),
+            "the two chunks carry the whole payload — nothing is dropped between them"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_that_was_not_there_is_removed_rather_than_restored() {
+        // Creating a file has an inverse too, and it is not a snapshot: it is the absence that
+        // was observed. `rm -f` and nothing else.
+        let script = "echo new > /data/local/tmp/created.txt";
+        let capture = &plan(script).captures[0];
+        let read = capture.read.clone();
+        let fake = Fake::answering(&[(&read, "ABSENT\n"), (script, "")]);
+        let backend = ReversibleBackend::new(fake.clone(), snapshot_dir());
+        backend.exec(request_for(script)).await.unwrap();
+
+        // Read the ledger out and let the guard go before the next await: a `MutexGuard` held
+        // across an await is how a teardown deadlocks the moment two sessions restore at once.
+        let (inverse, old_value, faithful) = {
+            let ledger = backend.ledger();
+            let guard = ledger.lock().unwrap();
+            let pending = guard.pending_for("session-alpha").to_vec();
+            assert_eq!(pending.len(), 1);
+            (
+                pending[0].inverse_script().unwrap().to_string(),
+                pending[0].old_value.clone(),
+                pending[0].faithful,
+            )
+        };
+        assert_eq!(inverse, "rm -f '/data/local/tmp/created.txt'");
+        assert_eq!(old_value, "<absent>");
+        assert!(faithful, "absence is restored exactly");
+
+        let report = backend.restore("session-alpha").await;
+        assert!(report.clean(), "{:?}", report.failed);
+        assert!(
+            fake.sequence()
+                .iter()
+                .any(|s| s.script == "rm -f '/data/local/tmp/created.txt'")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_over_budget_is_written_anyway_and_named_at_teardown() {
+        // The budget is a promise about *backups*, not about writes: the command still runs, and
+        // the session ends by saying out loud that this file is not coming back.
+        let script = "echo big > /data/local/tmp/big.txt";
+        let read = plan(script).captures[0].read.clone();
+        let over = SNAPSHOT_BUDGET_BYTES + 1;
+        let envelope = format!("PRESENT\n{over}\n");
+        let fake = Fake::answering(&[(&read, &envelope), (script, "")]);
+        let backend = ReversibleBackend::new(fake.clone(), snapshot_dir());
+        backend.exec(request_for(script)).await.unwrap();
+
+        let ledger = backend.ledger();
+        let ledger = ledger.lock().unwrap();
+        assert!(
+            ledger.pending_for("session-alpha").is_empty(),
+            "nothing was saved, so nothing can be restored"
+        );
+        let left = ledger.leaving_behind("session-alpha");
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert!(
+            left[0].why.contains("snapshot budget") && left[0].why.contains(&over.to_string()),
+            "{:?}",
+            left[0]
+        );
+        // The size check happened on the *envelope*: no content read was ever issued, so a
+        // 4 GB file costs one `wc` rather than a base64 of the whole thing.
+        assert_eq!(
+            fake.sequence()
+                .iter()
+                .filter(|s| s.script.contains("base64"))
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restore_that_does_not_match_the_digest_is_a_failure_not_a_restore() {
+        let script = "echo changed > /data/local/tmp/note.txt";
+        let digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let capture = &plan(script).captures[0];
+        let read = capture.read.clone();
+        let content = capture.content_read().unwrap();
+        let verify = "sha256sum < '/data/local/tmp/note.txt'".to_string();
+        let fake = Fake::answering(&[
+            (&read, "PRESENT\n3\n"),
+            (&content, &format!("{digest}  -\nYWJj")),
+            // The device now reports a different file than the one that was backed up.
+            (&verify, &format!("{}  -", "0".repeat(64))),
+            (script, ""),
+        ]);
+        let backend = ReversibleBackend::new(fake.clone(), snapshot_dir());
+        backend.exec(request_for(script)).await.unwrap();
+        let snapshot = backend
+            .ledger()
+            .lock()
+            .unwrap()
+            .pending_for("session-alpha")[0]
+            .inverse_script()
+            .is_none();
+        assert!(snapshot, "the undo is a snapshot, not a script");
+
+        let report = backend.restore("session-alpha").await;
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert!(
+            report.failed[0].1.contains("does *not* hold"),
+            "{}",
+            report.failed[0].1
+        );
+        assert_eq!(
+            report.still_pending_elsewhere, 1,
+            "a failed restore stays pending — the device is not back and the ledger must not \
+             pretend otherwise"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_name_cannot_escape_the_store() {
+        // The session id is caller-supplied and becomes a file name. Left alone, a session
+        // called `../../escape` would put device content outside the workspace.
+        let store = SnapshotStore::new(snapshot_dir());
+        let path = store
+            .save("../../etc/passwd", "nonce", "YWJj")
+            .expect("store writes");
+        assert_eq!(
+            path.parent(),
+            Some(store.dir()),
+            "the name lands in the store and nowhere else. What carries that is the separator: \
+             `/` never survives sanitising, so no session id can reach a parent directory"
+        );
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let prefix = name.strip_suffix("-nonce.b64").expect("{name}");
+        assert!(
+            !prefix.contains('/') && !prefix.contains('.'),
+            "the extension is ours; nothing from the caller may write a dot into the name"
+        );
+        assert_eq!(prefix, "______etc_passwd");
+    }
+
+    #[test]
+    fn the_snapshot_protocol_is_checked_before_it_is_believed() {
+        assert!(is_base64("YWJj"));
+        assert!(
+            is_base64(""),
+            "an empty file encodes to nothing, which is a real state"
+        );
+        assert!(!is_base64("YWJj\n"));
+        assert!(!is_base64("not base64!"));
+        assert_eq!(decoded_len_of_base64("YWJj"), 3);
+        assert_eq!(decoded_len_of_base64("YQ=="), 1);
+        assert_eq!(decoded_len_of_base64(""), 0);
+
+        assert!(matches!(parse_envelope("ABSENT\n"), Envelope::Absent));
+        assert!(matches!(
+            parse_envelope("PRESENT\n4096\n"),
+            Envelope::Size(Some(4096))
+        ));
+        assert!(matches!(parse_envelope("PRESENT\n"), Envelope::Size(None)));
+        assert!(matches!(parse_envelope(""), Envelope::Unparsed(_)));
+
+        let digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let parsed = parse_snapshot(&format!("{digest}  -\nYW\nJj\n")).unwrap();
+        assert_eq!(parsed.0, digest);
+        assert_eq!(parsed.1, "YWJj", "wrapped base64 reassembles");
+        assert!(parse_snapshot("nope\nYWJj").is_none(), "not a digest line");
+        assert!(parse_snapshot(&format!("{digest}  -\nnot base!")).is_none());
+    }
+
+    #[tokio::test]
     async fn a_read_only_script_is_passed_through_without_a_second_round_trip() {
         let fake = Fake::answering(&[]);
-        let backend = ReversibleBackend::new(fake.clone());
+        let backend = ReversibleBackend::new(fake.clone(), snapshot_dir());
         backend
             .exec(ExecRequest::read("getprop ro.build.type", "session-alpha"))
             .await
@@ -1136,7 +2185,7 @@ mod tests {
     #[tokio::test]
     async fn a_write_that_failed_records_no_undo() {
         let fake = Fake::with_failing("setprop debug.foo 1", &[("getprop 'debug.foo'", "0")]);
-        let backend = ReversibleBackend::new(fake.clone());
+        let backend = ReversibleBackend::new(fake.clone(), snapshot_dir());
         let record = backend
             .exec(request_for("setprop debug.foo 1"))
             .await
@@ -1157,7 +2206,7 @@ mod tests {
             ("setprop debug.foo 1", ""),
             ("setprop debug.foo 2", ""),
         ]);
-        let backend = ReversibleBackend::new(fake.clone());
+        let backend = ReversibleBackend::new(fake.clone(), snapshot_dir());
         // The first capture sees 0; after the first write the second capture sees 1, which the
         // fake cannot model from a static table — so the second read is answered explicitly.
         backend
@@ -1167,7 +2216,11 @@ mod tests {
         let undo_b = {
             let mut plan_b = plan("setprop debug.foo 2");
             let capture = plan_b.captures.remove(0);
-            undo_for(&capture, Some("1"), &request_for("setprop debug.foo 2"))
+            undo_for(
+                &capture,
+                Some(PreState::Value("1".to_string())),
+                &request_for("setprop debug.foo 2"),
+            )
         };
         if let UndoResult::Undo(undo) = undo_b {
             backend.ledger().lock().unwrap().record(undo);
@@ -1179,7 +2232,7 @@ mod tests {
             .unwrap()
             .pending()
             .iter()
-            .map(|u| u.inverse.clone())
+            .map(|u| u.inverse_script().unwrap().to_string())
             .collect();
         assert_eq!(
             before,
@@ -1199,7 +2252,7 @@ mod tests {
     #[tokio::test]
     async fn a_failing_restore_stays_pending_and_is_reported() {
         let fake = Fake::with_failing("setprop 'debug.foo' '0'", &[("getprop 'debug.foo'", "0")]);
-        let backend = ReversibleBackend::new(fake.clone());
+        let backend = ReversibleBackend::new(fake.clone(), snapshot_dir());
         backend
             .exec(request_for("setprop debug.foo 1"))
             .await
@@ -1228,7 +2281,7 @@ mod tests {
     #[tokio::test]
     async fn keeping_a_change_is_an_explicit_act() {
         let fake = Fake::answering(&[("getprop 'persist.sys.demo'", "")]);
-        let backend = ReversibleBackend::new(fake.clone());
+        let backend = ReversibleBackend::new(fake.clone(), snapshot_dir());
         backend
             .exec(request_for("setprop persist.sys.demo 1"))
             .await
@@ -1253,7 +2306,7 @@ mod tests {
     #[tokio::test]
     async fn what_cannot_be_undone_is_still_known_at_teardown() {
         let fake = Fake::answering(&[]);
-        let backend = ReversibleBackend::new(fake.clone());
+        let backend = ReversibleBackend::new(fake.clone(), snapshot_dir());
         backend
             .exec(request_for(
                 "am broadcast -a android.intent.action.BOOT_COMPLETED",
@@ -1276,7 +2329,7 @@ mod tests {
     #[tokio::test]
     async fn one_session_s_teardown_does_not_touch_another_s() {
         let fake = Fake::answering(&[("getprop 'debug.foo'", "0")]);
-        let backend = ReversibleBackend::new(fake.clone());
+        let backend = ReversibleBackend::new(fake.clone(), snapshot_dir());
         let mut other = ExecRequest::new(
             Capability::ShellWrite,
             "setprop debug.foo 1",

@@ -226,7 +226,7 @@ Both crates are plain Rust libraries with no platform-specific code, so they bui
 
 ```bash
 cargo build                                        # build
-cargo test                                         # 477 tests (android unit 293 + contract 83 + contract integration 27 + rule conformance 43 + real-process 13 + device ground truth 15)
+cargo test                                         # 477 tests (android unit 293 + contract 86 + contract integration 27 + rule conformance 43 + real-process 13 + device ground truth 15)
 cargo clippy --all-targets -- -D warnings          # upstream CI convention; must be warning-free
 cargo fmt --check
 ```

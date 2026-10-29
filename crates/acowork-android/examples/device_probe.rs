@@ -137,6 +137,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
         report_rollback(&profile, &transport).await;
         println!("\n── 10. §4.6.4 write → restore round trip ──────────");
         report_rollback_roundtrip(&profile, &transport).await?;
+        println!("\n── 11. §4.6.4 file snapshot round trip ────────────");
+        report_file_snapshot(&profile, &transport).await?;
     }
 
     Ok(())
@@ -362,6 +364,38 @@ async fn report_exec(profile: &HostProfile, transport: &AdbTransport) {
 /// Printed rather than asserted, because the device decides whether there is anything to
 /// check: a quiet log window means the path was not exercised, and saying so out loud is
 /// worth more than a green line that proved nothing.
+/// Where the harness keeps file snapshots.
+///
+/// A node would pass its Agent workspace — §4.6.4 names that as where a backup goes. The
+/// harness has no workspace, so it prints the path instead of pretending it is somewhere else.
+fn snapshot_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("acowork-probe-snapshots")
+}
+
+/// A backend chain that can write: the shell tier alone declares reads, and §4.6.4 cannot be
+/// demonstrated on a device that refuses every write.
+async fn writable_chain(
+    profile: &HostProfile,
+    transport: &AdbTransport,
+    sink: std::sync::Arc<dyn acowork_android::host::AuditSink>,
+) -> Result<ReversibleBackend, Box<dyn Error>> {
+    let mut granted = profile.clone();
+    // Both halves of the write tier: a property write and a file write are different claims, and
+    // the gate refuses a `shell:write` label on a redirect — which is the harness being told the
+    // truth rather than a bug to route around.
+    for capability in [Capability::ShellWrite, Capability::FsOutsideApp] {
+        granted
+            .caps
+            .declare(capability.id())
+            .map_err(|e| format!("cannot hand-declare {}: {e}", capability.id()))?;
+    }
+    use std::sync::Arc;
+    let shell: Arc<dyn ExecutionBackend> =
+        Arc::new(ShellBackend::with_runner(granted, transport.clone())?);
+    let audited: Arc<dyn ExecutionBackend> = Arc::new(AuditedBackend::new(shell, sink));
+    Ok(ReversibleBackend::new(audited, snapshot_dir()))
+}
+
 /// What §4.6.4 would remember before a write, and what it would run at session end.
 ///
 /// **No write is executed here.** The point of the section is the pre-state capture and the
@@ -387,6 +421,16 @@ async fn report_rollback(profile: &HostProfile, transport: &AdbTransport) {
         println!("\n  {script}");
         let plan = acowork_android::host::plan_rollback(script);
         for capture in &plan.captures {
+            // A file capture is a two-read protocol that ends in a snapshot *file*, so it is
+            // demonstrated for real in the round-trip section below rather than half-shown here.
+            if matches!(capture.target, acowork_android::host::UndoTarget::File(_)) {
+                println!(
+                    "    {} would be measured with `{}` and then snapshotted at execution time",
+                    capture.target.describe(),
+                    capture.read
+                );
+                continue;
+            }
             let request = ExecRequest::read(capture.read.clone(), "harness-session");
             let observed = match backend.exec(request).await {
                 Ok(r) if r.succeeded() => Some(r.stdout),
@@ -413,12 +457,16 @@ async fn report_rollback(profile: &HostProfile, transport: &AdbTransport) {
                 "harness-session",
             );
             request.approval_token = Some(acowork_android::host::ApprovalToken::new("harness"));
-            match acowork_android::host::undo_for(capture, observed.as_deref(), &request) {
+            match acowork_android::host::undo_for(
+                capture,
+                observed.map(acowork_android::host::PreState::Value),
+                &request,
+            ) {
                 acowork_android::host::UndoResult::Undo(undo) => {
                     println!(
                         "    pre-state {:?}  ->  would restore with `{}`{}",
                         undo.old_value,
-                        undo.inverse,
+                        undo.inverse_script().unwrap_or("<restore from snapshot>"),
                         if undo.faithful {
                             String::new()
                         } else {
@@ -688,7 +736,7 @@ async fn report_rollback_roundtrip(
     // session that leaves no trace.
     let audited: Arc<dyn ExecutionBackend> =
         Arc::new(AuditedBackend::new(shell.clone(), sink.clone()));
-    let chain = ReversibleBackend::new(Arc::clone(&audited));
+    let chain = ReversibleBackend::new(Arc::clone(&audited), snapshot_dir());
 
     // Observers read through the audit decorator but not through the rollback decorator: an
     // observation must not add ledger entries, and nothing that touches the device should
@@ -775,7 +823,7 @@ async fn report_rollback_roundtrip(
         Arc::new(ShellBackend::with_runner(grant_profile, transport.clone())?);
     let grant_audited: Arc<dyn ExecutionBackend> =
         Arc::new(AuditedBackend::new(grant_shell, sink.clone()));
-    let roundtrip = ReversibleBackend::new(grant_audited);
+    let roundtrip = ReversibleBackend::new(grant_audited, snapshot_dir());
 
     let before = read_prop(&audited, prop).await;
     println!("  {prop} before  = {before:?}");
@@ -918,6 +966,279 @@ async fn report_rollback_roundtrip(
             outcome,
         );
     }
+    Ok(())
+}
+
+/// §4.6.4's file half, run against the device: write a binary file, overwrite it, put it back.
+///
+/// Binary content is the point of using `\000` and `\377` rather than a text file. The exec
+/// channel decodes stdout as text (`String::from_utf8_lossy`), so a file read through it is
+/// *not* the file — which is why the snapshot travels as base64 and why the restore ends with a
+/// digest comparison rather than a zero exit code.
+async fn report_file_snapshot(
+    profile: &HostProfile,
+    transport: &AdbTransport,
+) -> Result<(), Box<dyn Error>> {
+    use std::sync::Arc;
+
+    use acowork_android::host::ApprovalToken;
+
+    let session = "harness-files";
+    let path = "/data/local/tmp/acowork-snap.bin";
+    let sink = Arc::new(MemoryAuditSink::new());
+    let chain = writable_chain(profile, transport, sink.clone()).await?;
+    let observer: Arc<dyn ExecutionBackend> = Arc::new(ShellBackend::with_runner(
+        profile.clone(),
+        transport.clone(),
+    )?);
+
+    async fn observe(shell: &Arc<dyn ExecutionBackend>, script: String) -> String {
+        match shell
+            .exec(ExecRequest::read(script, "harness-observer"))
+            .await
+        {
+            Ok(r) if r.succeeded() => r.stdout.trim().to_string(),
+            Ok(r) => format!("<exit {:?}: {}>", r.exit_code, r.stderr.trim()),
+            Err(e) => format!("<{e}>"),
+        }
+    }
+    async fn write(chain: &ReversibleBackend, script: &str, session: &str) -> Result<(), String> {
+        // Claim what the classifier says the script actually needs, the same way §9 does: a
+        // redirect is an `fs:outside-app` write, and mislabelling it is refused, not ignored.
+        let claimed = acowork_android::host::classify_script(script)
+            .strongest()
+            .capability()
+            .unwrap_or(Capability::ShellWrite);
+        let mut request = ExecRequest::new(claimed, script.to_string(), session);
+        request.approval_token = Some(ApprovalToken::new("harness"));
+        chain
+            .exec(request)
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("{e}"))
+    }
+
+    // 1. Create a file that was not there. The observed pre-state is *absence*, so the undo is
+    //    a removal, not a restore.
+    let create = format!("printf 'A\\000\\377\\033B' > {path}");
+    write(&chain, &create, session).await?;
+    let created = observe(&observer, format!("wc -c < {path}")).await;
+    let created_digest = observe(&observer, format!("sha256sum < {path}")).await;
+    println!(
+        "  created   {path} = {created} bytes, digest {:?}",
+        created_digest.split_whitespace().next().unwrap_or("")
+    );
+    println!(
+        "  ledger after the create: {} undo(s), first is `{}`",
+        pending_for(&chain, session),
+        chain
+            .ledger()
+            .lock()
+            .map(|l| l
+                .pending_for(session)
+                .first()
+                .and_then(|u| u.inverse_script())
+                .unwrap_or("<snapshot>")
+                .to_string())
+            .unwrap_or_default()
+    );
+
+    // 2. Overwrite it. Now the pre-state is the binary content, and the snapshot has to survive
+    //    base64, the host filesystem, chunking and the shell's quoting — and be checked.
+    let overwrite = format!("echo overwritten > {path}");
+    write(&chain, &overwrite, session).await?;
+    println!(
+        "  overwrote {path} = {} bytes ({:?})",
+        observe(&observer, format!("wc -c < {path}")).await,
+        observe(&observer, format!("head -c 32 {path} | tr -d '\\n'")).await
+    );
+
+    let ledger = chain.ledger();
+    let entries = ledger
+        .lock()
+        .map(|l| {
+            l.pending_for(session)
+                .iter()
+                .map(|u| match &u.action {
+                    acowork_android::host::UndoAction::Script(script) => {
+                        format!("{} -> script `{script}`", u.target.describe())
+                    }
+                    acowork_android::host::UndoAction::Snapshot {
+                        snapshot,
+                        bytes,
+                        digest,
+                    } => format!(
+                        "{} -> snapshot {} ({} device bytes, sha256 {})",
+                        u.target.describe(),
+                        snapshot.display(),
+                        bytes,
+                        digest.chars().take(12).collect::<String>()
+                    ),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    drop(ledger);
+    for entry in &entries {
+        println!("  pending: {entry}");
+    }
+    let snapshots: Vec<_> = std::fs::read_dir(snapshot_dir())
+        .map(|rd| rd.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    println!(
+        "  workspace copies: {} file(s) under {}",
+        snapshots.len(),
+        snapshot_dir().display()
+    );
+
+    // 3. Tear the session down. LIFO again: the overwrite is undone first (the binary content
+    //    comes back), then the create (the file is removed). Restoring in record order would
+    //    leave the binary file sitting there after a session that created it.
+    let report = chain.restore(session).await;
+    println!(
+        "  restore: {} applied, {} failed{}",
+        report.restored.len(),
+        report.failed.len(),
+        if report.clean() {
+            ""
+        } else {
+            "  <-- NOT CLEAN"
+        }
+    );
+    for (what, why) in &report.failed {
+        println!("    failed {what}: {why}");
+    }
+    println!(
+        "  {path} after teardown: {}",
+        observe(
+            &observer,
+            format!("test -e {path} && echo STILL_THERE || echo absent")
+        )
+        .await
+    );
+    println!(
+        "  staging leftovers: {}",
+        observe(
+            &observer,
+            "ls /data/local/tmp/.acowork-snap-* 2>/dev/null | wc -l".to_string()
+        )
+        .await
+    );
+    println!(
+        "  workspace copies after a verified restore: {}",
+        std::fs::read_dir(snapshot_dir())
+            .map(|rd| rd.flatten().count())
+            .unwrap_or(0)
+    );
+
+    // 4. More than one chunk. The budget allows a 64 KiB file, whose base64 is ~87 KiB, and the
+    //    measured argument ceiling on this device is ~110 KiB — so a real restore of a real file
+    //    is *always* chunked, and this is the path that has never run on hardware before.
+    let chunked = "/data/local/tmp/acowork-snap-many.bin";
+    let big = 60 * 1024;
+    write(
+        &chain,
+        &format!("head -c {big} /dev/urandom > {chunked}"),
+        session,
+    )
+    .await?;
+    let big_digest = observe(&observer, format!("sha256sum < {chunked}")).await;
+    // Declare the *creation* permanent, so the teardown below has exactly one job: put the
+    // content back. Left in the ledger, LIFO would also undo the create and remove the file —
+    // correct behaviour that would make this demonstration look like a failure.
+    let kept = chain
+        .ledger()
+        .lock()
+        .map(|mut l| {
+            l.keep(
+                session,
+                &acowork_android::host::UndoTarget::File(chunked.to_string()),
+            )
+        })
+        .unwrap_or(false);
+    println!("  declared the create permanent (kept: {kept}) — only the content is undoable");
+    write(&chain, &format!("echo squashed > {chunked}"), session).await?;
+    println!(
+        "  wrote a {big}-byte file (digest {:?}), then overwrote it with 9 bytes",
+        big_digest.split_whitespace().next().unwrap_or("")
+    );
+    let report = chain.restore(session).await;
+    println!(
+        "  restore of the multi-chunk snapshot: {} applied, {} failed{}",
+        report.restored.len(),
+        report.failed.len(),
+        if report.clean() {
+            ""
+        } else {
+            "  <-- NOT CLEAN"
+        }
+    );
+    for (what, why) in &report.failed {
+        println!("    failed {what}: {why}");
+    }
+    let after = observe(&observer, format!("sha256sum < {chunked}")).await;
+    println!(
+        "  {chunked} is now {} bytes, digest {:?} — the pre-write digest was {:?}. The restore \
+         reports success only when those match, so a chunk lost in transit is a failure here, \
+         not a quietly short file",
+        observe(&observer, format!("wc -c < {chunked}")).await,
+        after.split_whitespace().next().unwrap_or("").to_string(),
+        big_digest
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    );
+    write(&chain, &format!("rm -f {chunked}"), session).await?;
+
+    // 5. The refusal path, which is the half that keeps a promise this port cannot make from
+    //    being made silently. A file over the snapshot budget is still written — the budget is
+    //    about backups, not about permission — but the session ends by naming it.
+    let big = "/data/local/tmp/acowork-snap-big.bin";
+    let over = acowork_android::host::SNAPSHOT_BUDGET_BYTES + 1;
+    write(
+        &chain,
+        &format!("head -c {over} /dev/urandom > {big}"),
+        session,
+    )
+    .await?;
+    let before = chain
+        .ledger()
+        .lock()
+        .map(|l| l.pending_for(session).len())
+        .unwrap_or(0);
+    write(&chain, &format!("echo too_big > {big}"), session).await?;
+    let after = chain
+        .ledger()
+        .lock()
+        .map(|l| l.pending_for(session).len())
+        .unwrap_or(0);
+    let left = chain
+        .ledger()
+        .lock()
+        .map(|l| {
+            l.leaving_behind(session)
+                .iter()
+                .map(|u| format!("{}: {}", u.command, u.why))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    println!(
+        "  a {over}-byte file: undos went {} -> {}, so the write is permanent unless declared",
+        before, after
+    );
+    for why in left {
+        println!("    left behind — {why}");
+    }
+    write(&chain, &format!("rm -f {big}"), session).await?;
+    let report = chain.restore(session).await;
+    println!(
+        "  cleanup: {} applied, {} failed, {} still pending",
+        report.restored.len(),
+        report.failed.len(),
+        report.still_pending_elsewhere
+    );
+    println!("  audit records for the whole file session: {}", sink.len());
     Ok(())
 }
 

@@ -351,8 +351,44 @@ pub fn classify(script: &str) -> Verdict {
 /// what `setprop a 'b c'` is, and the disagreement would surface as a rollback that restores
 /// the wrong value.
 pub fn words(script: &str) -> Option<Vec<Vec<String>>> {
+    Some(
+        parsed(script)?
+            .into_iter()
+            .map(|command| command.words)
+            .collect(),
+    )
+}
+
+/// One command of a script: its words, and the file its output goes to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedCommand {
+    /// Every word, in shell order, including the command word and any leading `NAME=value`.
+    pub words: Vec<String>,
+    /// The file this command redirects output into, when it writes one.
+    ///
+    /// `/dev/null` and descriptor duplication (`>&1`, `2>&1`) are `None`: neither leaves
+    /// anything where a later reader can find it, so neither has a previous state to restore.
+    pub redirect: Option<String>,
+}
+
+/// The script's commands *and* their redirections.
+///
+/// [`words`] alone is not enough for a rollback planner: `echo x > /data/local/tmp/hosts`
+/// changes a file that appears nowhere in the argument vector, and a planner that cannot see
+/// the target cannot snapshot it. The redirection is read from the same `Command` the
+/// classifier used, so the tier decision and the rollback decision cannot disagree about
+/// which file a script touched.
+pub fn parsed(script: &str) -> Option<Vec<ParsedCommand>> {
     let commands = lex(script).and_then(split).ok()?;
-    Some(commands.into_iter().map(|c| c.words).collect())
+    Some(
+        commands
+            .into_iter()
+            .map(|command| ParsedCommand {
+                redirect: command.writes().map(str::to_string),
+                words: command.words,
+            })
+            .collect(),
+    )
 }
 
 /// Classify and check the claim in one step.

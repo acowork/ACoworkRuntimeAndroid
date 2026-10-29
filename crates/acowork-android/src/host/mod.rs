@@ -102,8 +102,9 @@ pub use probe::{
 };
 pub use profile::{HostCapabilitySummary, HostProfile, HostProfileName, ShellPaths};
 pub use rollback::{
-    Capture, Plan, RestoreReport, ReversibleBackend, RollbackLedger, Undo, UndoResult, UndoTarget,
-    Unundoable, Writing, plan as plan_rollback, undo_for,
+    Capture, FilePreState, Plan, PreState, RestoreReport, ReversibleBackend, RollbackLedger,
+    SNAPSHOT_BUDGET_BYTES, SNAPSHOT_CHUNK_BYTES, SNAPSHOT_STAGING_DIR, SnapshotStore, Undo,
+    UndoAction, UndoResult, UndoTarget, Unundoable, Writing, plan as plan_rollback, undo_for,
 };
 pub use script::{
     Identity, PreparedScript, ScriptError, extract_identity, is_valid_env_key, next_nonce,
