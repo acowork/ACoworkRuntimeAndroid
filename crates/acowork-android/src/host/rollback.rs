@@ -808,7 +808,7 @@ fn undo_for_file(
             )
         }
         FilePreState::TooBig { bytes } => UndoResult::CannotUndo(format!(
-            "file {path} holds {bytes} bytes, over the {SNAPSHOT_BUDGET_BYTES}-byte snapshot \
+            "holds {bytes} bytes, over the {SNAPSHOT_BUDGET_BYTES}-byte snapshot \
              budget; a truncated backup is a second change, so nothing was saved, and this \
              write will still be there when the session ends"
         )),

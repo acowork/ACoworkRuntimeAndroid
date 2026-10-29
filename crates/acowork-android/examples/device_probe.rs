@@ -378,7 +378,7 @@ async fn writable_chain(
     profile: &HostProfile,
     transport: &AdbTransport,
     sink: std::sync::Arc<dyn acowork_android::host::AuditSink>,
-) -> Result<ReversibleBackend, Box<dyn Error>> {
+) -> Result<std::sync::Arc<ReversibleBackend>, Box<dyn Error>> {
     let mut granted = profile.clone();
     // Both halves of the write tier: a property write and a file write are different claims, and
     // the gate refuses a `shell:write` label on a redirect — which is the harness being told the
@@ -392,8 +392,10 @@ async fn writable_chain(
     use std::sync::Arc;
     let shell: Arc<dyn ExecutionBackend> =
         Arc::new(ShellBackend::with_runner(granted, transport.clone())?);
-    let audited: Arc<dyn ExecutionBackend> = Arc::new(AuditedBackend::new(shell, sink));
-    Ok(ReversibleBackend::new(audited, snapshot_dir()))
+    // The order of the decorators is the library's decision (`host::chain`), not something a
+    // harness should get to re-derive — a harness that nests them the other way would still
+    // demonstrate a restore, just one that no log ever saw.
+    Ok(acowork_android::host::wrap(shell, sink, snapshot_dir()))
 }
 
 /// What §4.6.4 would remember before a write, and what it would run at session end.

@@ -56,6 +56,7 @@ pub mod audit;
 pub mod backend;
 pub mod backends;
 pub mod capability;
+pub mod chain;
 pub mod commands;
 pub mod denial;
 pub mod facts;
@@ -84,6 +85,7 @@ pub use backends::{AppSandboxBackend, RootShellBackend, ShellBackend};
 pub use capability::{
     Capability, PLATFORM, android_vocabulary, derive_claims, explain_absence, lookup,
 };
+pub use chain::{root_shell, shell, shell_with_runner, wrap};
 pub use commands::{
     Effect, Finding, Refusal, RefusalKind, Verdict, check as check_script,
     classify as classify_script,
