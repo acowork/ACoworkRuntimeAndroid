@@ -1317,6 +1317,7 @@ async fn report_evidence_capture(
         &backend,
         &EvidenceSource::Logcat {
             buffer: None,
+            filter: vec![],
             tail: Some(400),
         },
         session,
@@ -1336,6 +1337,34 @@ async fn report_evidence_capture(
             );
         }
         Err(e) => println!("  logcat -d -t 400 FAILED: {e}"),
+    }
+
+    // 2b. The same capture filtered. §4.6 item 6 asks for "buffer / filter", and a filter that
+    // only works in a unit test is not the item. `*:S` silences everything, so a successful
+    // capture here is one whose artifact is *supposed* to be nearly empty.
+    match capture_evidence(
+        &backend,
+        &EvidenceSource::Logcat {
+            buffer: None,
+            filter: vec!["*:S".to_string(), "SystemServer:V".to_string()],
+            tail: None,
+        },
+        session,
+        &dir,
+        Some(&token),
+        DEFAULT_EVIDENCE_BUDGET,
+    )
+    .await
+    {
+        Ok(artifact) => {
+            let text = std::fs::read_to_string(&artifact.host_path)?;
+            println!(
+                "  logcat -d '*:S' 'SystemServer:V' -> {} bytes, {} lines (a silenced filter spec producing an empty artifact is the correct answer, not a failure)",
+                artifact.bytes,
+                text.lines().count()
+            );
+        }
+        Err(e) => println!("  filtered logcat FAILED: {e}"),
     }
 
     // 3. The two sources that are names without contents on a `user` build. The point of these

@@ -25,6 +25,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::host::commands::{self, READ_TIER_COMMANDS, WRITE_TIER_COMMANDS};
+use crate::host::evidence::{EVIDENCE_CHUNK_BYTES, EVIDENCE_STAGING_DIR};
 use crate::host::facts::{Privilege, SelinuxState, ShellDialect};
 use crate::host::profile::HostProfile;
 
@@ -202,8 +203,9 @@ fn evidence_block(profile: &HostProfile) -> String {
         // different probe from the path walk, and an unanswered `/data/anr` says nothing about
         // whether `bugreportz` is installed.
         return format!(
-            "Evidence: no evidence source was probed, so availability is unknown.{}",
-            bugreportz_note(profile)
+            "Evidence: no evidence source was probed, so availability is unknown.{}\n{}",
+            bugreportz_note(profile),
+            capture_note(profile)
         );
     }
     let mut parts = Vec::new();
@@ -221,11 +223,44 @@ fn evidence_block(profile: &HostProfile) -> String {
         ),
         None => " The `dumpsys` service inventory was not answered.".to_string(),
     };
+    // The capture note goes on its own line. Not for tidiness: the sentence above names each
+    // source with its measured access, and a test (and a reader) must be able to check that no
+    // locked source is called available on the line that names it.
     format!(
-        "Evidence: {}.{}{}",
+        "Evidence: {}.{}{}\n{}",
         parts.join("; "),
         inventory,
-        bugreportz_note(profile)
+        bugreportz_note(profile),
+        capture_note(profile)
+    )
+}
+
+/// Whether this host can bring an artifact back, and what that costs.
+///
+/// Staging is a write, so the claim is conditioned on a measured fact — a writable location the
+/// probe confirmed — rather than on the module existing. Advertising a capture action on a
+/// device where it cannot run is how a model spends a retry.
+fn capture_note(profile: &HostProfile) -> String {
+    let stages = profile
+        .fs_roots
+        .iter()
+        .any(|root| root.writable && EVIDENCE_STAGING_DIR.starts_with(root.path.as_str()));
+    if !stages {
+        return format!(
+            "Capturing an artifact is not offered here: it stages bytes under \
+             {EVIDENCE_STAGING_DIR} first, and no writable location was confirmed there."
+        );
+    }
+    // Stated as a rate, not as a size: the chunk size is this port's constant, the artifact
+    // size is the device's business.
+    format!(
+        "Capture: a source that yields content comes back as a file in the Agent workspace \
+         (a source that does not is named above, and capturing one of those is a refusal, not \
+         an empty file). Bytes travel base64 because this channel decodes stdout as text — \
+         reading a binary through it is not reading it — at one command per {} KiB, and the \
+         artifact is kept only if it hashes to the digest the device computed before the \
+         transfer.",
+        EVIDENCE_CHUNK_BYTES / 1024
     )
 }
 
@@ -563,6 +598,64 @@ mod tests {
                 "{claim} claimed for a locked source"
             );
         }
+    }
+
+    /// The capture note is a claim about *this* device, so it is conditioned on the measured
+    /// writable root rather than on the module existing in the crate.
+    #[test]
+    fn capture_is_offered_only_where_staging_was_measured_writable() {
+        let mut p = system_shell();
+        p.fs_roots = vec![crate::host::facts::FsRoot {
+            path: "/data/local/tmp".to_string(),
+            writable: true,
+            own_package: false,
+        }];
+        let text = shell_tools(&p)[0].description.clone();
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("Capture:"))
+            .unwrap_or_default();
+        assert!(line.contains("Agent workspace"), "{text}");
+        assert!(
+            line.contains("one command per 256 KiB"),
+            "the cost is stated as a rate the reader can apply to any artifact: {line}"
+        );
+
+        // The same profile with a staging directory nobody confirmed.
+        p.fs_roots = vec![crate::host::facts::FsRoot {
+            path: "/data/local/tmp".to_string(),
+            writable: false,
+            own_package: false,
+        }];
+        let text = shell_tools(&p)[0].description.clone();
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("Capturing an artifact"))
+            .unwrap_or_default();
+        assert!(line.contains("not offered"), "{text}");
+        assert!(!line.contains("available"), "{line}");
+    }
+
+    /// A locked source and the word "available" must not share a line, which is why the capture
+    /// note is its own line rather than a clause of the evidence sentence.
+    #[test]
+    fn the_capture_note_does_not_land_on_the_line_that_names_a_locked_source() {
+        let mut p = system_shell();
+        p.fs_roots = vec![crate::host::facts::FsRoot {
+            path: "/data/local/tmp".to_string(),
+            writable: true,
+            own_package: false,
+        }];
+        p.evidence.sources.insert(
+            crate::host::facts::EvidencePath::Anr,
+            crate::host::facts::EvidenceAccess::Listable,
+        );
+        let text = shell_tools(&p)[0].description.clone();
+        let anr_line = text.lines().find(|l| l.contains("/data/anr")).unwrap();
+        assert!(
+            !anr_line.contains("Capture"),
+            "the capture sentence leaked onto the source line: {anr_line}"
+        );
     }
 
     #[test]

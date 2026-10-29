@@ -83,11 +83,16 @@ pub const QUICK_TIMEOUT: Duration = Duration::from_secs(30);
 pub enum Source {
     /// `screencap -p` — the current display as a PNG.
     Screenshot,
-    /// `logcat -d`, optionally one buffer and optionally only the last N lines.
+    /// `logcat -d`, optionally one buffer, optionally filtered, optionally only the last N
+    /// lines.
     Logcat {
         /// `main` / `system` / `crash` / `radio` / `events` / `kernel`, or `None` for the
         /// default set.
         buffer: Option<String>,
+        /// `tag:priority` specs, e.g. `["ActivityManager:V", "*:S"]`. §4.6 item 6 asks for
+        /// "buffer / filter", and a filter is the only part of `logcat` that a caller is
+        /// likely to want to *narrow* rather than widen.
+        filter: Vec<String>,
         /// `-t <n>`: the last n lines. `None` is the whole buffer, which on the measured device
         /// was 878 KiB.
         tail: Option<u32>,
@@ -113,7 +118,7 @@ impl Source {
     fn slug(&self) -> String {
         match self {
             Source::Screenshot => "screenshot".to_string(),
-            Source::Logcat { buffer, tail } => match (buffer, tail) {
+            Source::Logcat { buffer, tail, .. } => match (buffer, tail) {
                 (Some(b), Some(n)) => format!("logcat-{b}-{n}"),
                 (Some(b), None) => format!("logcat-{b}"),
                 (None, Some(n)) => format!("logcat-{n}"),
@@ -157,7 +162,11 @@ impl Source {
     fn stage_script(&self, stage: &str) -> Result<String, CaptureError> {
         match self {
             Source::Screenshot => Ok(format!("screencap -p > {}", quote_posix(stage))),
-            Source::Logcat { buffer, tail } => {
+            Source::Logcat {
+                buffer,
+                filter,
+                tail,
+            } => {
                 let mut script = String::from("logcat -d");
                 if let Some(b) = buffer {
                     let b = safe_name(b, "logcat buffer")?;
@@ -165,6 +174,13 @@ impl Source {
                 }
                 if let Some(n) = tail {
                     script.push_str(&format!(" -t {n}"));
+                }
+                // Filter specs are positional, so they come after the options. `*:S` is the
+                // common shape and `*` is exactly what a shell expands, so each one is quoted
+                // rather than trusted to arrive without metacharacters.
+                for spec in filter {
+                    let spec = safe_filter(spec)?;
+                    script.push_str(&format!(" {}", quote_posix(&spec)));
                 }
                 script.push_str(&format!(" > {}", quote_posix(stage)));
                 Ok(script)
@@ -183,13 +199,22 @@ impl Source {
     pub fn describe(&self) -> String {
         match self {
             Source::Screenshot => "screencap -p".to_string(),
-            Source::Logcat { buffer, tail } => format!(
-                "logcat -d{}{}",
+            Source::Logcat {
+                buffer,
+                filter,
+                tail,
+            } => format!(
+                "logcat -d{}{}{}",
                 buffer
                     .as_ref()
                     .map(|b| format!(" -b {b}"))
                     .unwrap_or_default(),
-                tail.map(|n| format!(" -t {n}")).unwrap_or_default()
+                tail.map(|n| format!(" -t {n}")).unwrap_or_default(),
+                if filter.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", filter.join(" "))
+                }
             ),
             Source::Dumpsys { service } => format!("dumpsys {service}"),
             Source::DeviceFile { path } => format!("read {path}"),
@@ -342,6 +367,35 @@ fn safe_name(value: &str, what: &str) -> Result<String, CaptureError> {
         Err(CaptureError::UnsafeName {
             value: value.to_string(),
             what: what.to_string(),
+        })
+    }
+}
+
+/// A `logcat` filter spec: `tag:priority`, where the tag is a word or `*`.
+///
+/// Priorities are the six letters `logcat` itself accepts. Anything else is refused, including
+/// a bare `tag` — a spec without a priority is a tag filter in some versions and a syntax error
+/// in others, and an artifact that came back empty because of a version difference reads as
+/// "there were no matching lines".
+fn safe_filter(spec: &str) -> Result<String, CaptureError> {
+    let Some((tag, priority)) = spec.split_once(':') else {
+        return Err(CaptureError::UnsafeName {
+            value: spec.to_string(),
+            what: "logcat filter (want `tag:priority`, e.g. `ActivityManager:V`)".to_string(),
+        });
+    };
+    let tag_ok = tag == "*"
+        || (!tag.is_empty()
+            && tag
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')));
+    let priority_ok = matches!(priority, "V" | "D" | "I" | "W" | "E" | "F" | "S");
+    if tag_ok && priority_ok {
+        Ok(spec.to_string())
+    } else {
+        Err(CaptureError::UnsafeName {
+            value: spec.to_string(),
+            what: "logcat filter (tag:priority, priority in V D I W E F S)".to_string(),
         })
     }
 }
@@ -1039,6 +1093,19 @@ mod tests {
                 "`{script}` must read, not write"
             );
         }
+        // A filter spec is the one part of `logcat` a caller supplies that lands as a
+        // positional argument, and `*:S` is the shape everyone writes.
+        let filtered = format!(
+            "logcat -d -b main -t 100 {} {} > {}",
+            quote_posix("ActivityManager:V"),
+            quote_posix("*:S"),
+            quote_posix(stage)
+        );
+        assert_eq!(
+            classify_script(&filtered).strongest(),
+            Effect::FileWrite,
+            "`{filtered}`"
+        );
         // Staging is a write, and the module claims it as one rather than hiding it.
         let staged = format!("screencap -p > {}", quote_posix(stage));
         assert_eq!(
@@ -1072,5 +1139,51 @@ mod tests {
         // And its base64 still fits under one output cap, which is what sets the chunk size.
         let encoded = (tail as usize).div_ceil(3) * 4;
         assert!(encoded < crate::host::DEFAULT_OUTPUT_CAP);
+    }
+
+    /// `*:S` is the shape everyone writes, and `*` is the character a shell expands.
+    #[tokio::test]
+    async fn a_filter_spec_is_quoted_rather_than_handed_to_the_shell() {
+        let device = device();
+        let dir = dir("filter");
+        capture_on(
+            &device,
+            &Source::Logcat {
+                buffer: Some("main".to_string()),
+                filter: vec!["ActivityManager:V".to_string(), "*:S".to_string()],
+                tail: Some(100),
+            },
+            "s-7",
+            &dir,
+            DEFAULT_EVIDENCE_BUDGET,
+        )
+        .await
+        .unwrap();
+        let staged = device
+            .scripts()
+            .iter()
+            .find_map(|s| redirect_target(s))
+            .expect("a staging path was written");
+        let script = device
+            .scripts()
+            .into_iter()
+            .find(|s| s.ends_with(&format!("> {}", quote_posix(&staged))))
+            .unwrap();
+        assert!(
+            script.contains("'ActivityManager:V' '*:S'"),
+            "both specs quoted, in order, after the options: {script}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_filter_spec_without_a_priority_is_refused() {
+        // Not pedantry: `logcat ActivityManager` filters by tag on some releases and is a
+        // syntax error on others, and the empty artifact that comes back from the second one
+        // looks exactly like "no matching lines" from the first.
+        assert!(safe_filter("ActivityManager").is_err());
+        assert!(safe_filter("tag:Q").is_err());
+        assert!(safe_filter("*:S").is_ok());
+        assert!(safe_filter("SystemServer:W").is_ok());
     }
 }
