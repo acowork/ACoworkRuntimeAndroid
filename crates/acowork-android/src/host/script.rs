@@ -134,7 +134,7 @@ const NONCE_LEN: usize = 20;
 /// Deliberately shape-based rather than position-based — it looks for the one 20-character
 /// lowercase-hex token on the prologue line instead of counting quotes — so it keeps working
 /// if the `printf` argument order changes. The coupling is not trusted:
-/// [`tests::nonce_of_recovers_the_nonce_from_every_generated_script`] generates scripts in a
+/// `tests::nonce_of_recovers_the_nonce_from_every_generated_script` generates scripts in a
 /// loop and checks this against the nonce `prepare` itself reported, which fails the moment
 /// the two disagree.
 pub fn nonce_of(script: &str) -> Option<&str> {

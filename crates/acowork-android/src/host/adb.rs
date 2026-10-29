@@ -10,8 +10,8 @@
 //!
 //! The alternative — a `.sh` file that runs the probe commands and greps the output — is
 //! shorter, and it proves nothing. It would exercise its own parsing rather than
-//! [`script`]'s, its own timeout rather than [`run_captured`]'s, and its own idea of what a
-//! denial looks like rather than [`su_prompt_denied`]'s. Passing the device's real output
+//! `script`'s, its own timeout rather than `run_captured`'s, and its own idea of what a
+//! denial looks like rather than `su_prompt_denied`'s. Passing the device's real output
 //! through the same types the shipped node uses is what makes a green harness run *evidence*
 //! about production rather than evidence about the test.
 //!
@@ -365,7 +365,7 @@ impl SpawnRunner for AdbTransport {
     ///
     /// The argv is `env -i KEY=VALUE… <file> <args…>` — the device-side equivalent of
     /// `env_clear()` + `envs()`. Cap, deadline and bounded drain are literally the same
-    /// code path as the shipped runner, by way of [`run_captured`].
+    /// code path as the shipped runner, by way of `run_captured`.
     async fn spawn(&self, invocation: SpawnInvocation) -> Result<RawOutput, SpawnError> {
         let mut args = vec![RemoteArg::token(ENV_PROGRAM), RemoteArg::token("-i")];
         for (key, value) in &invocation.env {

@@ -28,7 +28,7 @@
 //! That split is not cosmetic. It is what fixed a real defect: this module used to answer
 //! "wrong path, privilege will not help" for an out-of-roots path on *every* host, which
 //! is false on a rooted device and steered the model away from the only fix that existed.
-//! The guard is now keyed on the host's [`EscalationModel`](acowork_platform_contract::EscalationModel),
+//! The guard is now keyed on the host's ``EscalationModel``,
 //! and the contract independently refuses to forward an `Escalate` remedy to a device
 //! that has no escalation — two layers, so the mistake cannot recur silently.
 //!
@@ -365,7 +365,7 @@ fn implied_capability(denial: &SelinuxDenial) -> crate::host::capability::Capabi
 ///
 /// The guard below is therefore keyed on whether the host can escalate, and the contract
 /// adds a second line of defence: [`acowork_platform_contract::Remedy::is_admissible`]
-/// rejects `Escalate` on a host whose [`EscalationModel`] is `None`, so even a
+/// rejects `Escalate` on a host whose `EscalationModel` is `None`, so even a
 /// mis-classification cannot tell a sandboxed device to do something it cannot do.
 pub fn classify(denial: &SelinuxDenial, profile: &HostProfile) -> Option<Diagnostic> {
     use acowork_platform_contract::EscalationModel;
@@ -476,7 +476,7 @@ pub fn classify(denial: &SelinuxDenial, profile: &HostProfile) -> Option<Diagnos
     )
 }
 
-/// The Android [`DiagnosticClassifier`]: `avc: denied` records in, contract remedies out.
+/// The Android `DiagnosticClassifier`: `avc: denied` records in, contract remedies out.
 ///
 /// This is where platform specificity legitimately lives. The contract never sees an
 /// SELinux domain, a `tclass` or a `permissive` flag; it sees a [`Remedy`]. A second

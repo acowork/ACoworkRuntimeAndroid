@@ -26,7 +26,7 @@
 //!
 //! The innermost backend is whichever one the tier earned; [`wrap`] does not know or care which,
 //! which is why it takes the inner backend as an argument. Tier differences belong to the
-//! [`HostProfile`](crate::host::HostProfile), not to the shape of the chain: a read-only profile
+//! [`HostProfile`], not to the shape of the chain: a read-only profile
 //! produces empty plans and unremarkable records, so there is no second, simpler chain worth
 //! maintaining — and two shapes would mean two chances to pick the one that loses the rollback.
 

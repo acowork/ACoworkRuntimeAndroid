@@ -229,6 +229,7 @@ cargo build                                        # build
 cargo test                                         # 539 tests (android unit 355 + contract 86 + contract integration 27 + rule conformance 43 + real-process 13 + device ground truth 15)
 cargo clippy --all-targets -- -D warnings          # upstream CI convention; must be warning-free
 cargo fmt --check
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps      # every doc link must resolve
 ```
 
 The rules layer must additionally pass on a **bare-metal target**. This is a hard gate on R12 (the

@@ -91,7 +91,7 @@ impl Capability {
     /// The contract-level identifier.
     ///
     /// Infallible: the five IDs are literals this module controls, and each is
-    /// asserted well-formed by [`tests::every_vocabulary_id_parses`].
+    /// asserted well-formed by `tests::every_vocabulary_id_parses`.
     pub fn id(&self) -> HostCapability {
         let name = match self {
             Capability::ShellRead => "shell:read",

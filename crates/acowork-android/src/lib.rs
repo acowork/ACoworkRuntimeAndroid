@@ -19,7 +19,7 @@
 //! 1. [`host::facts`] — the data model. One type per probed fact, one pure parser
 //!    per command's text output.
 //! 2. [`host::probe`] — which commands run, what they cost, and how results are
-//!    routed. The [`host::probe::ProbeRunner`] trait is the only I/O boundary.
+//!    routed. The `host::probe::ProbeRunner` trait is the only I/O boundary.
 //! 3. [`host::profile`] — assembly into the session-immutable `HostProfile`.
 //! 4. [`host::capability`] — capabilities derived from facts, never configured.
 //! 5. [`host::backend`] — the `ExecutionBackend` contract and the authorization

@@ -24,7 +24,7 @@
 //! | Derivation | [`capability`] | Capabilities as a function of facts, never of config | Pure |
 //! | Content check | [`commands`] | What a script actually does, independent of the label claiming it | Pure |
 //! | Presentation | [`tools`] | ADR-AND-001 §4.5 tool registration text, from measured facts | Pure |
-//! | Assembly | [`script`] | Render a request into the script a shell runs, with the identity probe | Pure |
+//! | Assembly | `script` | Render a request into the script a shell runs, with the identity probe | Pure |
 //! | Process | [`spawn`] | The one seam that touches an OS: `SpawnRunner`, plus the tokio impl | I/O |
 //! | Contract | [`backend`] | `ExecutionBackend`, and the gate that composes both authorities | Pure gate + async trait |
 //! | Backends | [`backends`] | The tier-specific `ExecutionBackend` implementations | Composes script + spawn + commands |
@@ -47,7 +47,7 @@
 //!   type; the adapter to whatever wire vocabulary wins is a separate later file.
 //!   See blocker B2.
 //! - **No authorization *decisions* about who a user is.** The gate consumes an
-//!   opaque [`backend::AttributionVerdict`]. Owner truth stays in the Gateway per
+//!   opaque `backend::AttributionVerdict`. Owner truth stays in the Gateway per
 //!   upstream ADR-087 D1/D5. See blocker B1.
 //! - **No polling.** The profile is built once and re-derived only on the events
 //!   listed in android-host-probe.md §6.

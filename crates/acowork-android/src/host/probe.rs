@@ -4,7 +4,7 @@
 //! # Separation of concerns
 //!
 //! This module owns **what to ask** and **what came back**. It does not own
-//! spawning (that is the platform runner, [`ProbeRunner`]) and it does not own
+//! spawning (that is the platform runner, `ProbeRunner`) and it does not own
 //! interpretation (that is [`super::facts`] and [`super::profile`]). Keeping the
 //! three apart is what lets the whole probe be unit-tested from fabricated
 //! output — the P0 acceptance criterion in ADR-AND-001 §6.

@@ -575,7 +575,7 @@ pub fn su_prompt_denied(stderr: &str) -> bool {
 
 /// Does this stderr say the privileged helper is **absent or unreachable**?
 ///
-/// See [`su_prompt_denied`] for why this is a shared predicate rather than a local one.
+/// See `su_prompt_denied` for why this is a shared predicate rather than a local one.
 pub fn su_helper_missing(stderr: &str) -> bool {
     let err = stderr.to_ascii_lowercase();
     ["not found", "no such file", "inaccessible", "not available"]

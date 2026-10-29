@@ -222,6 +222,7 @@ cargo build                                        # 构建
 cargo test                                         # 539 个测试（Android 单元 355 + 契约层 86 + 契约集成 27 + 规则一致性 43 + 真进程 13 + 真机地面实况 15）
 cargo clippy --all-targets -- -D warnings          # 上游 CI 约定，须零告警
 cargo fmt --check
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps      # 文档链接必须都能解析
 ```
 
 规则层还要在**裸机 target** 上过一遍——这是 R12（契约不预设任何 OS 设施）的硬门，不是可选检查：

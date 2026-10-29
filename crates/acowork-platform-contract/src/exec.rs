@@ -286,7 +286,7 @@ pub enum LockOutcome {
 /// The timestamp is a `usize`, not a `u64`, because 32-bit targets — including the
 /// ESP32-class boards this contract exists to admit — have no 64-bit atomic. That
 /// makes the counter wrap (every ~49.7 days at millisecond resolution on a 32-bit
-/// `usize`), so every comparison here goes through [`elapsed_since`], which uses
+/// `usize`), so every comparison here goes through `elapsed_since`, which uses
 /// wrapping subtraction. Elapsed time stays correct across one wrap as long as it is
 /// much shorter than the wrap period; a TTL measured in minutes satisfies that by
 /// four orders of magnitude. On a 64-bit target the wrap is unreachable and the

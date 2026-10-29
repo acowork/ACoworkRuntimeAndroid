@@ -19,8 +19,8 @@
 //! script text out of the envelope the gate sees, so the gate is handed `android:shell:read`
 //! as an assertion about the commands and has no way to test it. ADR-AND-001 §4.4 auto-passes
 //! that tier precisely because those commands cannot change the device, so the assertion is
-//! the whole of the safety argument, and [`commands::check`](super::commands::check) is where
-//! it stops being taken on trust. It runs in [`run_script`], the one path every shell backend
+//! the whole of the safety argument, and [`check`](super::commands) is where
+//! it stops being taken on trust. It runs in `run_script`, the one path every shell backend
 //! takes, before anything is assembled or spawned.
 //!
 //! What a backend *also* decides is everything else the gate cannot know:
@@ -46,7 +46,7 @@
 //! # Unverified about this module
 //!
 //! The `su` command-line (`-c` versus `su 0`, and whether `su` forwards stdin to the shell it
-//! spawns) and the denial-wording list in [`super::facts::su_prompt_denied`] are both taken
+//! spawns) and the denial-wording list in `super::facts::su_prompt_denied` are both taken
 //! from documentation and memory, not from a device. Neither is confirmed by anything here:
 //! every test in this module uses a scripted runner, which cannot tell a correct guess from a
 //! wrong one. They are the first two things the device harness has to settle.
@@ -427,7 +427,7 @@ impl<R: SpawnRunner> ExecutionBackend for ShellBackend<R> {
 /// implementations differ in what they grant — Magisk can be configured to hand back the shell
 /// uid rather than 0 — and ADR-AND-001 §1.1 is explicit that uid 0 and a usable SELinux domain
 /// are separate facts that can disagree. So this backend never infers privilege from an exit
-/// code. It reads the uid and domain that [`script`] observed *inside* the running script, and
+/// code. It reads the uid and domain that `script` observed *inside* the running script, and
 /// refuses the result unless they say root.
 ///
 /// A run whose identity could not be established is refused too. "Cannot prove it was root" and

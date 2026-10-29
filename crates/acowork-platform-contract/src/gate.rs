@@ -11,7 +11,7 @@
 //!
 //! - **Attribution** — *is this session allowed to touch this device at all?* That is
 //!   an ownership question, the control plane owns the data, and the device cannot
-//!   answer it. It sends an [`AttributionVerdict`]: a boolean plus a tier, and
+//!   answer it. It sends an `AttributionVerdict`: a boolean plus a tier, and
 //!   nothing else.
 //! - **Readiness** — *can this device do it right now?* That is a local question:
 //!   is the capability declared, is the dangerous-mode switch on, is the resource

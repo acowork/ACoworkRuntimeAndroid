@@ -81,7 +81,7 @@ impl HostProfileName {
 
     /// The stable wire spelling of this tier.
     ///
-    /// This is the value the contract's [`HostSummary::profile`] carries. It is the
+    /// This is the value the contract's `HostSummary::profile` carries. It is the
     /// port's own name for its configuration and is opaque to the contract — used for
     /// scheduling and for humans, never in a gate decision, because a rule keyed on a
     /// profile *name* would be a platform branch in disguise (contract rule R6).

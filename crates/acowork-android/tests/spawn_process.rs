@@ -4,7 +4,7 @@
 //! logic and nothing else. This file is where the claims about *how a process is actually
 //! started* get tested against a process: that the script reaches stdin rather than argv,
 //! that the Runtime's environment does not leak into the child, that the quoting in
-//! [`host::script`] survives a real shell's parser, and that a killed command still hands
+//! `host::script` survives a real shell's parser, and that a killed command still hands
 //! back the bytes it produced before dying.
 //!
 //! Gated to Unix. Android is the target, macOS and Linux are the build hosts, and `/bin/sh`

@@ -1781,7 +1781,7 @@ impl ReversibleBackend {
     /// Put a file back from its snapshot, then prove it.
     ///
     /// The payload travels as base64 in chunks, because the device-side `printf` is an
-    /// `execve` and an argument list over ~110 KiB is refused (see [`SNAPSHOT_CHUNK_BYTES`]).
+    /// `execve` and an argument list over ~110 KiB is refused (see `SNAPSHOT_CHUNK_BYTES`).
     /// Chunking is only tolerable because the last step compares the restored file against the
     /// digest the device reported *before* the write: an assembly that went wrong is reported
     /// as a failure instead of silently leaving a corrupt file where a backup was supposed to

@@ -4,8 +4,8 @@
 //! # Why this module exists at all
 //!
 //! Before it, every field the ADR asks for was *computed* and then *dropped*.
-//! [`ExecRecord`](super::backend::ExecRecord) carried uid, SELinux domain, exit code,
-//! duration and parsed `avc` denials; [`BackendError`](super::backend::BackendError) carried
+//! [`ExecRecord`] carried uid, SELinux domain, exit code,
+//! duration and parsed `avc` denials; [`BackendError`] carried
 //! the refusal reason. Both were handed to the caller and, on the contract path, projected
 //! down to a platform-neutral [`ExecOutcome`](acowork_platform_contract::ExecOutcome) whose
 //! shape has nowhere to put any of it. So the answer to "which session ran `settings put` as
@@ -573,7 +573,7 @@ impl AuditSink for MemoryAuditSink {
 /// A decorator rather than a hook inside each backend, for two reasons. The first is obvious:
 /// three backends would each have to remember to log, and the point of an audit trail is that
 /// forgetting is not an option. The second matters more here — the refusals most worth logging
-/// are produced by the shared content check in [`run_script`](super::backends), deep inside
+/// are produced by the shared content check in `run_script`, deep inside
 /// the shell backends, so per-backend logging would cover the shell tiers and miss
 /// [`AppSandboxBackend`](super::backends::AppSandboxBackend), which has no shell and refuses
 /// for a reason of its own.

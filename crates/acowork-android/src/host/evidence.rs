@@ -63,7 +63,7 @@ use crate::host::{
 pub const DEFAULT_EVIDENCE_BUDGET: u64 = 4 * 1024 * 1024;
 
 /// Raw bytes per read. The limit in this direction is the output cap (1 MiB of *text* coming
-/// back), not the `printf` argument ceiling that sizes [`SNAPSHOT_CHUNK_BYTES`]
+/// back), not the `printf` argument ceiling that sizes `SNAPSHOT_CHUNK_BYTES`
 /// (super::SNAPSHOT_CHUNK_BYTES) on the write path: 256 KiB of bytes is ~342 KiB of base64,
 /// which fits with room for the identity prologue's own output.
 pub const EVIDENCE_CHUNK_BYTES: u64 = 256 * 1024;
@@ -99,7 +99,7 @@ pub enum Source {
     },
     /// `dumpsys <service>` — one service's dump, not the 246-service list.
     Dumpsys {
-        /// The service name, validated against [`safe_name`] before it reaches a command line.
+        /// The service name, validated against `safe_name` before it reaches a command line.
         service: String,
     },
     /// A file already on the device, read without going through a staging copy. This is the

@@ -1,9 +1,9 @@
 //! The one place in this crate that starts a process.
 //!
-//! [`script`] decides *what text* a backend runs; this module decides *how a process is
+//! `script` decides *what text* a backend runs; this module decides *how a process is
 //! actually started*, and [`super::backend`] turns that into an
 //! [`ExecRecord`](super::backend::ExecRecord). The split is the same one
-//! [`super::probe`] makes with [`ProbeRunner`](super::probe::ProbeRunner): pure decision
+//! [`super::probe`] makes with ``ProbeRunner``: pure decision
 //! above, one narrow I/O boundary below, so that everything in this crate except this
 //! file can be tested without a device, a shell, or a root.
 //!
@@ -30,7 +30,7 @@
 //! Android device can read another's command line through `/proc/<pid>/cmdline`, so a
 //! secret in an argument is a secret published to the whole device — including to the
 //! untrusted app domain. `sh -s` reads the script from stdin instead, and stdin is not
-//! world-readable. [`SpawnInvocation::script`] is therefore a field, not part of
+//! world-readable. `SpawnInvocation::script` is therefore a field, not part of
 //! [`SpawnInvocation::args`], and [`ProcessSpawnRunner`] has no way to put it in argv
 //! even by accident.
 //!
@@ -162,7 +162,7 @@ impl RawOutput {
 /// Why no process could be run.
 ///
 /// Reserved for "the runner could not operate". A command that started and failed is a
-/// normal [`RawOutput`], exactly as [`ProbeRunner`] treats a failing probe. Returning
+/// normal [`RawOutput`], exactly as `ProbeRunner` treats a failing probe. Returning
 /// `Err` for a non-zero exit would push every caller into distinguishing "could not run"
 /// from "ran and said no", which is the distinction the whole backend exists to make.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,11 +201,11 @@ pub trait SpawnRunner: Send + Sync {
     /// Start the process, capture both streams, and report what happened.
     ///
     /// Implementations must:
-    /// - write [`SpawnInvocation::script`] to stdin and close it, never place it in argv;
+    /// - write `SpawnInvocation::script` to stdin and close it, never place it in argv;
     /// - clear the inherited environment before applying [`SpawnInvocation::env`];
     /// - return the bytes collected *so far* when the deadline fires, with
     ///   [`RawOutput::timed_out`] set — the identity prologue that
-    ///   [`script`](super::script) puts first exists precisely so a killed command still
+    ///   ``script`` puts first exists precisely so a killed command still
     ///   answers "who was running this";
     /// - keep draining the pipes past `output_cap` rather than stopping, because a child
     ///   blocked writing to an unread pipe will hit its timeout for the wrong reason.
@@ -214,10 +214,10 @@ pub trait SpawnRunner: Send + Sync {
 
 /// A [`SpawnRunner`] that starts real processes with `tokio::process`.
 ///
-/// Unit tests never use this — they use [`ScriptedSpawnRunner`](scripted) so that the
+/// Unit tests never use this — they use ``ScriptedSpawnRunner`` so that the
 /// backend logic is testable on a machine with no shell. It is exercised for real by
 /// `tests/spawn_process.rs`, which runs `/bin/sh -s` on the build host: the argument
-/// passing, the quoting in [`script`], and the identity round-trip are then genuinely
+/// passing, the quoting in `script`, and the identity round-trip are then genuinely
 /// executed rather than asserted about.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ProcessSpawnRunner;

@@ -46,7 +46,7 @@
 //!
 //! | Question | Authority | Why |
 //! |---|---|---|
-//! | *Who* may ask for a write-tier action? | Gateway → [`AttributionVerdict`](acowork_platform_contract::AttributionVerdict) | ADR-087 D1/D5: owner truth lives in `node_owners.json`. The device cannot and must not reconstruct it. |
+//! | *Who* may ask for a write-tier action? | Gateway → `AttributionVerdict` | ADR-087 D1/D5: owner truth lives in `node_owners.json`. The device cannot and must not reconstruct it. |
 //! | *What* is possible here, and is it safe now? | Device → [`HostProfile`] + dangerous-mode + [`SessionWriteLock`] | Only the device has the probed facts, the local session switch, and the lock state. |
 //!
 //! The device receives the answer as an **opaque verdict**, never an identity. That
@@ -229,7 +229,7 @@ pub struct ExecRecord {
     ///
     /// This lives on the record rather than being returned as a `BackendError` because a
     /// timed-out command still produced evidence: partial stdout, whatever stderr said, and
-    /// — since [`script`](super::script) puts the identity prologue *first* — proof of which
+    /// — since ``script`` puts the identity prologue *first* — proof of which
     /// uid and SELinux domain ran it. Routing a timeout through the error channel would
     /// discard exactly the information that makes a hang auditable, and would leave the
     /// caller unable to answer "what did it manage to do before you killed it".
@@ -710,7 +710,7 @@ impl SessionWriteLock {
 
     /// The lock fact the gate needs, from this session's point of view.
     ///
-    /// A session that already holds the lock sees [`LockState::Available`], which is what
+    /// A session that already holds the lock sees `LockState::Available`, which is what
     /// makes re-entrant read-then-write sequences work without the gate refusing the
     /// second call.
     pub fn lock_state(&self, session: &str, now: Duration) -> acowork_platform_contract::LockState {

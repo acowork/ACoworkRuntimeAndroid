@@ -1207,7 +1207,7 @@ const MOUNT_READ_FLAGS: &[&str] = &["-l", "-s", "--"];
 
 /// §4.4's read vocabulary, verbatim: the commands the auto-pass tier claims to cover.
 ///
-/// These are the first seven entries of [`READ_ONLY`]; everything after them in that table is
+/// These are the first seven entries of `READ_ONLY`; everything after them in that table is
 /// justified a different way (the probe runs it itself, or it only filters text). A tool
 /// description reports on *this* list, because it is the list the ADR commits to — so the
 /// two must not drift, which `the_tier_vocabulary_matches_the_classifier` pins.
