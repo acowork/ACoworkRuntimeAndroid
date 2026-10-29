@@ -759,12 +759,24 @@ fn analyse(command: &Command) -> Finding {
 
     // A redirection makes the command a file write whatever it was: `logcat -d > /data/x`
     // reads the log *and* writes a file, which is not the capability `logcat` needs.
-    if let Some(target) = command.writes() {
-        let effect = file_effect(target);
-        return Finding::new(head, effect, format!("redirects its output to `{target}`"));
+    //
+    // It does not *replace* the command's own effect though, which is what it used to do. A
+    // script can write twice from one command — `sed -i 's/a/b/' /system/build.prop >
+    // /data/local/tmp/log` rewrites a partition file and drops the noise in tmp — and a tier
+    // decision that reports only the redirect approves the smaller half.
+    let own = effect_of(&head, command.args());
+    match command.writes() {
+        Some(target) => {
+            let redirect = file_effect(target);
+            let detail = if own.effect == Effect::ReadOnly {
+                format!("redirects its output to `{target}`")
+            } else {
+                format!("redirects its output to `{target}`, and {}", own.detail)
+            };
+            Finding::new(head, redirect.max(own.effect), detail)
+        }
+        None => own,
     }
-
-    effect_of(&head, command.args())
 }
 
 /// Where a write target actually lands, as far as this port can tell.
@@ -808,6 +820,18 @@ fn destination(target: &str) -> Destination {
     }
 }
 
+/// The tier a write to this path costs, for callers that must compare it against something.
+///
+/// The rollback planner is that caller: when a command's finding is heavier than its own
+/// redirection, the difference is a second write the ledger will not be able to restore, and the
+/// session has to be told so at teardown rather than left with an undo list that looks complete.
+/// It is exposed as a question to the classifier rather than a rule the planner copies, because a
+/// second implementation of "where does this path land" is how the two drift apart — which is the
+/// exact defect class `resolve_path` and `written_targets` exist to keep single.
+pub fn file_write_effect(target: &str) -> Effect {
+    file_effect(target)
+}
+
 /// Effect of writing to a path we have already decided the port can see.
 fn effect_at(path: &str) -> Effect {
     if is_block_device(path) {
@@ -829,6 +853,24 @@ fn file_effect(target: &str) -> Effect {
         // which *tier* the write belongs to.
         Destination::Bounded { directory } => effect_at(&directory),
     }
+}
+
+/// Whether a move/copy/link request carries its destination in a flag rather than an operand.
+///
+/// `-t DIR` and `--target-directory=DIR` are the two spellings, glued or separate. The guard is
+/// scoped to `cp`/`mv`/`ln` on purpose: `touch -t 202401010000 file` uses the same letters for a
+/// timestamp, and refusing that would be the classifier inventing a rule the command does not
+/// have. Whether this toybox implements `-t` at all is a device fact nobody has measured here —
+/// the refusal does not wait for the measurement, because the cost of refusing a spelling the
+/// device ignores is one clarification, and the cost of blessing one is an approval for a
+/// directory nobody read.
+fn destination_is_in_a_flag(args: &[String]) -> bool {
+    args.iter().any(|a| {
+        a == "-t"
+            || a == "--target-directory"
+            || a.starts_with("--target-directory=")
+            || (a.starts_with("-t") && a.len() > 2 && a.as_bytes()[2] == b'/')
+    })
 }
 
 /// Which operands of a filesystem-mutating command name the files it changes.
@@ -1078,6 +1120,14 @@ fn effect_of(head: &str, args: &[String]) -> Finding {
             .filter(|a| !a.starts_with('-'))
             .map(String::as_str)
             .collect();
+        if matches!(head, "cp" | "mv" | "ln") && destination_is_in_a_flag(args) {
+            return Finding::opaque(
+                head,
+                "-t puts the destination directory in a flag, so the operand list names only what \
+                 is being moved — the port would be approving the source and letting the \
+                 destination arrive from a flag it never read",
+            );
+        }
         let Some(targets) = written_targets(head, &operands) else {
             return Finding::opaque(
                 head,
@@ -1872,6 +1922,91 @@ mod tests {
             effect("cp /data/local/tmp/x"),
             Effect::Opaque,
             "one operand means the destination is relative to a working directory nobody sees"
+        );
+    }
+
+    #[test]
+    fn a_destination_hiding_inside_a_flag_is_refused_not_blessed() {
+        // `cp -t /system/bin x` names the partition where the operand list never looks: `-t` is
+        // a flag, `/system/bin` is a non-flag operand, and "the last operand is the destination"
+        // would read this as writing `x`. Whether this toybox implements `-t` is a device fact
+        // nobody has measured here, and the refusal does not wait for the measurement.
+        assert_eq!(
+            effect("cp -t /system/bin /data/local/tmp/x"),
+            Effect::Opaque
+        );
+        assert_eq!(
+            effect("mv --target-directory=/system/bin /data/local/tmp/x"),
+            Effect::Opaque
+        );
+        assert_eq!(
+            effect("cp -t/system/bin /data/local/tmp/x"),
+            Effect::Opaque,
+            "the glued spelling is the same request"
+        );
+    }
+
+    #[test]
+    fn a_multiplexer_or_an_absolute_invocation_cannot_change_the_tier() {
+        // Two spellings of the same write must cost the same approval: the classifier unpacks
+        // `toybox`/`busybox` to the real subcommand and resolves a command word to its basename
+        // (backends invoke `/system/bin/cp` because the child runs with a cleared environment).
+        assert_eq!(
+            effect("toybox cp /data/local/tmp/x /system/bin/y"),
+            Effect::SystemWrite
+        );
+        assert_eq!(
+            effect("busybox sed -i 's/a/b/' /system/build.prop"),
+            Effect::SystemWrite
+        );
+        assert_eq!(
+            effect("/system/bin/cp /data/local/tmp/x /system/bin/y"),
+            Effect::SystemWrite
+        );
+        assert_eq!(
+            effect("toybox dd if=/dev/zero of=/data/local/tmp/../../../dev/block/mmcblk0"),
+            Effect::Banned
+        );
+    }
+
+    #[test]
+    fn a_timestamp_flag_is_not_mistaken_for_a_destination() {
+        // `touch -t` takes a date. A guard scoped to "any -t anywhere" would be the classifier
+        // inventing a rule the command does not have.
+        assert_eq!(
+            effect("touch -t 202401010000 /data/local/tmp/x"),
+            Effect::FileWrite
+        );
+        assert_eq!(
+            effect("touch -t 202401010000 /system/x"),
+            Effect::SystemWrite,
+            "the timestamp operand is not a path, and the path still decides the tier"
+        );
+    }
+
+    #[test]
+    fn a_command_that_writes_twice_is_costed_for_both_writes() {
+        // A redirection used to *replace* the command's own effect: the finding said "redirects
+        // its output", and an in-place edit in the same command disappeared from the tier
+        // decision. The approval a script needs is the strongest thing it does, not the last
+        // thing the classifier noticed.
+        assert_eq!(
+            effect("sed -i 's/a/b/' /system/build.prop > /data/local/tmp/log"),
+            Effect::SystemWrite,
+            "the log lands in tmp; the build.prop rewrite does not stop being a partition write"
+        );
+        assert_eq!(
+            effect("sed -i 's/a/b/' /data/local/tmp/x > /data/local/tmp/log"),
+            Effect::FileWrite
+        );
+        assert_eq!(
+            effect("cp /data/local/tmp/x /system/bin/y > /data/local/tmp/log"),
+            Effect::SystemWrite
+        );
+        assert_eq!(
+            effect("getprop > /data/local/tmp/log"),
+            Effect::FileWrite,
+            "a pure read with a redirect is still only the file write"
         );
     }
 

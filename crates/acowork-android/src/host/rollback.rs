@@ -781,7 +781,29 @@ pub fn plan(script: &str) -> Plan {
         let capture =
             Capture::from_args(&command.words, finding).or_else(|| Capture::from_redirect(command));
         match capture {
-            Some(capture) => out.captures.push(capture),
+            Some(capture) => {
+                out.captures.push(capture);
+                // A command can write twice. `sed -i 's/a/b/' /system/build.prop >
+                // /data/local/tmp/log` rewrites a partition file and redirects the noise into
+                // tmp; the ledger holds one undo per command, so a snapshot of the log says
+                // nothing about build.prop. Silence here would leave a teardown report whose undo
+                // list looks complete, which is the failure this module was written to avoid.
+                if let Some(target) = command.redirect.as_deref() {
+                    let redirected = commands::file_write_effect(target);
+                    if finding.effect > redirected {
+                        out.unundoable.push(Unundoable {
+                            command: finding.command.clone(),
+                            why: format!(
+                                "writes something besides the file it redirects into — the \
+                                 ledger holds one undo per command, so the snapshot of \
+                                 {target:?} does not cover this command's heavier effect ({:?})",
+                                finding.effect
+                            ),
+                            kind: UnundoableKind::NotModelled,
+                        });
+                    }
+                }
+            }
             // A redirect the planner *saw* and rejected deserves its own sentence: "no inverse
             // is modelled" reads like a gap in the port's ambition, when the real reason is
             // that the target was not a name the capture could trust.
@@ -2676,6 +2698,36 @@ mod tests {
                 .iter()
                 .any(|s| s.script == "rm -f '/data/local/tmp/created.txt'")
         );
+    }
+
+    #[test]
+    fn a_command_that_writes_twice_says_which_half_the_ledger_cannot_put_back() {
+        // One undo per command is the ledger's shape, and a script can write twice inside one
+        // command. The snapshot of the redirected file must not read as a restore of the
+        // in-place edit too.
+        let plan = plan("sed -i 's/a/b/' /system/build.prop > /data/local/tmp/log");
+        assert_eq!(plan.captures.len(), 1, "the redirect is still snapshotted");
+        assert_eq!(
+            plan.unundoable.len(),
+            1,
+            "and the second write is named: {:?}",
+            plan.unundoable
+        );
+        assert!(
+            plan.unundoable[0].why.contains("one undo per command"),
+            "{:?}",
+            plan.unundoable[0]
+        );
+        assert_eq!(plan.unundoable[0].kind, UnundoableKind::NotModelled);
+    }
+
+    #[test]
+    fn a_plain_redirect_is_not_reported_as_a_second_write() {
+        // The common case must stay quiet: `getprop > /system/x` writes one file, and noise in
+        // the teardown report is what makes operators stop reading it.
+        let plan = plan("getprop > /data/local/tmp/log");
+        assert_eq!(plan.captures.len(), 1);
+        assert!(plan.unundoable.is_empty(), "{:?}", plan.unundoable);
     }
 
     #[test]
