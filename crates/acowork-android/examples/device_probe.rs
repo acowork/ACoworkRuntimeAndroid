@@ -139,6 +139,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
         report_rollback_roundtrip(&profile, &transport).await?;
         println!("\n── 11. §4.6.4 file snapshot round trip ────────────");
         report_file_snapshot(&profile, &transport).await?;
+        println!("\n── 12. §4.6 item 6 evidence capture ───────────────");
+        report_evidence_capture(&profile, &transport).await?;
     }
 
     Ok(())
@@ -1251,4 +1253,190 @@ fn pending_for(chain: &ReversibleBackend, session: &str) -> usize {
         .lock()
         .map(|ledger| ledger.pending_for(session).len())
         .unwrap_or(0)
+}
+
+/// Pull real evidence off the device and prove the bytes are the device's bytes.
+///
+/// §4.6 item 6 lists six sources; section 7 printed what the *profile* says about them. This one
+/// asks the device for bytes and checks what came back, because the difference between those two
+/// statements is the whole finding: a source can be listable and unreadable at the same time.
+async fn report_evidence_capture(
+    profile: &HostProfile,
+    transport: &AdbTransport,
+) -> Result<(), Box<dyn Error>> {
+    use acowork_android::host::{
+        ApprovalToken, CaptureError, DEFAULT_EVIDENCE_BUDGET, EvidenceSource, ExecutionBackend,
+        capture_evidence,
+    };
+    use std::sync::Arc;
+
+    let sink = Arc::new(MemoryAuditSink::new());
+    let chain = writable_chain(profile, transport, sink.clone()).await?;
+    let backend = Arc::clone(&chain) as Arc<dyn ExecutionBackend>;
+    let session = "harness-evidence";
+    let dir = std::env::temp_dir().join("acowork-probe-evidence");
+    let _ = std::fs::remove_dir_all(&dir);
+    let token = ApprovalToken::new("harness");
+
+    // 1. A screenshot: binary, 1.4 MB measured, arrives in chunks.
+    match capture_evidence(
+        &backend,
+        &EvidenceSource::Screenshot,
+        session,
+        &dir,
+        Some(&token),
+        DEFAULT_EVIDENCE_BUDGET,
+    )
+    .await
+    {
+        Ok(artifact) => {
+            let bytes: Vec<u8> = std::fs::read(&artifact.host_path)?;
+            let png = bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+            println!(
+                "  screencap -p -> {} ({} bytes in {} reads, sha256 {:?})",
+                artifact.host_path.display(),
+                artifact.bytes,
+                artifact.reads,
+                &artifact.digest[..12]
+            );
+            println!(
+                "  PNG magic on the host copy: {png} — the exec channel decodes stdout as UTF-8 \
+                 text, so this is the claim the base64 transport exists to earn"
+            );
+            assert!(png, "a screenshot that is not a PNG is a transport bug");
+            assert_eq!(bytes.len() as u64, artifact.bytes);
+        }
+        Err(e) => {
+            println!("  screencap -p FAILED: {e}");
+            return Err("the read tier on this device can screenshot; this is a port bug".into());
+        }
+    }
+
+    // 2. A logcat tail: text, but the same path, because the buffer is bigger than one output cap.
+    match capture_evidence(
+        &backend,
+        &EvidenceSource::Logcat {
+            buffer: None,
+            tail: Some(400),
+        },
+        session,
+        &dir,
+        Some(&token),
+        DEFAULT_EVIDENCE_BUDGET,
+    )
+    .await
+    {
+        Ok(artifact) => {
+            let text = std::fs::read_to_string(&artifact.host_path)?;
+            println!(
+                "  logcat -d -t 400 -> {} bytes, {} lines, digest {:?} verified against the device",
+                artifact.bytes,
+                text.lines().count(),
+                &artifact.digest[..12]
+            );
+        }
+        Err(e) => println!("  logcat -d -t 400 FAILED: {e}"),
+    }
+
+    // 3. The two sources that are names without contents on a `user` build. The point of these
+    //    calls is the error text: an empty file would be a lie, and a stack trace is not a reason.
+    for path in ["/data/anr/trace_00", "/data/tombstones"] {
+        match capture_evidence(
+            &backend,
+            &EvidenceSource::DeviceFile {
+                path: path.to_string(),
+            },
+            session,
+            &dir,
+            None,
+            DEFAULT_EVIDENCE_BUDGET,
+        )
+        .await
+        {
+            Ok(artifact) => println!(
+                "  {path} unexpectedly produced {} bytes — this device is not what section 7 measured",
+                artifact.bytes
+            ),
+            Err(CaptureError::Unreadable { reason, .. }) => {
+                println!(
+                    "  {path} -> refused with the device's own words: {}",
+                    reason.trim()
+                );
+            }
+            Err(e) => println!("  {path} -> {e}"),
+        }
+    }
+
+    // 4. Staging hygiene: nothing of ours is left on the device.
+    let observer: Arc<dyn ExecutionBackend> = Arc::new(ShellBackend::with_runner(
+        profile.clone(),
+        transport.clone(),
+    )?);
+    let leftovers = observer
+        .exec(ExecRequest::read(
+            "ls -d /data/local/tmp/.acowork-ev-* 2>/dev/null | wc -l",
+            session,
+        ))
+        .await
+        .map(|r| r.stdout.trim().to_string())
+        .unwrap_or_else(|e| format!("<{e}>"));
+    println!("  staging leftovers on the device: {leftovers}");
+
+    // 5. What the rollback ledger made of staging: each capture created a file, so each owes an
+    //    `rm -f`. The capture already removed it; the ledger's entry is the backstop for a
+    //    capture that died halfway, and running it now must be harmless.
+    let pending = pending_for(&chain, session);
+    println!("  undos this session holds after the captures: {pending}");
+    let report = chain.restore(session).await;
+    println!(
+        "  teardown of the staging undos: {} applied, {} failed",
+        report.restored.len(),
+        report.failed.len()
+    );
+
+    // 6. `bugreportz` is a write and costs 1m44s here, so it is not run unless asked for.
+    if std::env::var("ACOWORK_PROBE_BUGREPORT").is_ok() {
+        match capture_evidence(
+            &backend,
+            &EvidenceSource::Bugreport,
+            session,
+            &dir,
+            Some(&token),
+            // The default, deliberately: the constant's doc claims 4 MiB was chosen because it
+            // covers a real bugreport, and a claim like that belongs next to a measurement.
+            DEFAULT_EVIDENCE_BUDGET,
+        )
+        .await
+        {
+            Ok(artifact) => {
+                let head = {
+                    let mut f = std::fs::File::open(&artifact.host_path)?;
+                    let mut b = [0u8; 4];
+                    std::io::Read::read_exact(&mut f, &mut b)?;
+                    b
+                };
+                println!(
+                    "  bugreportz -> {} ({} bytes in {} reads, header {:02x?})",
+                    artifact.host_path.display(),
+                    artifact.bytes,
+                    artifact.reads,
+                    head
+                );
+                assert_eq!(head, [0x50, 0x4b, 0x03, 0x04], "a zip that is not a zip");
+            }
+            Err(e) => println!("  bugreportz FAILED: {e}"),
+        }
+    } else {
+        println!(
+            "  bugreportz: skipped (measured 1m44s to produce and a write under the classifier; \
+             set ACOWORK_PROBE_BUGREPORT=1 to run it)"
+        );
+    }
+
+    println!(
+        "  audit records for the capture session: {} — every chunk read is in there, which is \
+         what makes 6 reads for a screenshot defensible rather than invisible",
+        sink.len()
+    );
+    Ok(())
 }

@@ -59,6 +59,7 @@ pub mod capability;
 pub mod chain;
 pub mod commands;
 pub mod denial;
+pub mod evidence;
 pub mod facts;
 pub mod probe;
 pub mod profile;
@@ -92,6 +93,10 @@ pub use commands::{
 };
 pub use denial::{
     DenialLedger, SelinuxClassifier, SelinuxDenial, classify, parse_denials, redact_denials,
+};
+pub use evidence::{
+    Artifact as EvidenceArtifact, CaptureError, DEFAULT_EVIDENCE_BUDGET, EVIDENCE_CHUNK_BYTES,
+    EVIDENCE_STAGING_DIR, Source as EvidenceSource, capture as capture_evidence,
 };
 pub use facts::{
     AppletSet, BuildType, DeviceFacts, FsRoot, MountEntry, Privilege, SelinuxDomain, SelinuxState,

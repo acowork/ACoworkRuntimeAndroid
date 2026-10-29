@@ -17,6 +17,12 @@ rust-version.workspace = true
 # make every embedded consumer carry `serde/std`.
 acowork-platform-contract = { workspace = true, features = ["std"] }
 async-trait.workspace = true
+# Host-side integrity check for evidence artifacts: the device reports a sha256 of the
+# bytes it wrote, and the file that lands in the Agent workspace must hash to the same value.
+sha2 = "0.11"
+# The companion to that check: the device can only hand bytes over a channel whose stdout is
+# decoded as UTF-8 text, so every artifact arrives base64-encoded and has to be decoded here.
+base64 = "0.22"
 # Only `host::spawn::ProcessSpawnRunner` needs a runtime, and only because starting a
 # process without blocking an async task needs an async pipe reader. Everything else in
 # this crate is `Pin<Box<dyn Future>>`-clean and would compile without tokio; the feature
