@@ -375,6 +375,13 @@ impl ResourceLock {
 
     /// Try to take the lock at time `now`.
     ///
+    /// On success the hold is identified by `now` itself: that is the value [`renew`] and
+    /// [`release`] need back, and a port that discards it has no way to tell its own hold
+    /// from one that replaced it after a TTL expiry.
+    ///
+    /// [`renew`]: ResourceLock::renew
+    /// [`release`]: ResourceLock::release
+    ///
     /// Three outcomes, and only three:
     /// - free → take it;
     /// - held within its TTL → [`LockOutcome::Busy`]. **No queueing, no preemption**
@@ -428,15 +435,57 @@ impl ResourceLock {
         }
     }
 
-    /// Release the lock.
+    /// Extend *this* hold, identified by the instant it was taken.
     ///
-    /// Idempotent, and safe to call after the TTL has already reclaimed the hold:
-    /// releasing something you no longer hold must not free someone else's lock. A
-    /// caller that needs that guarantee should hold a guard rather than a timestamp —
-    /// the contract keeps this simple because the gate releases on every denial path
-    /// and a double release there is harmless.
-    pub fn release(&self) {
-        self.held_since_ms.store(FREE, Ordering::Release);
+    /// Renewal is required by R11's own wording — a mutating command refreshes the TTL
+    /// rather than reacquiring — and without a primitive for it a port has to improvise with
+    /// `release()` followed by `try_acquire()`, which is how a stale holder ends up freeing
+    /// whoever legitimately reclaimed the lock after it expired. This does not: the expected
+    /// value is our own acquisition instant, so the compare-exchange fails the moment another
+    /// caller's hold is standing.
+    ///
+    /// Renewal is **not** acquisition. A hold past its TTL is dead, and reviving it here would
+    /// let a caller that stalled for longer than the TTL keep a device it was presumed to have
+    /// stopped using. `false` means "you are not the holder any more"; the caller goes back
+    /// through [`try_acquire`](ResourceLock::try_acquire), which is where the reclaim rule
+    /// lives and where another caller's live hold is respected.
+    ///
+    /// Why the caller passes `at` at all: the lock carries no identity, because "session" is a
+    /// port concept and R11 states a platform-neutral rule. The acquisition instant is the only
+    /// thing that distinguishes our hold from whoever took it after we expired. It is not a
+    /// unique token — two acquisitions at the same instant are the same hold — which is sound
+    /// except when the TTL is zero, where every caller reclaims immediately and mutual
+    /// exclusion was vacuous anyway.
+    pub fn renew(&self, at: Duration, now: Duration) -> bool {
+        let expected = stored_for(at);
+        if expected == FREE || self.is_expired(expected, now) {
+            return false;
+        }
+        self.held_since_ms
+            .compare_exchange(
+                expected,
+                stored_for(now),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Release, if the hold still standing is the one taken at `at`. Returns whether it was.
+    ///
+    /// The unconditional store this replaced was documented as meaning "releasing something
+    /// you no longer hold must not free someone else's lock" and did the opposite: a session
+    /// whose TTL had passed, whose lock had meanwhile been reclaimed, could call `release()`
+    /// on teardown and free the *new* holder's lock — two writers on one device, the one
+    /// outcome R11 exists to prevent. The guarantee now lives in the code rather than in the
+    /// sentence about it.
+    ///
+    /// Releasing a lock you never took returns `false` and changes nothing, so a double
+    /// release is still harmless.
+    pub fn release(&self, at: Duration) -> bool {
+        self.held_since_ms
+            .compare_exchange(stored_for(at), FREE, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     /// Who holds the lock at time `now`, and for how long.
@@ -576,7 +625,7 @@ mod tests {
         fn lock_releases() {
             let lock = ResourceLock::new(secs(600));
             lock.try_acquire(secs(0));
-            lock.release();
+            assert!(lock.release(secs(0)));
             assert!(lock.is_free(secs(1)));
             assert_eq!(lock.try_acquire(secs(1)), LockOutcome::Acquired);
         }
@@ -584,9 +633,81 @@ mod tests {
         #[test]
         fn release_is_idempotent() {
             let lock = ResourceLock::new(secs(600));
-            lock.release();
-            lock.release();
+            assert!(!lock.release(secs(0)), "never taken at 0");
+            lock.try_acquire(secs(3));
+            assert!(
+                !lock.release(secs(0)),
+                "releasing a hold that is not ours must not free it"
+            );
+            assert!(lock.release(secs(3)));
             assert!(lock.is_free(secs(0)));
+        }
+
+        #[test]
+        fn renew_extends_a_live_hold() {
+            // R11's "a mutating command refreshes the hold" needs a primitive, because the
+            // alternative — release then re-acquire — opens the device for the width of two
+            // statements and frees it for whoever is holding it by then.
+            let lock = ResourceLock::new(secs(100));
+            assert_eq!(lock.try_acquire(secs(0)), LockOutcome::Acquired);
+            assert!(
+                lock.renew(secs(0), secs(60)),
+                "the holder may extend its own hold"
+            );
+            // The hold now runs to 160, not to 100: measured from the renewal, not from the
+            // original acquisition.
+            assert_eq!(
+                lock.try_acquire(secs(90)),
+                LockOutcome::Busy {
+                    held_for: secs(30),
+                    retry_after: secs(70),
+                },
+                "a renewal that did not move the deadline would not be worth this API"
+            );
+        }
+
+        #[test]
+        fn a_renewal_does_not_resurrect_an_expired_hold() {
+            // Renewal is not acquisition. A caller that stalled past the TTL was presumed dead;
+            // letting it revive its own hold by touching it would make the TTL a suggestion and
+            // the reclaim rule decorative.
+            let lock = ResourceLock::new(secs(100));
+            assert_eq!(lock.try_acquire(secs(0)), LockOutcome::Acquired);
+            assert!(
+                !lock.renew(secs(0), secs(150)),
+                "expired: not ours to extend"
+            );
+            assert_eq!(
+                lock.try_acquire(secs(150)),
+                LockOutcome::Acquired,
+                "the way back is the ordinary reclaim, which is also how a new caller wins"
+            );
+        }
+
+        #[test]
+        fn a_stale_holder_cannot_touch_a_live_one() {
+            // The steal, pinned without threads. A expires, B legitimately reclaims, and A
+            // comes back believing it still holds. Neither renewal nor release may act on B's
+            // hold: the acquisition instant is the only identity this lock has, and it no
+            // longer matches.
+            let lock = ResourceLock::new(secs(100));
+            assert_eq!(lock.try_acquire(secs(0)), LockOutcome::Acquired);
+            assert_eq!(
+                lock.try_acquire(secs(200)),
+                LockOutcome::Acquired,
+                "B reclaims a hold presumed dead"
+            );
+            assert!(
+                !lock.renew(secs(0), secs(210)),
+                "A's instant is not standing"
+            );
+            assert!(
+                !lock.release(secs(0)),
+                "and A's release must not free B — the guarantee the old unconditional store \
+                 documented and did not provide"
+            );
+            assert_eq!(lock.holder(secs(210)), Some(secs(10)), "B still holds");
+            assert!(lock.release(secs(200)), "B may release its own");
         }
 
         #[test]

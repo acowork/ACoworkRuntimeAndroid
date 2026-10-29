@@ -561,12 +561,31 @@ pub enum SessionLockOutcome {
 ///
 /// The implementation is an in-process serialization point — one device, one Node Agent,
 /// so a distributed lock would be pure over-engineering (§7.2). The actual mutual
-/// exclusion and TTL live in the contract's [`ResourceLock`]; this type adds only the
-/// holder's session id.
-#[derive(Debug)]
+/// exclusion and TTL live in the contract's [`ResourceLock`]; this type adds the holder's
+/// session id *and the instant the hold was taken*, which is what makes the identity
+/// checkable rather than remembered.
 pub struct SessionWriteLock {
     inner: ResourceLock,
-    holder: Mutex<Option<String>>,
+    /// One mutex covers each compound operation. Taking the contract lock and then writing
+    /// the identity were two steps, and two steps is a window: a session whose hold had
+    /// expired could read a still-stale identity in `renew`, conclude it was the holder, and
+    /// `release()` the lock out of whoever had legitimately reclaimed it. Two writers on one
+    /// physical device is the one outcome R11 forbids, so the identity and the acquisition
+    /// move together or not at all.
+    holder: Mutex<Option<Hold>>,
+}
+
+/// A recorded hold: who, and since when.
+///
+/// The instant is not decoration. The contract lock carries no identity — "session" is a port
+/// concept, and an identity-bearing lock would force Android's session model on a target where
+/// it may not exist — so the acquisition timestamp is the only thing that distinguishes *our*
+/// hold from one that replaced it after we expired. A holder that stored only the session
+/// string could ask "am I the holder?" but never "is the lock still mine?".
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Hold {
+    session: String,
+    at: Duration,
 }
 
 impl SessionWriteLock {
@@ -589,22 +608,48 @@ impl SessionWriteLock {
         &self.inner
     }
 
+    /// The identity mutex, poisoned recovered.
+    ///
+    /// A panic while the lock was held must not make the record unreachable: the worst thing
+    /// available is a device that cannot be unlocked, and losing the *name* of the holder is
+    /// how that happens silently.
+    fn hold(&self) -> std::sync::MutexGuard<'_, Option<Hold>> {
+        self.holder
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Try to take the lock for `session`. Never blocks, never queues.
     pub fn try_acquire(&self, session: &str, now: Duration) -> SessionLockOutcome {
+        let mut holder = self.hold();
+        self.acquire_locked(&mut holder, session, now)
+    }
+
+    /// The acquisition half, with the identity lock already held.
+    fn acquire_locked(
+        &self,
+        holder: &mut Option<Hold>,
+        session: &str,
+        now: Duration,
+    ) -> SessionLockOutcome {
         match self.inner.try_acquire(now) {
             LockOutcome::Acquired => {
-                self.set_holder(session);
+                *holder = Some(Hold {
+                    session: session.to_string(),
+                    at: now,
+                });
                 SessionLockOutcome::Acquired
             }
             LockOutcome::Busy { retry_after, .. } => {
-                // The contract lock does not know who holds it, so read the identity
-                // this layer recorded. If it is missing the holder crashed between
-                // acquiring and recording; say so rather than naming nobody.
-                let holder = self
-                    .current_holder()
+                // Read under the same mutex that writes it, so the name belongs to the hold
+                // that is standing. If nobody is recorded the holder crashed between acquiring
+                // and recording; say so rather than naming nobody.
+                let named = holder
+                    .as_ref()
+                    .map(|h| h.session.clone())
                     .unwrap_or_else(|| "<expired session>".to_string());
                 SessionLockOutcome::HeldBy {
-                    holder,
+                    holder: named,
                     retry_after,
                 }
             }
@@ -614,38 +659,52 @@ impl SessionWriteLock {
     /// Extend the TTL while a mutating command runs (§7.2: "每条 mutating 命令执行时
     /// 自动续期").
     ///
-    /// Only the holder may renew. Renewing someone else's hold would let a session
-    /// extend a lock it does not own, which is preemption by another name.
+    /// Only the holder may renew. Renewing someone else's hold would let a session extend a
+    /// lock it does not own, which is preemption by another name.
+    ///
+    /// Renewal goes through [`ResourceLock::renew`] rather than the release-then-acquire it
+    /// replaced: releasing to re-take is *not* renewal, it is unlocking the device for the
+    /// width of two statements and, worse, unlocking it for whoever else is holding it by
+    /// then.
     pub fn renew(&self, session: &str, now: Duration) -> SessionLockOutcome {
-        if self.current_holder().as_deref() != Some(session) {
-            return self.try_acquire(session, now);
+        let mut holder = self.hold();
+        let Some(at) = holder
+            .as_ref()
+            .filter(|h| h.session == session)
+            .map(|h| h.at)
+        else {
+            // Not ours, or nobody's. Falling through to the ordinary acquire path is the
+            // honest reading of "renew": we do not get to take a live lock from its holder,
+            // and we do get the TTL's own reclaim rule if the hold really did die.
+            return self.acquire_locked(&mut holder, session, now);
+        };
+
+        if self.inner.renew(at, now) {
+            if let Some(h) = holder.as_mut().filter(|h| h.session == session) {
+                h.at = now;
+            }
+            return SessionLockOutcome::Acquired;
         }
-        // Re-acquiring from a released state is the only renewal the contract lock
-        // offers, so release and retake. The window is not observable: this is an
-        // in-process lock and the caller is the holder.
-        self.inner.release();
-        match self.inner.try_acquire(now) {
-            LockOutcome::Acquired => SessionLockOutcome::Acquired,
-            LockOutcome::Busy { retry_after, .. } => SessionLockOutcome::HeldBy {
-                holder: self
-                    .current_holder()
-                    .unwrap_or_else(|| "<unknown>".to_string()),
-                retry_after,
-            },
-        }
+
+        // Our hold expired while we were busy. It is not ours any more, so drop the name
+        // before asking again — otherwise a `Busy` answer could name *us* as the holder.
+        *holder = None;
+        self.acquire_locked(&mut holder, session, now)
     }
 
     /// Release, if this session holds it.
     ///
     /// Expiry releases too, but never hands the lock to a waiter — §7.2: "只释放，不自动
-    /// 抢占". A non-holder's release is ignored, so a late release from a session that
-    /// already lost the lock to TTL expiry cannot free someone else's hold.
+    /// 抢占". A non-holder's release is ignored, so a late release from a session that already
+    /// lost the lock to TTL expiry cannot free someone else's hold: the contract's `release`
+    /// compares against the recorded acquisition instant, and a hold that is not ours is left
+    /// standing.
     pub fn release(&self, session: &str) {
-        let mut holder = self.holder.lock().expect("lock poisoned");
-        if holder.as_deref() == Some(session) {
+        let mut holder = self.hold();
+        if let Some(h) = holder.as_ref().filter(|h| h.session == session) {
+            let at = h.at;
             *holder = None;
-            drop(holder);
-            self.inner.release();
+            self.inner.release(at);
         }
     }
 
@@ -656,24 +715,26 @@ impl SessionWriteLock {
     /// second call.
     pub fn lock_state(&self, session: &str, now: Duration) -> acowork_platform_contract::LockState {
         use acowork_platform_contract::LockState;
-        if self.current_holder().as_deref() == Some(session) {
+        let Self { inner, holder } = self;
+        let held_by_us = holder
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|h| h.session == session);
+        if held_by_us {
             return LockState::Available;
         }
-        match self.inner.holder(now) {
+        match inner.holder(now) {
             None => LockState::Available,
             Some(held_for) => LockState::Busy {
-                retry_after: self.inner.ttl().saturating_sub(held_for),
+                retry_after: inner.ttl().saturating_sub(held_for),
             },
         }
     }
 
     /// Who holds the lock, if anyone.
     pub fn current_holder(&self) -> Option<String> {
-        self.holder.lock().expect("lock poisoned").clone()
-    }
-
-    fn set_holder(&self, session: &str) {
-        *self.holder.lock().expect("lock poisoned") = Some(session.to_string());
+        self.hold().as_ref().map(|h| h.session.clone())
     }
 }
 
@@ -770,6 +831,74 @@ mod tests {
             }
             other => panic!("expected HeldBy, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_stalled_session_does_not_take_the_lock_back_from_whoever_reclaimed_it() {
+        // §7.2's "no preemption" is about exactly this moment: A held, stalled past the TTL,
+        // and B took the device on the honest reading that A was gone. A's renewal must
+        // neither extend B's hold nor free it, and the refusal has to name B — a caller told
+        // "busy" without a name retries into the same wall, which is the behaviour §7.2 exists
+        // to prevent.
+        let lock = SessionWriteLock::with_ttl(Duration::from_secs(100));
+        assert_eq!(
+            lock.try_acquire("A", Duration::from_secs(0)),
+            SessionLockOutcome::Acquired
+        );
+        assert_eq!(
+            lock.try_acquire("B", Duration::from_secs(200)),
+            SessionLockOutcome::Acquired,
+            "B reclaims a hold presumed dead"
+        );
+
+        assert_eq!(
+            lock.renew("A", Duration::from_secs(210)),
+            SessionLockOutcome::HeldBy {
+                holder: "B".to_string(),
+                retry_after: Duration::from_secs(90),
+            },
+            "the refusal names the session that actually holds it"
+        );
+        lock.release("A");
+        assert_eq!(
+            lock.lock_state("B", Duration::from_secs(215)),
+            acowork_platform_contract::LockState::Available,
+            "a stale release must not unlock the device under whoever is working"
+        );
+        assert_eq!(lock.current_holder().as_deref(), Some("B"));
+        assert_eq!(
+            lock.lock_state("A", Duration::from_secs(215)),
+            acowork_platform_contract::LockState::Busy {
+                retry_after: Duration::from_secs(85),
+            },
+        );
+    }
+
+    #[test]
+    fn a_holder_that_stalled_past_the_ttl_gets_the_lock_back_by_asking() {
+        // Expiry is a presumption of death, not a verdict: if nobody else took the device, the
+        // session that comes back late may reclaim it. What it may not do is reclaim silently
+        // under the name of renewal — `renew` falls through to the ordinary acquire path, which
+        // is where the reclaim rule lives and where a live hold by someone else was refused in
+        // the test above.
+        let lock = SessionWriteLock::with_ttl(Duration::from_secs(100));
+        assert_eq!(
+            lock.try_acquire("A", Duration::from_secs(0)),
+            SessionLockOutcome::Acquired
+        );
+        assert_eq!(
+            lock.renew("A", Duration::from_secs(150)),
+            SessionLockOutcome::Acquired,
+            "nobody else is waiting, and the TTL's reclaim rule applies to the old holder too"
+        );
+        assert_eq!(
+            lock.try_acquire("B", Duration::from_secs(160)),
+            SessionLockOutcome::HeldBy {
+                holder: "A".to_string(),
+                retry_after: Duration::from_secs(90),
+            },
+            "the renewal moved the deadline, so B waits from the renewal, not from the first acquire"
+        );
     }
 
     #[test]
