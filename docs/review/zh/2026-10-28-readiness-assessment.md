@@ -4,7 +4,9 @@
 - **范围**：[README.zh.md](../../../README.zh.md)、[ADR-AND-001](../../adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md)、[ADR-AND-002](../../adr/zh/ADR-AND-002-platform-contract-layer.md)（2026-10-29 新增）、[android-host-probe.md](../../design/zh/android-host-probe.md)
 - **核对基准**：上游 `AgentCowork` @ `0b5e8f14`（2026-10-28）
 - **结论**：**文档质量高，但有 3 条硬阻塞（B1/B2/B3）需上游裁定。** P0 只读切片不被阻塞，已交付并通过验收判据。
-  > **2026-10-29 更新**：**B3 的影响面已收窄，但未消除。** 规则层抽成只依赖 `serde` 的独立 crate 后，「引擎归属形态二义」无论上游怎么裁定都**不波及规则层**，且这是结构保证（裸机 target 编译 + lib 依赖图无 std 边）而非约定。但 B3 二义的本来就是*引擎*（node + runtime）的归属，README 路线图 #2 的引擎抽取**仍然阻塞**——契约层解决的是宿主规则，不是引擎归属。B1 的解法已在契约层落地为规则 R7 并有测试钉住，仍待上游评审以确认 §7.1 的字面修订。B2（词汇表所有权）**仍是唯一未解的硬阻塞**。
+  > **已提交上游评审（2026-10-29）**：B1 + B2 已整理成请求裁定文档，提交至 `AgentCowork/docs/review/zh/37-android-write-tier-attribution-and-capability-registry-review.md`（B1 含三个必答问题 Q1 执行点 / Q2 契约归属 / Q3 无主节点；B2 给出 a/b/c/d 四个选项，推荐 a「新增 Node/设备安全域表」）。**等待裁定，未获结论前 P3 生产接线不落地。**
+  > **B3 的影响面已收窄，但未消除。** 规则层抽成只依赖 `serde` 的独立 crate 后，「引擎归属形态二义」无论上游怎么裁定都**不波及规则层**，且这是结构保证（裸机 target 编译 + lib 依赖图无 std 边）而非约定。但 B3 二义的本来就是*引擎*（node + runtime）的归属，README 路线图 #2 的引擎抽取**仍然阻塞**——契约层解决的是宿主规则，不是引擎归属。
+  > **三条阻塞的当前形状**：B1 解法已在契约层落地为规则 R7 并有三个测试钉住，**等的是上游对 §7.1 字面修订的确认**（Q1/Q2/Q3）；B2 **无解法可落地**——它缺的是一张上游表，本地领域类型 + 待建适配层只能把改动面积压到一个文件，不能替代裁定；B3 只阻塞引擎抽取，不阻塞 Android 移植。
 
 ---
 
@@ -56,6 +58,10 @@
 
 **这确实修订了 §7.1 的字面表述**：Gateway 做*归属*判定，不做*能力*判定。
 
+**上游已有的先例支持这个形状（2026-10-29 复核 ADR-087 全文后补）**：D8 已裁定「`GET /api/nodes` 每条记录服务端算好 `can_manage` / `can_use` **布尔**下发，Desktop/Mobile **只消费布尔渲染，不再自行推导**」。`AttributionVerdict` 不是新发明，而是同一纪律用到设备侧消费者上——服务端判定、布尔下发、客户端不推导。这一先例显著降低了本请求的说服成本。
+
+**D7 对本解法的约束**：D7 裁定无主资源 fail-closed、只有 admin 可 manage。当前实现把「无裁决」一律拒绝，比 D7 更严——D7 隐含 admin 可以另路授权。已在提交文档中作为开放问题（Q3）请上游裁定 admin 裁决在设备侧的形状。
+
 > **落点已迁移（2026-10-29，[ADR-AND-002](../../adr/zh/ADR-AND-002-platform-contract-layer.md) §4）**：原写在 [backend.rs](../../../crates/acowork-android/src/host/backend.rs) 的 `AttributionVerdict` / `AuthorizationContext` / `authorize` 已上移到契约层 [gate.rs](../../../crates/acowork-platform-contract/src/gate.rs)，成为 `AttributionVerdict` / `LocalReadiness` / `Gate::decide`，即规则 **R7** 的执行点。
 > 迁移的理由与本节的分析同源：B1 的冲突源于上游两份文档在回答**不同的问题**（谁能请求 vs 此刻什么可行），而「不同的问题」是平台无关的——把它留在 Android 层，第二个端口就得自己再推导一遍同样的分解。
 > 解法内容**未变**，并由 `r7_the_conjunction_happens_on_the_device_and_neither_authority_suffices`、`r7_the_attribution_verdict_carries_no_identity`、`r7_a_verdict_cannot_be_replayed_against_a_higher_tier` 三个测试钉住。
@@ -69,6 +75,23 @@
 3. 而 `android:fs:outside-app`（写 `/data` 下非自身路径）本质是**带路径参数**的能力，`android:shell:read` 的白名单命令集也是参数 → 与「布尔开关」冲突。
 4. 命名空间不一致：design 30 用点分（`fs.read` / `shell.exec`），本 ADR 用冒号（`android:shell:read`）。
 5. design 30 §9 已点名：「其 HostProfile 能力上报（§7.1）**应改为**同一份能力注册表（§6.2）的一个来源」。
+
+#### 复核后的修正（2026-10-29）：不是「布尔 vs 带参」，是**上游有两张表，都没有它的位置**
+
+上面第 3、4 条把冲突写得太粗。逐字复核上游代码与文档后，事实是：
+
+| 上游表 | 位置 | 命名 | 形状 | 语义 |
+|---|---|---|---|---|
+| 引擎能力注册表 | design 30 §6.2 / D12 | 点分 | **布尔，不带参数**，参数化走 §6.3.2 schema | 引擎*能配置什么* |
+| `Permission` | `permission.rs:112` | **冒号 + 参数** | `FilesystemWrite(Option<String>)`、`Network(Option<String>)`、`IntentSend(Option<String>)` | **agent** manifest 被授权的范围 |
+
+所以「上游能力是布尔开关」只对第一张表成立：已发布的 `Permission` enum **本身就带路径参数、本身就是冒号命名**。真正的缺口不是形状不符，而是**归属**：
+
+- 「可写路径前缀」不是**用户可设置项**——D14 明文「参数 schema 只描述用户可设置项，不接管生效值来源」。用户若能把它调宽，等于让 UI 扩权，所以它不能进 §6.3.2 的参数 schema。
+- 它也不属于 `Permission`——那张表的所有者是 **agent manifest**，而 HostProfile 上报的主体是 **Node**（本 ADR §7.1 已裁定「能力归 Node」，与 ADR-075/ADR-090 同向）。
+- 布尔注册表只装得下「执行档」这类事实（`android.shell.root` 可以拆成布尔），装不下命令集与路径前缀。
+
+**三处都塞不进去**，这才是需要上游裁定的东西——而且它顺带暴露了上游自身的命名不一致（design 30 点分 vs `Permission` 冒号），不是本 ADR 单方面的问题。
 
 #### 已采用的解法：本地领域类型 + 待建的薄适配层
 
