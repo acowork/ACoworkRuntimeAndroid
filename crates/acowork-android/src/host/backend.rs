@@ -875,6 +875,81 @@ mod tests {
     }
 
     #[test]
+    fn two_sessions_never_hold_the_device_at_the_same_time() {
+        // R11 is a *safety* property — never two writers, whatever the interleaving — and
+        // until now every test in this module drove the lock from a single thread. This one
+        // contends for real: two sessions acquire, mark themselves inside, assert nobody else
+        // is marked inside, renew while inside (a compound read-then-write of the identity,
+        // which is where the release-steal window lived), unmark and release.
+        //
+        // What this test does NOT prove, stated plainly so nobody over-reads it: it cannot
+        // reproduce the release-steal bug. That bug needed an *expired* hold to be reclaimed
+        // between the identity read and the contract op, and a test that wants to assert
+        // "never two inside" has to keep holds alive long enough that expiry never makes a
+        // second entry legitimate. The TTL is therefore huge relative to the clock, and the
+        // guarantee this pins is the one the callers actually depend on under load, while the
+        // window itself is closed structurally — one mutex spans each compound operation.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+        // A hold lasting 3600s against a clock that advances one nanosecond per operation: no
+        // hold in this test can ever expire.
+        let lock = Arc::new(SessionWriteLock::with_ttl(Duration::from_secs(3600)));
+        let inside = Arc::new(AtomicU32::new(0));
+        let clock = Arc::new(AtomicU64::new(0));
+        const ITERATIONS: u64 = 3000;
+
+        let hammer = |name: &'static str, bit: u32| {
+            let (lock, inside, clock) =
+                (Arc::clone(&lock), Arc::clone(&inside), Arc::clone(&clock));
+            std::thread::spawn(move || {
+                let mut holds = 0u64;
+                for _ in 0..ITERATIONS {
+                    let tick = |clock: &AtomicU64| {
+                        Duration::from_nanos(clock.fetch_add(1, Ordering::Relaxed))
+                    };
+                    if lock.try_acquire(name, tick(&clock)) != SessionLockOutcome::Acquired {
+                        continue;
+                    }
+                    holds += 1;
+                    let others = inside.fetch_or(bit, Ordering::SeqCst) & !bit;
+                    assert_eq!(
+                        others, 0,
+                        "{name} held the lock while another session was still inside its critical section"
+                    );
+                    // Still ours, and still nobody else's: nothing in this test can expire a
+                    // hold, so anything other than `Acquired` here is the lock losing track of
+                    // who it belongs to.
+                    assert_eq!(
+                        lock.renew(name, tick(&clock)),
+                        SessionLockOutcome::Acquired,
+                        "{name} lost a hold it never released and could not have expired"
+                    );
+                    std::hint::spin_loop();
+                    inside.fetch_and(!bit, Ordering::SeqCst);
+                    lock.release(name);
+                }
+                holds
+            })
+        };
+
+        let a = hammer("A", 1 << 0);
+        let b = hammer("B", 1 << 1);
+        let (a, b) = (a.join().unwrap(), b.join().unwrap());
+        // A lock nobody ever gets is trivially exclusive, so the safety assertions above are
+        // only meaningful if both sessions actually got through.
+        assert!(
+            a > 0 && b > 0,
+            "both sessions must acquire at least once — A got {a}, B got {b}"
+        );
+        assert_eq!(
+            lock.current_holder(),
+            None,
+            "every hold taken here was released"
+        );
+    }
+
+    #[test]
     fn a_holder_that_stalled_past_the_ttl_gets_the_lock_back_by_asking() {
         // Expiry is a presumption of death, not a verdict: if nobody else took the device, the
         // session that comes back late may reclaim it. What it may not do is reclaim silently
