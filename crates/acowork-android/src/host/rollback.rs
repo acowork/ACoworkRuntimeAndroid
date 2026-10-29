@@ -572,7 +572,7 @@ impl Unundoable {
 /// The enabled-state family shares one reason: the commands pair up, but the read does not
 /// distinguish the modes, so no inverse can be named. Kept as one string because four copies of
 /// a sentence drift four ways.
-const ENABLED_STATE_REASON: &str = "the commands pair up, but no read on this device reports      *which* disabled mode a package is in — `pm list packages -d` folds `disabled`,      `disabled-user` and `disable-until-used` into one list (measured on BLA-AL00: 0 rows      against 300 enabled packages), so restoring the flag can set a different mode than the one      observed. That is a second unapproved change, not a rollback";
+const ENABLED_STATE_REASON: &str = "the commands pair up, but no read on this device reports *which* disabled mode a package is in — `pm list packages -d` folds `disabled`, `disabled-user` and `disable-until-used` into one list (measured on BLA-AL00: 0 rows against 300 enabled packages), so restoring the flag can set a different mode than the one observed. That is a second unapproved change, not a rollback";
 
 const IRREVERSIBLE: &[(&str, &str, UnundoableKind, &str)] = &[
     (
@@ -788,7 +788,9 @@ pub fn plan(script: &str) -> Plan {
             None if command.redirect.is_some() => out.unundoable.push(Unundoable {
                 command: finding.command.clone(),
                 why: format!(
-                    "redirects to {:?}, which is not a plain absolute path — a relative name, a                      glob or a `$variable` names a file this capture cannot identify, so no                      snapshot was taken and this change stays after the session ends",
+                    "redirects to {:?}, which is not a plain absolute path — a relative name, a \
+                     glob or a `$variable` names a file this capture cannot identify, so no \
+                     snapshot was taken and this change stays after the session ends",
                     command.redirect.as_deref().unwrap_or("")
                 ),
                 kind: UnundoableKind::IndeterminateTarget,
@@ -1576,7 +1578,7 @@ impl ReversibleBackend {
             left.push(Unundoable {
                 command: undo.target.describe(),
                 why: format!(
-                    "session {session} was closed without restoring, and this change was left in                      place deliberately; the undo was dropped{}",
+                    "session {session} was closed without restoring, and this change was left in place deliberately; the undo was dropped{}",
                     if undo.persists_reboot {
                         ", and it survives a reboot"
                     } else {

@@ -220,7 +220,7 @@ ADR §7.4 只裁定了 `fs:system` 与 `selinux:permissive` 两条需要 owner �
 - 外加 ADR §6 P1 的不变量：root-shell 档下 Runtime 自身 privilege 恒 `< Root`
 - 外加 ADR §7.1 红线：Gateway 摘要在每一档上均不泄漏 SELinux context / fs_roots 路径 / ABI / build type
 
-### 测试发现的 6 个真实缺陷
+### 测试发现的 10 个真实缺陷
 
 先写测试的价值——以下都不是测试写错，是实现或设计错：
 
@@ -232,6 +232,12 @@ ADR §7.4 只裁定了 `fs:system` 与 `selinux:permissive` 两条需要 owner �
 | 4 | 档位优先级允许「ApkSandbox 却声明 shell 能力」（B9） | profile 自相矛盾，工具注册与档位判定打架 |
 | 5 | `Capability` 按 Rust 变体名序列化 | 变体重命名会静默改变 wire 形态与快照基线 |
 | 6 | `AttributionRefused` 消息只说原因不给下一步 | 违反 N3；策略拒绝退化为重试循环 |
+| 7 | 路径判定跑在**字面拼写**上，不解析 `..` | `/data/local/tmp/../../../dev/block/mmcblk0` 判成普通文件写：§4.6.3 的硬禁加三段路径即可绕开；反向也错——`/data/local/tmp/../../system` 其实是 `/data/system`，多要一次没人做坏事的审批 |
+| 8 | 写目标由**设备**决定时仍按字面前缀判定（`$VAR`、glob、`~`） | `echo x > $TARGET` 花最轻的写档，落点由运行时变量决定；`rm -fr *` 相对一个没人能看见的工作目录删东西 |
+| 9 | `sed -i` 只识别「发生了就地编辑」，不看编辑**哪个**文件 | `sed -i 's/a/b/' /system/build.prop` 只要 `fs:outside-app` 就改到分区 |
+| 10 | `cp`/`mv`/`ln` 把第一个操作数当作被写的文件——那其实是**源** | `cp /data/local/tmp/x /system/bin/y` 花最轻的写档改分区；`mv ... /dev/block/mmcblk0` 不判禁 |
+
+7–10 是同一个错误的四个面：**分类器把「脚本里出现了一个路径」当成「我知道文件会落到哪」**。源不是目的地，写法不是落点，而设备在内核里替它解析的东西（`..`、变量展开、glob、家目录）端口若不自已解析，就是在让请求的措辞决定它被允许要求什么。四条都是先把断言写出来、看它失败才成立的——读代码只会同意它，不会推翻它。
 
 缺陷 2 值得单独记：`fs_roots` 探测的是**非特权**可达范围（probe §2 item 12 只探 `$PREFIX` / `/sdcard` / 自身包目录），**不是** root 可达范围的穷举（README 矩阵写的是「`/data` 大范围」）。因此「路径在 fs_roots 之外」只在**无法提权**的宿主上才等价于「路径错了」。修正后该分支以 `can_escalate` 为前置守卫。
 

@@ -873,7 +873,7 @@ async fn report_rollback_roundtrip(
             format!("MATCH: back to the value it was found with ({before:?})")
         } else {
             format!(
-                "MISMATCH: found {before:?}, left {after:?} — the undo does not restore this                  device, and the claim in §4.6.4 is false here"
+                "MISMATCH: found {before:?}, left {after:?} — the undo does not restore this device, and the claim in §4.6.4 is false here"
             )
         }
     );

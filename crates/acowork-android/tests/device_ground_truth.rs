@@ -488,7 +488,7 @@ fn the_probe_budget_was_met_on_real_hardware() {
         .expect("at least one command was timed");
     assert!(
         slowest < 500,
-        "an item came within a whisker of its own 500 ms deadline ({slowest} ms): the budget          is being spent by single calls, not by their number"
+        "an item came within a whisker of its own 500 ms deadline ({slowest} ms): the budget is being spent by single calls, not by their number"
     );
     assert_eq!(
         probe.costs.len(),

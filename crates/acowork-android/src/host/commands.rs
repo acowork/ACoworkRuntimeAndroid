@@ -767,15 +767,92 @@ fn analyse(command: &Command) -> Finding {
     effect_of(&head, command.args())
 }
 
-/// Effect of writing to a path: partition and device nodes are the heavier tiers, and
-/// writing a block device outright is banned.
-fn file_effect(target: &str) -> Effect {
-    if is_block_device(target) {
+/// Where a write target actually lands, as far as this port can tell.
+enum Destination {
+    /// One path, read off the text.
+    Known(String),
+    /// A pattern, but every file the shell can reach through it sits under this directory.
+    Bounded { directory: String },
+    /// The device picks the path, after the approval was given.
+    Unknown,
+}
+
+/// Read a write target as the device will resolve it.
+///
+/// `$VAR` and `` ` `` expand before the open, a leading `~` becomes the home directory, and a
+/// glob is filled in from the filesystem — so a prefix test on that text finds a harmless root
+/// and hands out `fs:outside-app` for a write that may land in `/system`. This is the same
+/// "spelling decides the approval" hole [`resolve_path`](super::script::resolve_path) closed for
+/// `..`, arriving by a different route, and it is closed the same way: say the port cannot tell
+/// what the script does, rather than guessing.
+///
+/// A glob is not automatically unknowable. `rm -fr /data/local/tmp/*` is confined to a directory
+/// the shell owns, and refusing it would cost an approval for a bounded operation the port can
+/// describe. What makes a glob unbounded is a `..` *after* the metacharacter, because that is
+/// resolved after expansion: `/data/*/../../system/x` climbs out of whatever `/data/*` matched.
+/// And a pattern with no directory part at all (`*`, `log*.txt`) is relative to a working
+/// directory this port never sees, which is unknown for a different reason.
+fn destination(target: &str) -> Destination {
+    if target.contains(['$', '`']) || target.starts_with('~') {
+        return Destination::Unknown;
+    }
+    let Some(first) = target.find(['*', '?', '[']) else {
+        return Destination::Known(target.to_string());
+    };
+    let (prefix, rest) = target.split_at(first);
+    if prefix.is_empty() || rest.split('/').any(|segment| segment == "..") {
+        return Destination::Unknown;
+    }
+    Destination::Bounded {
+        directory: prefix.to_string(),
+    }
+}
+
+/// Effect of writing to a path we have already decided the port can see.
+fn effect_at(path: &str) -> Effect {
+    if is_block_device(path) {
         Effect::Banned
-    } else if is_partition_path(target) {
+    } else if is_partition_path(path) {
         Effect::SystemWrite
     } else {
         Effect::FileWrite
+    }
+}
+
+/// Effect of writing to a path: partition and device nodes are the heavier tiers, writing a
+/// block device outright is banned, and a destination the device picks is refused outright.
+fn file_effect(target: &str) -> Effect {
+    match destination(target) {
+        Destination::Unknown => Effect::Opaque,
+        Destination::Known(path) => effect_at(&path),
+        // The directory part of a pattern is what bounds it; the glob tail decides nothing about
+        // which *tier* the write belongs to.
+        Destination::Bounded { directory } => effect_at(&directory),
+    }
+}
+
+/// Which operands of a filesystem-mutating command name the files it changes.
+///
+/// Getting this wrong is not a rounding error: reading the first operand as "the file" describes
+/// the *source* of a copy, and the source is only read.
+///
+/// - `cp` and `ln` write their last operand only.
+/// - `mv` writes the last **and** unlinks the others from where they were, so both sides of the
+///   rename belong to whatever tier the operation touches.
+/// - Everything else in [`FILE_WRITE`] (`touch`, `chmod`, `chown`, `tee`, `truncate`, `rm`, the
+///   formatters) acts on every operand it names.
+///
+/// `None` is the case where no destination can be seen: `cp /data/local/tmp/x` with a single
+/// operand puts its result in a working directory this port never observes. Refusing that is the
+/// same rule already applied to `sed -i` — a classifier that guesses which file a human approved
+/// has approved an operation nobody looked at.
+fn written_targets<'a>(head: &str, operands: &[&'a str]) -> Option<Vec<&'a str>> {
+    match head {
+        "cp" | "ln" if operands.len() > 1 => operands.last().copied().map(|t| vec![t]),
+        "mv" if operands.len() > 1 => Some(operands.to_vec()),
+        "cp" | "ln" | "mv" => None,
+        _ if operands.is_empty() => None,
+        _ => Some(operands.to_vec()),
     }
 }
 
@@ -821,10 +898,13 @@ fn effect_of(head: &str, args: &[String]) -> Finding {
             .map(|a| a.as_str())
             .filter(|a| !a.starts_with('-'))
             .collect();
-        if targets
-            .iter()
-            .any(|t| is_destructive_root(t) || is_partition_path(t))
-        {
+        if targets.iter().any(|t| match destination(t) {
+            Destination::Unknown => false,
+            Destination::Known(path) => is_destructive_root(&path) || is_partition_path(&path),
+            Destination::Bounded { directory } => {
+                is_destructive_root(&directory) || is_partition_path(&directory)
+            }
+        }) {
             return Finding::new(
                 head,
                 Effect::Banned,
@@ -832,6 +912,23 @@ fn effect_of(head: &str, args: &[String]) -> Finding {
                     "`rm {}` removes a partition root or the device root, and {}",
                     targets.join(" "),
                     BANNED_TEXT
+                ),
+            );
+        }
+        // A removal the port cannot bound is not a removal it can allow: `$DIR`, a bare `*`
+        // relative to a working directory nobody can see, and a pattern with a `..` after it all
+        // decide *what* gets deleted after the approval was given.
+        if let Some(target) = targets
+            .iter()
+            .find(|t| matches!(destination(t), Destination::Unknown))
+        {
+            return Finding::new(
+                head,
+                Effect::Opaque,
+                format!(
+                    "`rm` of `{target}` deletes something the device picks: a variable, a home \
+                     directory, a pattern relative to an unseen working directory, or a glob \
+                     with `..` after it"
                 ),
             );
         }
@@ -913,7 +1010,40 @@ fn effect_of(head: &str, args: &[String]) -> Finding {
             }
         }
         if head == "sed" && flag("i") {
-            return Finding::new(head, Effect::FileWrite, "-i edits a file in place");
+            // `-i` rewrites the files named *after* the script expression, and the classifier
+            // used to stop at "an in-place edit happened" and hand out FileWrite whatever the
+            // file was: `sed -i 's/a/b/' /system/build.prop` asked for the lightest write tier
+            // there is. Which operand is the script is only decidable when nothing interleaves
+            // more expressions with more files, so `-e` and a missing operand are refused rather
+            // than guessed — a port that guesses which filename a human approved has approved a
+            // different operation than the one on the screen.
+            let interleaved = args
+                .iter()
+                .any(|a| a.starts_with("-e") || a.starts_with("--expression"));
+            let operands: Vec<&str> = args
+                .iter()
+                .filter(|a| !a.starts_with('-'))
+                .map(String::as_str)
+                .collect();
+            if interleaved {
+                return Finding::opaque(
+                    head,
+                    "-e interleaves script expressions with file names, so which operand gets \
+                     rewritten cannot be told apart",
+                );
+            }
+            if operands.len() < 2 {
+                return Finding::opaque(
+                    head,
+                    "-i edits a file in place and none was named, so there is nothing to check",
+                );
+            }
+            let effect = operands[1..].iter().map(|f| file_effect(f)).max();
+            return Finding::new(
+                head,
+                effect.unwrap_or(Effect::Opaque),
+                format!("rewrites `{}` in place", operands[1..].join("`, `")),
+            );
         }
         if head == "screencap" {
             // `screencap` alone writes nothing; with a path it saves a capture there.
@@ -939,12 +1069,28 @@ fn effect_of(head: &str, args: &[String]) -> Finding {
     }
 
     if FILE_WRITE.contains(&head) {
-        let target = args
+        // Which operands name the files that change. This used to read the *first* argument as
+        // "the file", which for `cp`, `mv` and `ln` is the source — so the destination was never
+        // classified at all, and `cp /data/local/tmp/x /system/bin/y` cost the lightest write
+        // tier available while changing a partition.
+        let operands: Vec<&str> = args
             .iter()
-            .find(|a| !a.starts_with('-'))
-            .map(|a| a.as_str())
-            .unwrap_or("a file");
-        return Finding::new(head, file_effect(target), format!("modifies `{target}`"));
+            .filter(|a| !a.starts_with('-'))
+            .map(String::as_str)
+            .collect();
+        let Some(targets) = written_targets(head, &operands) else {
+            return Finding::opaque(
+                head,
+                "the file it would change is not named: with one operand the destination is \
+                 relative to a working directory this port never sees",
+            );
+        };
+        let effect = targets
+            .iter()
+            .map(|t| file_effect(t))
+            .max()
+            .unwrap_or(Effect::Opaque);
+        return Finding::new(head, effect, format!("modifies `{}`", targets.join("`, `")));
     }
 
     if SHELL_WRITE.contains(&head) {
@@ -1567,6 +1713,165 @@ mod tests {
         assert_eq!(
             effect("echo x > '/data/local/tmp/../../../system/x'"),
             Effect::SystemWrite
+        );
+    }
+
+    #[test]
+    fn a_write_target_whose_destination_is_decided_on_the_device_is_refused() {
+        // The classifier may only reason about a destination it can see. These all name a file
+        // the *device* picks: `$` and the backtick expand before the open, a glob is filled in
+        // from the filesystem, `~` becomes the home directory.
+        assert_eq!(
+            effect("echo x > $TARGET"),
+            Effect::Opaque,
+            "the destination is a variable"
+        );
+        assert_eq!(
+            effect("echo x > /data/local/tmp/$SUB"),
+            Effect::Opaque,
+            "half of it is a variable"
+        );
+        assert_eq!(
+            effect("echo x > `echo /system/x`"),
+            Effect::Opaque,
+            "half of it is a command"
+        );
+        assert_eq!(
+            effect("echo x > /data/*/../../system/x"),
+            Effect::Opaque,
+            "the `..` is resolved after the glob, so it climbs out of whatever /data/* matched"
+        );
+        assert_eq!(
+            effect("echo x > ~/../system/x"),
+            Effect::Opaque,
+            "the home directory is not something this port can see"
+        );
+    }
+
+    #[test]
+    fn a_glob_is_bounded_by_its_directory_not_refused_on_sight() {
+        // `rm -fr /data/local/tmp/*` is a normal cleanup of a directory the shell owns. Refusing
+        // every pattern would be over-blocking with a straight face; the thing that makes a
+        // pattern unknowable is having no directory part, or a `..` after it.
+        assert_eq!(
+            effect("rm -fr /data/local/tmp/*"),
+            Effect::FileWrite,
+            "bounded to a directory that belongs to no partition"
+        );
+        assert_eq!(
+            effect("getprop > /data/local/tmp/*.log"),
+            Effect::FileWrite,
+            "the glob tail decides the name, not the tier"
+        );
+        assert_eq!(
+            effect("getprop > /system/*"),
+            Effect::SystemWrite,
+            "a pattern inside a partition is still a write to that partition"
+        );
+        assert_eq!(
+            effect("rm -fr /*"),
+            Effect::Banned,
+            "bounded to the device root, which is the ban"
+        );
+        assert_eq!(
+            effect("rm -fr *"),
+            Effect::Opaque,
+            "relative to a working directory nobody can see"
+        );
+    }
+
+    #[test]
+    fn a_harmless_looking_variable_still_has_to_be_refused() {
+        // The whole point of the ban list is that it does not depend on the caller's intentions.
+        // A `dd` whose `of=` is a variable is the same hole as a redirect whose target is one.
+        assert_eq!(
+            effect("dd if=/dev/zero of=$BLOCK"),
+            Effect::Opaque,
+            "the block device is chosen after the approval"
+        );
+        assert_eq!(
+            effect("sed -i 's/a/b/' $FILE"),
+            Effect::Opaque,
+            "in-place editing of an unseeable path"
+        );
+    }
+
+    #[test]
+    fn an_in_place_edit_is_classified_by_the_file_it_rewrites() {
+        // `sed -i` was the third instance of the same mistake: the classifier noticed that a
+        // file was rewritten and never asked which one, so `/system/build.prop` cost the same
+        // approval as a scratch file. The script expression is skipped on purpose — it is not a
+        // path, and `s/x$/Y/` would otherwise read as a variable.
+        assert_eq!(
+            effect("sed -i 's/a/b/' /system/build.prop"),
+            Effect::SystemWrite
+        );
+        assert_eq!(
+            effect("sed -i 's/a/b/' /dev/block/mmcblk0"),
+            Effect::Banned,
+            "rewriting a raw device through a text editor is still writing it"
+        );
+        assert_eq!(
+            effect("sed -i 's/x$/Y/' /data/local/tmp/x"),
+            Effect::FileWrite,
+            "an end-of-line anchor is not a variable"
+        );
+        assert_eq!(
+            effect("sed -i -e 's/a/b/' /data/local/tmp/x"),
+            Effect::Opaque,
+            "-e makes the operand list ambiguous"
+        );
+        assert_eq!(
+            effect("sed -i 's/a/b/'"),
+            Effect::Opaque,
+            "an in-place edit with no file named"
+        );
+    }
+
+    #[test]
+    fn the_destination_of_a_copy_is_what_costs_the_approval() {
+        // The classifier took the *first* non-flag argument as the file a command writes. For
+        // `cp`, `mv` and `ln` that argument is the source, so the destination — the file that
+        // actually changes — was never looked at: `cp /data/local/tmp/x /system/bin/y` cost the
+        // same approval as a scratch file, and `mv ... /dev/block/mmcblk0` was not banned.
+        assert_eq!(
+            effect("cp /data/local/tmp/x /system/bin/y"),
+            Effect::SystemWrite
+        );
+        assert_eq!(
+            effect("mv /data/local/tmp/x /dev/block/mmcblk0"),
+            Effect::Banned
+        );
+        assert_eq!(
+            effect("ln -s /data/local/tmp/x /system/bin/sh"),
+            Effect::SystemWrite,
+            "the link name is the file created, not the thing it points at"
+        );
+        assert_eq!(
+            effect("cp /system/app/x.apk /data/local/tmp/y"),
+            Effect::FileWrite,
+            "reading out of /system is not writing to it"
+        );
+        assert_eq!(
+            effect("mv /system/x /data/local/tmp/y"),
+            Effect::SystemWrite,
+            "but moving a file out of /system does change /system"
+        );
+        assert_eq!(
+            effect("chmod 755 /system/bin/x"),
+            Effect::SystemWrite,
+            "the mode is not a path, and the path is not first"
+        );
+        assert_eq!(effect("truncate -s 0 /data/local/tmp/x"), Effect::FileWrite);
+        assert_eq!(
+            effect("tee /system/x"),
+            Effect::SystemWrite,
+            "tee writes every operand it names"
+        );
+        assert_eq!(
+            effect("cp /data/local/tmp/x"),
+            Effect::Opaque,
+            "one operand means the destination is relative to a working directory nobody sees"
         );
     }
 

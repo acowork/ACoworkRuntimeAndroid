@@ -1411,7 +1411,7 @@ mod tests {
         assert!(text.contains("android:shell:write"), "{text}");
         assert!(
             text.contains("android:shell:read"),
-            "the refusal has to say what this device *does* allow, or the caller retries                 harder instead of elsewhere: {text}"
+            "the refusal has to say what this device *does* allow, or the caller retries harder instead of elsewhere: {text}"
         );
         assert!(
             backend.runner.invocations().is_empty(),
