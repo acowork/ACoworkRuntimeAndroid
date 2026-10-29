@@ -927,10 +927,16 @@ fn effect_of(head: &str, args: &[String]) -> Finding {
         return Finding::new(head, Effect::Banned, BANNED_TEXT);
     }
     if head == "dd" {
-        for arg in args {
-            if let Some(target) = arg.strip_prefix("of=") {
-                return Finding::new(head, file_effect(target), format!("writes `{target}`"));
-            }
+        // Every `of=` in the script, not the first: a copy can name more than one destination,
+        // and returning on the first match is the same reflex that had `cp` classify a source.
+        let targets: Vec<&str> = args.iter().filter_map(|a| a.strip_prefix("of=")).collect();
+        if !targets.is_empty() {
+            let effect = targets
+                .iter()
+                .map(|t| file_effect(t))
+                .max()
+                .unwrap_or(Effect::Opaque);
+            return Finding::new(head, effect, format!("writes `{}`", targets.join("`, `")));
         }
         return Finding::new(head, Effect::ReadOnly, "copies stdin to stdout");
     }
@@ -2007,6 +2013,25 @@ mod tests {
             effect("getprop > /data/local/tmp/log"),
             Effect::FileWrite,
             "a pure read with a redirect is still only the file write"
+        );
+    }
+
+    #[test]
+    fn every_output_operand_of_a_copy_counts_not_just_the_first() {
+        // `dd` returned on the first `of=` it saw, the same "first match wins" reflex that made
+        // `cp` read its source as the destination. Both names are in the script, so the heavier
+        // one is the tier the command needs.
+        assert_eq!(
+            effect("dd if=/dev/zero of=/data/local/tmp/x of=/dev/block/mmcblk0"),
+            Effect::Banned
+        );
+        assert_eq!(
+            effect("dd if=/dev/zero of=/data/local/tmp/x"),
+            Effect::FileWrite
+        );
+        assert_eq!(
+            effect("dd if=/dev/zero of=/data/local/tmp/x of=/system/y"),
+            Effect::SystemWrite
         );
     }
 
