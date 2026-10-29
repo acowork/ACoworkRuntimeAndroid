@@ -132,6 +132,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
         report_evidence(&profile);
         println!("\n── 8. §7.1 projection redaction ───────────────────");
         report_projection(&profile, &transport).await;
+        println!("\n── 9. §4.6.4 rollback planner ─────────────────────");
+        report_rollback(&profile, &transport).await;
     }
 
     Ok(())
@@ -357,6 +359,102 @@ async fn report_exec(profile: &HostProfile, transport: &AdbTransport) {
 /// Printed rather than asserted, because the device decides whether there is anything to
 /// check: a quiet log window means the path was not exercised, and saying so out loud is
 /// worth more than a green line that proved nothing.
+/// What §4.6.4 would remember before a write, and what it would run at session end.
+///
+/// **No write is executed here.** The point of the section is the pre-state capture and the
+/// inverse it produces, and both are reachable by running the read half against the device —
+/// which is the half that has to be right, since an undo built on a misread value is a second,
+/// unapproved change rather than a rollback. Toggling a real property on somebody's handset to
+/// watch the restore path work is a demonstration the unit tests already cover with a fake
+/// backend that records the request sequence.
+async fn report_rollback(profile: &HostProfile, transport: &AdbTransport) {
+    let backend = match ShellBackend::with_runner(profile.clone(), transport.clone()) {
+        Ok(b) => b,
+        Err(e) => {
+            println!("  no shell backend for this profile: {e}");
+            return;
+        }
+    };
+
+    for script in [
+        "setprop debug.stagefright.ccodec 1",
+        "settings put system font_scale 1.6",
+        "setenforce 0",
+    ] {
+        println!("\n  {script}");
+        let plan = acowork_android::host::plan_rollback(script);
+        for capture in &plan.captures {
+            let request = ExecRequest::read(capture.read.clone(), "harness-session");
+            let observed = match backend.exec(request).await {
+                Ok(r) if r.succeeded() => Some(r.stdout),
+                Ok(r) => {
+                    println!(
+                        "    capture `{}` -> exit {:?}: {}",
+                        capture.read,
+                        r.exit_code,
+                        r.stderr.trim()
+                    );
+                    None
+                }
+                Err(e) => {
+                    println!("    capture `{}` -> {e}", capture.read);
+                    None
+                }
+            };
+            let claimed = acowork_android::host::classify_script(script)
+                .strongest()
+                .capability();
+            let mut request = ExecRequest::new(
+                claimed.unwrap_or(acowork_android::host::Capability::ShellWrite),
+                script,
+                "harness-session",
+            );
+            request.approval_token = Some(acowork_android::host::ApprovalToken::new("harness"));
+            match acowork_android::host::undo_for(capture, observed.as_deref(), &request) {
+                acowork_android::host::UndoResult::Undo(undo) => {
+                    println!(
+                        "    pre-state {:?}  ->  would restore with `{}`{}",
+                        undo.old_value,
+                        undo.inverse,
+                        if undo.faithful {
+                            String::new()
+                        } else {
+                            " (approximate: the key was unset, and Android has no unset)"
+                                .to_string()
+                        }
+                    );
+                    println!(
+                        "    capability {}  approval reused: {}  persists across reboot: {}",
+                        undo.capability,
+                        undo.token.is_some(),
+                        undo.persists_reboot
+                    );
+                }
+                acowork_android::host::UndoResult::NothingToUndo(why) => {
+                    println!("    nothing to undo: {why}");
+                }
+                acowork_android::host::UndoResult::CannotUndo(why) => {
+                    println!("    NO UNDO POSSIBLE: {why}");
+                }
+            }
+        }
+    }
+
+    println!("\n  writes this port cannot put back:");
+    for script in [
+        "am broadcast -a android.intent.action.BOOT_COMPLETED",
+        "echo note > /data/local/tmp/note.txt",
+        "setprop persist.sys.demo 1 &",
+    ] {
+        for item in acowork_android::host::plan_rollback(script).unundoable {
+            // Two lines rather than a padded column: the unanalysable case's "command" is the
+            // whole script, and a fixed width either truncates it or pushes the reason off the
+            // edge — and the reason is the part that matters.
+            println!("    {}\n      {}", item.command, item.why);
+        }
+    }
+}
+
 async fn report_projection(profile: &HostProfile, transport: &AdbTransport) {
     let backend = match ShellBackend::with_runner(profile.clone(), transport.clone()) {
         Ok(b) => b,

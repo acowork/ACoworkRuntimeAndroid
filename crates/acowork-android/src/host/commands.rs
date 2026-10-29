@@ -332,6 +332,23 @@ pub fn classify(script: &str) -> Verdict {
     }
 }
 
+/// The script's commands as the argument vectors the shell would pass them.
+///
+/// `None` means the script could not be split at all — backgrounding, a subshell, a command
+/// substitution. That is deliberately not the same as `Some(vec![])`: a caller that wants to
+/// reason about *arguments* (the rollback planner, which has to know which prop a `setprop`
+/// names) must not read "unanalysable" as "nothing to undo here".
+///
+/// This exists because the classifier throws the arguments away. `Finding` records the command
+/// word and the reason for its effect, which is all a tier decision needs and none of what an
+/// inverse needs. Re-implementing the lexer next to it would guarantee the two disagree about
+/// what `setprop a 'b c'` is, and the disagreement would surface as a rollback that restores
+/// the wrong value.
+pub fn words(script: &str) -> Option<Vec<Vec<String>>> {
+    let commands = lex(script).and_then(split).ok()?;
+    Some(commands.into_iter().map(|c| c.words).collect())
+}
+
 /// Classify and check the claim in one step.
 pub fn check(script: &str, claimed: Option<Capability>) -> Result<Verdict, Refusal> {
     let verdict = classify(script);
@@ -1146,6 +1163,30 @@ mod tests {
             .into_iter()
             .next()
             .unwrap_or_else(|| panic!("no finding for {script:?}"))
+    }
+
+    #[test]
+    fn words_recovers_the_arguments_the_classifier_throws_away() {
+        // The rollback planner reads prop names and values out of these vectors, so quoting
+        // has to survive exactly as the shell would see it.
+        assert_eq!(
+            words("setprop debug.foo.bar 'a b'"),
+            Some(vec![vec![
+                "setprop".to_string(),
+                "debug.foo.bar".to_string(),
+                "a b".to_string()
+            ]])
+        );
+        // Two commands, two vectors — a script that changes two props needs two undos.
+        assert_eq!(
+            words("setprop a 1; setprop b 2").map(|v| v.len()),
+            Some(2),
+            "a sequence is not one command"
+        );
+        // `None`, not an empty list: "I could not read this" must not look like "nothing here
+        // needs undoing".
+        assert_eq!(words("setprop a b &"), None);
+        assert_eq!(words(""), Some(vec![]));
     }
 
     #[test]

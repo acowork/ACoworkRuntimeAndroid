@@ -31,6 +31,7 @@
 //! | Transport | [`adb`] | Drive a device from the host over `adb` (feature `device`) | I/O |
 //! | Feedback | [`denial`] | `avc: denied` → an actionable next step | Pure, plus a session ledger |
 //! | Accountability | [`audit`] | §4.6.1: one record per attempt, written before and after | I/O on the way in, pure mapping |
+//! | Reversibility | [`rollback`] | §4.6.4: capture a write's pre-state, restore it at session end | Pure planner, plus a backend decorator |
 //!
 //! Keeping the parsers pure is not tidiness for its own sake: it is what makes the
 //! P0 acceptance criterion in ADR-AND-001 §6 ("单元测试用伪造 probe 输出")
@@ -60,6 +61,7 @@ pub mod denial;
 pub mod facts;
 pub mod probe;
 pub mod profile;
+pub mod rollback;
 pub mod script;
 pub mod spawn;
 pub mod tools;
@@ -99,6 +101,10 @@ pub use probe::{
     ProbeRunner, SPOT_CHECK_APPLETS, all_commands, parse_spot_checks, run_probe,
 };
 pub use profile::{HostCapabilitySummary, HostProfile, HostProfileName, ShellPaths};
+pub use rollback::{
+    Capture, Plan, RestoreReport, ReversibleBackend, RollbackLedger, Undo, UndoResult, UndoTarget,
+    Unundoable, Writing, plan as plan_rollback, undo_for,
+};
 pub use script::{
     Identity, PreparedScript, ScriptError, extract_identity, is_valid_env_key, next_nonce,
     nonce_of, prepare, quote_posix,
