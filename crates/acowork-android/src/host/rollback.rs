@@ -76,6 +76,17 @@ use crate::host::script::quote_posix;
 /// lands at a quarter of that. Raising it means raising the output cap, not this constant.
 pub const SNAPSHOT_BUDGET_BYTES: u64 = 64 * 1024;
 
+/// How much of the Agent workspace the whole snapshot store may occupy.
+///
+/// Enforced when a backup is *taken*, not when one would be evicted. The difference is the
+/// point: an evicted backup voids an undo already written into the ledger, so the ledger would
+/// go on promising a restore whose bytes are gone, and the failure would surface at teardown —
+/// the worst possible moment to discover it. Refusing at capture time means the promise is
+/// simply never made, and the reason appears in the same teardown line as the write that caused
+/// it. Sized against the per-file budget: 8 MiB is roughly ninety-four 64 KiB backups, which is
+/// far more file edits than a debugging session performs, and the workspace is on the host.
+pub const SNAPSHOT_STORE_BUDGET_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Base64 characters handed to one command when a snapshot is put back.
 ///
 /// Measured on a Huawei BLA-AL00 (EMUI, `/system/bin/sh` + toybox): a single argument
@@ -102,12 +113,34 @@ pub const SNAPSHOT_STAGING_DIR: &str = "/data/local/tmp";
 #[derive(Debug, Clone)]
 pub struct SnapshotStore {
     dir: PathBuf,
+    budget: u64,
 }
 
 impl SnapshotStore {
     /// Store snapshots under `dir`, created on first use.
     pub fn new(dir: impl Into<PathBuf>) -> SnapshotStore {
-        SnapshotStore { dir: dir.into() }
+        SnapshotStore {
+            dir: dir.into(),
+            budget: SNAPSHOT_STORE_BUDGET_BYTES,
+        }
+    }
+
+    /// The same, with a different allowance.
+    ///
+    /// The budget belongs to the workspace, and the workspace belongs to the node, so a caller
+    /// that has decided "4 MiB of backups in this Agent's directory" should say so here rather
+    /// than discover the port's default at the wrong moment. It is also what makes the refusal
+    /// testable without writing 8 MiB of base64 to a temp directory.
+    pub fn with_budget(dir: impl Into<PathBuf>, budget: u64) -> SnapshotStore {
+        SnapshotStore {
+            dir: dir.into(),
+            budget,
+        }
+    }
+
+    /// The allowance this store enforces.
+    pub fn budget(&self) -> u64 {
+        self.budget
     }
 
     /// Where they live.
@@ -131,6 +164,21 @@ impl SnapshotStore {
         base64_payload: &str,
     ) -> std::io::Result<PathBuf> {
         std::fs::create_dir_all(&self.dir)?;
+        let used = self.used_bytes();
+        let incoming = base64_payload.len() as u64;
+        if used + incoming > self.budget {
+            // `StorageFull` is the honest kind: this is not a permissions problem or a missing
+            // directory, and a caller that retries would just fail again.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                format!(
+                    "the snapshot store holds {used} bytes against a {}-byte budget, and this \
+                     backup needs {incoming} — no older backup is evicted to make room, because \
+                     that would void an undo already promised; this one is simply not promised",
+                    self.budget
+                ),
+            ));
+        }
         let path = self.dir.join(format!(
             "{}-{}.b64",
             sanitize(session, 40, '_'),
@@ -140,6 +188,25 @@ impl SnapshotStore {
         file.write_all(base64_payload.as_bytes())?;
         file.flush()?;
         Ok(path)
+    }
+
+    /// Bytes currently occupied by stored backups.
+    ///
+    /// Summed from the directory rather than kept in a counter: the store is `Clone` and handed
+    /// around behind an `Arc`, and a counter would be one more piece of state that can disagree
+    /// with what is actually on disk. A few dozen `stat` calls per backup is not the cost worth
+    /// being wrong about.
+    pub fn used_bytes(&self) -> u64 {
+        std::fs::read_dir(&self.dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|e| e.metadata().ok())
+                    .filter(|m| m.is_file())
+                    .map(|m| m.len())
+                    .sum()
+            })
+            .unwrap_or_default()
     }
 
     /// Drop a snapshot. Best effort: a failure here leaves a stale backup in the workspace,
@@ -1324,6 +1391,24 @@ impl RollbackLedger {
             .unwrap_or_default()
     }
 
+    /// Remove and return one session's pending undos.
+    ///
+    /// Returned rather than dropped because the caller has to say what happened to them: an
+    /// undo that vanishes from the ledger looks exactly like an undo that ran.
+    pub(crate) fn take_session(&mut self, session: &str) -> Vec<Undo> {
+        let mut taken = Vec::new();
+        let mut kept = Vec::with_capacity(self.entries.len());
+        for entry in std::mem::take(&mut self.entries) {
+            if entry.session_id == session {
+                taken.push(entry);
+            } else {
+                kept.push(entry);
+            }
+        }
+        self.entries = kept;
+        taken
+    }
+
     /// Declare a change permanent — §4.6.4's 「`persist.*` 需显式声明才保留」.
     ///
     /// Returns whether anything was dropped. The declaration is an act of *not* rolling back,
@@ -1415,6 +1500,17 @@ impl ReversibleBackend {
         }
     }
 
+    /// Wrap a backend with a store the caller configured — a different workspace allowance, or a
+    /// directory shared with another backend. `new` is the default-budget case; this is the one
+    /// a node reaches for when it has decided how much of the Agent workspace backups may take.
+    pub fn with_store(inner: Arc<dyn ExecutionBackend>, store: SnapshotStore) -> ReversibleBackend {
+        ReversibleBackend {
+            inner,
+            ledger: Arc::new(Mutex::new(RollbackLedger::new())),
+            store: Arc::new(store),
+        }
+    }
+
     /// Wrap a backend with a ledger and a snapshot store the caller already holds.
     pub fn with_ledger(
         inner: Arc<dyn ExecutionBackend>,
@@ -1447,6 +1543,47 @@ impl ReversibleBackend {
         self.ledger
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Give up on a session without touching the device.
+    ///
+    /// This is the path for a session that is closing without a rollback — the operator said
+    /// keep it, or the node is discarding the session entirely. Two things must happen together
+    /// and neither can be left to the caller: the host copies go, and the ledger says out loud
+    /// that the device is still changed. An implementation that only cleared the ledger would
+    /// produce the one report this module exists to prevent — an empty undo list that reads like
+    /// a clean device.
+    pub fn abandon(&self, session: &str) -> usize {
+        let taken = self
+            .ledger
+            .lock()
+            .map(|mut l| l.take_session(session))
+            .unwrap_or_default();
+        let count = taken.len();
+        let mut left = Vec::with_capacity(count);
+        for undo in taken {
+            if let UndoAction::Snapshot { snapshot, .. } = &undo.action {
+                self.store.discard(snapshot);
+            }
+            left.push(Unundoable {
+                command: undo.target.describe(),
+                why: format!(
+                    "session {session} was closed without restoring, and this change was left in                      place deliberately; the undo was dropped{}",
+                    if undo.persists_reboot {
+                        ", and it survives a reboot"
+                    } else {
+                        ""
+                    }
+                ),
+                kind: UnundoableKind::NoRestorableState,
+            });
+        }
+        if !left.is_empty()
+            && let Ok(mut l) = self.ledger.lock()
+        {
+            l.record_unundoable(session, &left);
+        }
+        count
     }
 
     /// Run one capture read.
@@ -3111,5 +3248,141 @@ mod tests {
         let labels: Vec<&str> = all.iter().map(|k| k.label()).collect();
         let unique: std::collections::HashSet<&str> = labels.iter().copied().collect();
         assert_eq!(labels.len(), unique.len(), "{labels:?}");
+    }
+
+    // ── the store's own lifetime ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_full_store_refuses_a_new_backup_instead_of_evicting_an_old_one() {
+        let digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let first = "echo changed > /data/local/tmp/first.txt";
+        let second = "echo changed > /data/local/tmp/second.txt";
+
+        let mut reads = Vec::new();
+        for script in [first, second] {
+            let capture = &plan(script).captures[0];
+            reads.push((capture.read.clone(), capture.content_read().unwrap()));
+        }
+        let dir = snapshot_dir();
+        let fake = Fake::answering(&[
+            (&reads[0].0, "PRESENT\n3\n"),
+            (&reads[0].1, &format!("{digest}  -\nYWJj")),
+            (first, ""),
+            (&reads[1].0, "PRESENT\n3\n"),
+            (&reads[1].1, &format!("{digest}  -\nYWJj")),
+            (second, ""),
+        ]);
+        // Six bytes: the first 4-byte backup fits, the second does not.
+        let backend =
+            ReversibleBackend::with_store(fake, SnapshotStore::with_budget(dir.clone(), 6));
+
+        backend.exec(request_for(first)).await.unwrap();
+        backend.exec(request_for(second)).await.unwrap();
+
+        let pending = backend
+            .ledger()
+            .lock()
+            .unwrap()
+            .pending_for("session-alpha")
+            .len();
+        assert_eq!(
+            pending, 1,
+            "the first backup is kept, the second was refused"
+        );
+        let left = backend
+            .ledger()
+            .lock()
+            .unwrap()
+            .leaving_behind("session-alpha")
+            .to_vec();
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(left[0].kind, UnundoableKind::NoRestorableState);
+        assert!(left[0].why.contains("not promised"), "{}", left[0].why);
+        assert!(
+            left[0].why.contains("evicted"),
+            "the reason has to say why nothing was freed: {}",
+            left[0].why
+        );
+
+        // The refused write still happened — the store is about the *backup*, not about
+        // vetoing the command.
+        let kept: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(kept.len(), 1, "the older backup survived the pressure");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn abandoning_a_session_drops_backups_and_says_the_device_is_still_changed() {
+        let digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let script = "echo changed > /data/local/tmp/note.txt";
+        let capture = &plan(script).captures[0];
+        let (read, content) = (capture.read.clone(), capture.content_read().unwrap());
+        let dir = snapshot_dir();
+        let fake = Fake::answering(&[
+            (&read, "PRESENT\n3\n"),
+            (&content, &format!("{digest}  -\nYWJj")),
+            (script, ""),
+        ]);
+        let backend = ReversibleBackend::new(fake.clone(), dir.clone());
+        backend.exec(request_for(script)).await.unwrap();
+
+        let dropped = backend.abandon("session-alpha");
+        assert_eq!(dropped, 1);
+        assert!(backend.ledger().lock().unwrap().pending().is_empty());
+        assert_eq!(
+            std::fs::read_dir(&dir)
+                .map(|e| e.flatten().count())
+                .unwrap_or(0),
+            0,
+            "the host copy goes with the undo it belonged to"
+        );
+
+        // The point of the whole test: an empty ledger must not read as a clean device.
+        let left = backend
+            .ledger()
+            .lock()
+            .unwrap()
+            .leaving_behind("session-alpha")
+            .to_vec();
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(left[0].kind, UnundoableKind::NoRestorableState);
+        assert!(
+            left[0].why.contains("closed without restoring"),
+            "{}",
+            left[0].why
+        );
+
+        // And abandoning is not a rollback: nothing was ever sent to the device beyond the
+        // capture reads and the write itself.
+        let seen = fake.seen.lock().unwrap().clone();
+        assert!(
+            !seen
+                .iter()
+                .any(|request| request.script.starts_with("base64 -d")),
+            "abandon must not restore: {seen:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn abandoning_a_session_with_nothing_pending_is_quiet() {
+        let backend = ReversibleBackend::new(
+            Fake::answering(&[("setprop debug.foo 1", "")]),
+            snapshot_dir(),
+        );
+        assert_eq!(backend.abandon("never-here"), 0);
+        assert!(
+            backend
+                .ledger()
+                .lock()
+                .unwrap()
+                .leaving_behind("never-here")
+                .is_empty(),
+            "a session that changed nothing must not appear in the teardown list"
+        );
     }
 }

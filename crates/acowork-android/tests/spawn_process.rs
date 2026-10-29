@@ -494,6 +494,10 @@ async fn a_missing_working_directory_is_reported_not_silently_ignored() {
 /// The bounded drain in [`Capture`]/`settle` is what stops it; without that test the runner
 /// returned after 30 s with the right bytes and the wrong duration, which is the kind of bug
 /// only a real process exposes.
+///
+/// The `sleep 20` is a tripwire, not a cost: measured at 0.52 s when the drain is bounded, and
+/// it only runs to 20 s in the regression it exists to catch — which is the moment spending 20 s
+/// is worth it. It is deliberately not `#[ignore]`d or feature-gated for CI.
 #[tokio::test]
 async fn a_grandchild_holding_the_pipes_does_not_delay_a_finished_command() {
     let _process_table = own_the_process_table().await;
