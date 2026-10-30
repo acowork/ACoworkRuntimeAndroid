@@ -143,6 +143,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
         report_evidence_capture(&profile, &transport).await?;
         println!("\n── 13. §4.6.4 pm / am / input surface ─────────────");
         report_package_writes(&profile, &transport).await?;
+        println!("\n── 14. shell semantics the destination rules assert ──");
+        report_shell_semantics(&profile, &transport).await?;
     }
 
     Ok(())
@@ -423,6 +425,14 @@ async fn report_rollback(profile: &HostProfile, transport: &AdbTransport) {
         "setprop debug.stagefright.ccodec 1",
         "settings put system font_scale 1.6",
         "setenforce 0",
+        // The shapes the destination rules were added for: two redirections in one command, a
+        // destination carried in a flag, a copy into a partition, and a write inside an app's
+        // private home. Printed as plans, executed nowhere — §14 measures the shell facts behind
+        // them on the device.
+        "printf AAA > /data/local/tmp/acowork-one > /data/local/tmp/acowork-two",
+        "mv -t /data/local/tmp/acowork-dst /data/local/tmp/acowork-src/a",
+        "install -m 644 /data/local/tmp/a /system/b",
+        "echo x > /data/data/com.acowork.probe/f",
     ] {
         println!("\n  {script}");
         let plan = acowork_android::host::plan_rollback(script);
@@ -1217,6 +1227,135 @@ async fn report_file_snapshot(
         report.still_pending_elsewhere
     );
     println!("  audit records for the whole file session: {}", sink.len());
+    Ok(())
+}
+
+/// §14 — measure on the device the shell facts the classifier's destination rules assert.
+///
+/// Three rules were written from POSIX and AOSP rather than from this handset: every
+/// redirection of a command is applied (`cmd > a > b` truncates `a` and sends stdout to `b`),
+/// `-t DIR` carries the destination for cp/mv/ln/install, and a target that does not start at the
+/// root resolves against a working directory the port never sees. The tiers follow from those
+/// rules, so what has to be checked here is the rules themselves — a classifier that describes a
+/// shell which is not this one is wrong in whichever direction it is wrong.
+///
+/// Everything written sits under `/data/local/tmp`, the one area §11 proved this uid can write,
+/// and is removed again. Nothing here changes a capability or a tier.
+async fn report_shell_semantics(
+    profile: &HostProfile,
+    transport: &AdbTransport,
+) -> Result<(), Box<dyn Error>> {
+    use std::sync::Arc;
+
+    let session = "harness-semantics";
+    let dir = "/data/local/tmp/acowork-sem";
+    let sink = Arc::new(MemoryAuditSink::new());
+    let chain = writable_chain(profile, transport, sink.clone()).await?;
+    let observer: Arc<dyn ExecutionBackend> = Arc::new(ShellBackend::with_runner(
+        profile.clone(),
+        transport.clone(),
+    )?);
+
+    // 1. Which of the commands the classifier reads a destination from exist on this device.
+    println!("  ── presence of the commands whose operands are read as paths ──");
+    for command in ["mv", "cp", "ln", "install", "toybox"] {
+        let found = observe(&observer, format!("command -v {command}")).await;
+        let shown = if found.starts_with('<') {
+            "absent".to_string()
+        } else {
+            found
+        };
+        println!("  {command:<8} {shown}");
+    }
+
+    // 2. Does `-t DIR` carry a destination here? The classifier now tiers the command by that
+    //    directory; if this shell ignores the flag, the write lands somewhere else entirely and
+    //    the answer has to be corrected rather than defended.
+    write(&chain, &format!("mkdir -p {dir}/src {dir}/dst"), session).await?;
+    write(&chain, &format!("printf x > {dir}/src/a"), session).await?;
+    let moved = write_record(&chain, &format!("mv -t {dir}/dst {dir}/src/a"), session).await;
+    let in_dst = observe(
+        &observer,
+        format!("test -e {dir}/dst/a && echo PRESENT || echo ABSENT"),
+    )
+    .await;
+    let in_src = observe(
+        &observer,
+        format!("test -e {dir}/src/a && echo PRESENT || echo ABSENT"),
+    )
+    .await;
+    println!(
+        "  `mv -t {dir}/dst {dir}/src/a` → {}; dst/a {in_dst}, src/a {in_src} ⇒ -t is {}",
+        match &moved {
+            Ok(record) => format!("exit {:?}", record.exit_code),
+            Err(error) => format!("refused: {error}"),
+        },
+        if in_dst.contains("PRESENT") && in_src.contains("ABSENT") {
+            "implemented"
+        } else {
+            "NOT demonstrated by this run"
+        }
+    );
+
+    // 3. Two redirections in one command. The claim is precise, so the check is: `one` is
+    //    truncated and receives nothing, `two` receives stdout. Anything else means the
+    //    classifier's "both files change" is wrong about this shell.
+    write(
+        &chain,
+        &format!("printf AAA > {dir}/one > {dir}/two"),
+        session,
+    )
+    .await?;
+    let one = observe(&observer, format!("wc -c < {dir}/one")).await;
+    let two = observe(&observer, format!("wc -c < {dir}/two")).await;
+    println!(
+        "  `printf AAA > {dir}/one > {dir}/two` → one {one} bytes, two {two} bytes \
+         (classifier expects one truncated to 0, the last target holding the output)"
+    );
+
+    // 4. A relative target. The port refuses to tier these, and this is the fact behind the
+    //    refusal: the file lands wherever the child process happens to sit, which the approval
+    //    text does not carry.
+    let cwd = observe(&observer, "pwd").await;
+    let relative = write_record(&chain, "printf R > acowork-rel.txt", session).await;
+    let landed = observe(
+        &observer,
+        "test -e ./acowork-rel.txt && echo PRESENT || echo ABSENT".to_string(),
+    )
+    .await;
+    let rel_outcome = match &relative {
+        Ok(record) => format!("exit {:?}", record.exit_code),
+        Err(error) => format!("refused: {error}"),
+    };
+    println!(
+        "  `printf R > acowork-rel.txt` → {rel_outcome}; the read tier sits at {cwd}, where the \
+         file is {landed} — a name with no root in it is a different file per working directory"
+    );
+
+    // Teardown: the ledger's own undo list is not what cleans these up (the harness wrote them,
+    // so an honest restore would *recreate* the pre-state), so remove the area explicitly and
+    // then show what the ledger still holds for the session.
+    write(&chain, &format!("rm -rf {dir}"), session).await?;
+    write(&chain, "rm -f /data/local/tmp/acowork-rel.txt", session).await?;
+    let left = pending_for(&chain, session);
+    let report = chain.restore(session).await;
+    println!(
+        "  ledger held {left} undo(s) for this session; restore applied {}, failed {}, \
+         pending elsewhere {}",
+        report.restored.len(),
+        report.failed.len(),
+        report.still_pending_elsewhere
+    );
+    let gone = observe(
+        &observer,
+        format!("test -e {dir} && echo STILL-THERE || echo CLEAN"),
+    )
+    .await;
+    println!("  {dir} after cleanup: {gone}");
+    println!(
+        "  audit records for the whole semantics session: {}",
+        sink.len()
+    );
     Ok(())
 }
 
