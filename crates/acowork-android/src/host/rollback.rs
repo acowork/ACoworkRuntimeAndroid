@@ -2472,6 +2472,10 @@ mod tests {
         // ends" about a command that leaves nothing behind — the same phantom `am broadcast` was
         // corrected for, arriving by a different route.
         let planned = plan("cat /data/data/com.foo/databases/app.db");
+        // The raw-device read is the same shape: an approval, and nothing to put back.
+        let disk = plan("cat /dev/block/mmcblk0");
+        assert!(disk.captures.is_empty(), "{:?}", disk.captures);
+        assert_eq!(disk.unundoable.len(), 1, "{:?}", disk.unundoable);
         assert!(planned.captures.is_empty(), "{:?}", planned.captures);
         assert_eq!(planned.unundoable.len(), 1, "{:?}", planned.unundoable);
         assert_eq!(

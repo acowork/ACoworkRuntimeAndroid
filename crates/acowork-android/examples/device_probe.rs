@@ -1242,6 +1242,10 @@ async fn report_file_snapshot(
 /// A fourth question joined them when the read side got the same treatment as the write side:
 /// which of another uid's homes this tier can actually open. That one is not about the rule's
 /// shape but about what the rule is worth on this device, so it is printed rather than asserted.
+/// The same question now covers the two surfaces the rule grew after the section was written — a
+/// numbered `/proc` entry and the block-device directory. Where a file is the disclosure rather
+/// than the listing, the probe reads **one byte and throws it away** to answer readable-or-not;
+/// it prints the verdict, never the bytes.
 ///
 /// Everything written sits under `/data/local/tmp`, the one area §11 proved this uid can write,
 /// and is removed again. Nothing here changes a capability or a tier, and nothing here reads a
@@ -1354,8 +1358,23 @@ async fn report_shell_semantics(
         "/data/misc",
         "/data/anr",
         "/data/local/tmp",
+        // The two shapes the disclosure rule grew for after this section was first written. A
+        // numbered process directory and a raw partition are not app homes, so the listing here
+        // says whether the rule protects something this tier can actually reach — and `/proc` is
+        // read with `head -c 1` rather than `ls`, because the file is the disclosure and the
+        // directory is not.
+        "/proc/1/environ",
+        "/proc/self/environ",
+        "/dev/block",
     ] {
-        let listed = observe(&observer, format!("ls {path} 2>/dev/null | head -3")).await;
+        let probe = if path.contains("/proc/") && !path.ends_with("environ") {
+            format!("ls {path} 2>/dev/null | head -3")
+        } else if path.ends_with("environ") {
+            format!("head -c 1 {path} >/dev/null 2>&1 && echo READABLE || echo DENIED")
+        } else {
+            format!("ls {path} 2>/dev/null | head -3")
+        };
+        let listed = observe(&observer, probe).await;
         let denied = observe(&observer, format!("ls {path} 2>&1 >/dev/null | head -1")).await;
         let verdict = if listed.trim().is_empty() {
             "no listing".to_string()

@@ -828,6 +828,10 @@ fn analyse(command: &Command) -> Finding {
     // tier by the destination, so a copy *out* of an app's home was a light write with no word
     // about what it read.
     //
+    // The same argument covers a raw block device: writing one is on the §4.6.3 hard-ban list,
+    // and reading `/dev/block/mmcblk0` opens every app's home through one argument while the read
+    // tier passed it unattended.
+    //
     // It is its own effect and not a heavier write, because the two questions the port asks about
     // a command are not the same question: what has to be claimed to run it, and what the ledger
     // has to put back afterwards. This one changes the answer to the first and not the second.
@@ -837,19 +841,93 @@ fn analyse(command: &Command) -> Finding {
             .iter()
             .map(String::as_str)
             .filter(|a| looks_like_path(a))
-            .find(|a| is_private_data_path(a));
-        if let Some(path) = reached {
+            .find_map(|a| match inspectable_path(a) {
+                Some(kind) => Some((a, kind)),
+                None => {
+                    if is_private_data_path(a) {
+                        Some((a, "it belongs to another uid"))
+                    } else if is_block_device(a) {
+                        Some((
+                            a,
+                            "it is the partition itself rather than a file on it: every app's \
+                             home, every message and every photo is readable through this one \
+                             argument",
+                        ))
+                    } else {
+                        None
+                    }
+                }
+            });
+        if let Some((path, what)) = reached {
             finding.effect = finding.effect.max(Effect::ForeignRead);
             finding.detail = format!(
-                "{}; reads `{path}`, which belongs to another uid — nothing on the device changes, \
-                 and this port has no app-data capability to ask for yet, so it costs the \
-                 heaviest filesystem tier it has instead of the read tier that would have passed \
-                 it unattended",
-                finding.detail
+                "{}; reads `{path}`, which is not something the read tier was ever entitled to \
+                 see — {what}. Nothing on the device changes, so it is a disclosure and not a \
+                 write, and this port has no app-data capability to ask for yet, so it costs the \
+                 heaviest filesystem tier it has instead of the tier that would have passed it \
+                 unattended",
+                finding.detail,
             );
         }
     }
     finding
+}
+
+/// What a read of this `/proc` entry says about somebody else's process, if it reads one.
+///
+/// The port cannot ask which uid owns a pid without a device round trip, so the rule is lexical
+/// and errs the conservative way: a numbered process directory is somebody's process, and the
+/// caller says so to the operator. `/proc/self` and `/proc/thread-self` are the reader's own and
+/// stay at the read tier, and `/proc/meminfo` or `/proc/cpuinfo` — the system's own statistics,
+/// which is what the evidence surface actually reads — are not under a pid at all.
+fn inspectable_path(path: &str) -> Option<&'static str> {
+    const SENSITIVE: &[(&str, &str)] = &[
+        (
+            "environ",
+            "the environment of a process the caller does not own, where tokens sit",
+        ),
+        (
+            "mem",
+            "the live memory of a process the caller does not own",
+        ),
+        (
+            "smaps",
+            "every mapping of a process the caller does not own",
+        ),
+        (
+            "smaps_rollup",
+            "every mapping of a process the caller does not own",
+        ),
+        (
+            "pagemap",
+            "the page table of a process the caller does not own",
+        ),
+        (
+            "maps",
+            "the address layout of a process the caller does not own",
+        ),
+        (
+            "cmdline",
+            "the arguments a process was started with, which are often secrets",
+        ),
+        ("fd", "the open files of a process the caller does not own"),
+    ];
+    let path = super::script::resolve_path(path);
+    let rest = path.strip_prefix("/proc/")?;
+    let mut segments = rest.split('/');
+    let process = segments.next()?;
+    // A numbered process directory is somebody's process; a glob over them is the enumeration of
+    // all of them, which is the wider disclosure rather than a reason to pass it.
+    let named_process = !process.is_empty() && process.chars().all(|c| c.is_ascii_digit());
+    let globbed_process = process.contains(['*', '?', '[']);
+    if !(named_process || globbed_process) {
+        return None;
+    }
+    let entry = segments.next()?;
+    SENSITIVE
+        .iter()
+        .find(|(name, _)| *name == entry)
+        .map(|(_, why)| *why)
 }
 
 /// The tier all of a command's redirections cost, and the sentence naming them.
@@ -2108,11 +2186,15 @@ mod tests {
         }
         // And the reads the same rule must leave alone. Each of these is a real shape from the
         // port's own scripts and from the harness, and each names a file the port can see.
+        // `cat /proc/*/cmdline` left this list when the process-inspection rule landed: a glob
+        // over pids reads every process's launch arguments, which is the disclosure that rule is
+        // about. `/proc/*/attr/current` stays, because it is what the port's own fact probe runs
+        // and it names an SELinux context rather than something anybody keeps secret.
         for script in [
             "cat /data/local/tmp/x",
             "cat '/data/local/tmp/my file.txt'",
             "cat /data/anr/*",
-            "cat /proc/*/cmdline",
+            "cat /proc/*/attr/current",
             "head -n 5 /data/local/tmp/x",
             "grep -r secret /data/anr",
             "sed 's/a/b/' /data/local/tmp/x",
@@ -2177,6 +2259,68 @@ mod tests {
         ] {
             assert_eq!(effect(script), Effect::ReadOnly, "{script}");
         }
+    }
+
+    #[test]
+    fn reading_another_process_insides_costs_the_disclosure_tier() {
+        // The third argument shape in the same family. `/proc/<pid>/environ` is where a process
+        // keeps the token it was handed, and `/proc/<pid>/mem` is the decrypted database while it
+        // is open — both were answering ReadOnly, the auto-pass tier, on a root device.
+        for script in [
+            "cat /proc/1234/environ",
+            "cat /proc/1/mem",
+            "strings /proc/999/maps",
+            "ls /proc/42/fd",
+            "cat /proc/*/environ",
+            "head -c 8 /proc/1234/smaps_rollup",
+        ] {
+            assert_eq!(effect(script), Effect::ForeignRead, "{script}");
+        }
+        // The reader's own process and the system's own statistics stay where the evidence
+        // surface needs them: this is a rule about *whose* process, not about the word "proc".
+        for script in [
+            "cat /proc/self/environ",
+            "cat /proc/thread-self/status",
+            "cat /proc/meminfo",
+            "cat /proc/cpuinfo",
+            "cat /proc/mounts",
+            "ls /proc",
+        ] {
+            assert_eq!(effect(script), Effect::ReadOnly, "{script}");
+        }
+    }
+
+    #[test]
+    fn reading_a_raw_block_device_costs_the_disclosure_tier_too() {
+        // The same asymmetry one level up. §4.6.3 hard-bans *writing* a block device, and the
+        // write side honours it, but `cat /dev/block/mmcblk0` was answering ReadOnly — the
+        // auto-pass tier — while the device it opens is every app's home, every message and
+        // every photo on the handset, in one argument. A read of it changes nothing, so it is
+        // the disclosure effect and not a heavier one; it still cannot go unattended.
+        for script in [
+            "cat /dev/block/mmcblk0",
+            "cat /dev/block/mmcblk0p1",
+            "od /dev/block/sda",
+            "strings /dev/block/by-name/userdata",
+            "head -c 4096 /dev/loop0",
+            "cat /dev/block/../../dev/block/mmcblk0",
+        ] {
+            assert_eq!(effect(script), Effect::ForeignRead, "{script}");
+            assert!(
+                check(script, Some(Capability::FsOutsideApp)).is_err(),
+                "{script} must not be covered by a capability that is not being asked for"
+            );
+        }
+        // The devices that are not disks stay at the read tier: `/dev/zero` and `/dev/null` are
+        // sources of nothing, and `/dev/kmsg` is not a partition somebody's data lives in.
+        for script in ["cat /dev/zero", "cat /dev/null", "cat /proc/self/mem"] {
+            assert_eq!(effect(script), Effect::ReadOnly, "{script}");
+        }
+        // And the write is still the thing that is refused outright, not merely approved.
+        assert_eq!(
+            effect("dd if=/dev/zero of=/dev/block/mmcblk0"),
+            Effect::Banned
+        );
     }
 
     #[test]
