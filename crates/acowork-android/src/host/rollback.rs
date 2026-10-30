@@ -2435,6 +2435,15 @@ mod tests {
         assert_eq!(planned.captures.len(), 1, "{:?}", planned.captures);
         // A plain filter still owes the ledger nothing.
         assert!(plan("sort /data/local/tmp/f").is_empty());
+        // `uniq INPUT OUTPUT` carries its destination in an operand instead of a flag, and the
+        // ledger has to see the same two operands the classifier tiered.
+        let planned = plan("uniq /data/local/tmp/f /data/local/tmp/out");
+        assert_eq!(
+            planned.captures[0].target,
+            UndoTarget::File("/data/local/tmp/out".to_string()),
+            "{:?}",
+            planned.captures
+        );
     }
 
     #[test]

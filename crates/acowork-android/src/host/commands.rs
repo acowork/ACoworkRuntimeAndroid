@@ -1048,6 +1048,13 @@ pub fn file_writes(words: &[String]) -> Option<Vec<FileWrite>> {
         "sort" => flag_value(&args, &["-o", "--output"])
             .map(|path| vec![(path, FileChange::Content)])
             .unwrap_or_default(),
+        // `uniq INPUT [OUTPUT]`: the ledger has to know about the output the same way the
+        // classifier does, or a deduplicated copy of `/system/build.prop` is approved and then
+        // restored as nothing at all.
+        "uniq" => match uniq_operands(&args).as_slice() {
+            [_, output] => vec![(output.clone(), FileChange::Content)],
+            _ => Vec::new(),
+        },
         "tee" | "truncate" => paths
             .iter()
             .map(|p| (p.to_string(), FileChange::Content))
@@ -1137,6 +1144,19 @@ fn file_effect(target: &str) -> Effect {
         // which *tier* the write belongs to.
         Destination::Bounded { directory } => effect_at(&directory),
     }
+}
+
+/// The operands `uniq` is pointed at, minus the values its own flags carry separately.
+///
+/// `-f N` and `-w N` take a number as their next token, and a token of all digits is a field
+/// count for this command rather than a file: no path a caller would hand `uniq` is spelled as
+/// bare digits. Kept next to the classifier's rule so the tier decision and the ledger's snapshot
+/// cannot drift apart on how many operands this command is seen to have.
+fn uniq_operands(args: &[String]) -> Vec<String> {
+    args.iter()
+        .filter(|a| !a.starts_with('-') && !a.chars().all(|c| c.is_ascii_digit()))
+        .cloned()
+        .collect()
 }
 
 /// The destination a move/copy/link/install request carries in a flag, if it carries one.
@@ -1557,6 +1577,37 @@ fn effect_of(head: &str, args: &[String]) -> Finding {
                     file_effect(&target),
                     format!("writes the sorted output to `{target}`"),
                 );
+            }
+        }
+        if head == "uniq" {
+            // `uniq INPUT [OUTPUT]` — the output is a positional operand, not a flag, which is
+            // why the read allow-list missed it: every other filter on that list takes at most
+            // one file. Two operands mean the second one is created.
+            //
+            // A bare number is skipped because `-f N` and `-w N` carry theirs as a separate
+            // token, and no filename this command is pointed at is spelled as digits alone. A
+            // relative output is not a known destination: it lands in a working directory nobody
+            // observes, so `file_effect` answers Opaque rather than guessing the tier.
+            let operands: Vec<String> = uniq_operands(args);
+            match operands.as_slice() {
+                [] | [_] => {}
+                [_, output] => {
+                    return Finding::new(
+                        head,
+                        file_effect(output),
+                        format!("writes the deduplicated output to `{output}`"),
+                    );
+                }
+                [_input, _output, _extra @ ..] => {
+                    return Finding::opaque(
+                        head,
+                        format!(
+                            "it names {} files, and `uniq` takes an input and an output; which \
+                             one is written is not decided here",
+                            operands.len()
+                        ),
+                    );
+                }
             }
         }
         if head == "date" {
@@ -2729,6 +2780,7 @@ mod tests {
             // The destination hidden in a flag, on a command the read list used to answer for.
             "sort -o /system/x /data/local/tmp/f",
             "sort -o /data/local/tmp/x /data/local/tmp/f",
+            "uniq /data/local/tmp/f /system/out",
             "logcat -f/system/log",
         ];
         for script in corpus {
@@ -2959,6 +3011,34 @@ mod tests {
         );
         assert_eq!(effect("sort -c /data/local/tmp/f"), Effect::ReadOnly);
         assert_eq!(effect("sort /data/local/tmp/f"), Effect::ReadOnly);
+
+        // `uniq` is the same trap in a different argument position: POSIX and toybox both spell
+        // it `uniq INPUT [OUTPUT]`, so the second operand is a file it creates.
+        assert_eq!(
+            effect("uniq /data/local/tmp/f /system/out"),
+            Effect::SystemWrite,
+            "the second operand is the output file"
+        );
+        assert_eq!(
+            effect("uniq -f 2 /data/local/tmp/f /data/local/tmp/out"),
+            Effect::FileWrite,
+            "and a flag's own value is not one of its operands"
+        );
+        assert_eq!(effect("uniq -c /data/local/tmp/f"), Effect::ReadOnly);
+        assert_eq!(effect("uniq /data/local/tmp/f"), Effect::ReadOnly);
+        assert_eq!(
+            effect("uniq /data/local/tmp/f ./out"),
+            Effect::Opaque,
+            "a relative output belongs to a working directory nobody observes"
+        );
+        assert_eq!(
+            effect("uniq /data/local/tmp/a /data/local/tmp/b /data/local/tmp/c"),
+            Effect::Opaque,
+            "three files for a command that takes two does not say which one is written"
+        );
+        // `-o` on `strings` is a byte offset, not a destination — the shape that would have been
+        // over-answered if every `-o` were read as a file.
+        assert_eq!(effect("strings -o 5 /data/local/tmp/f"), Effect::ReadOnly);
 
         // `date` prints, unless it is being told what the clock reads.
         assert_eq!(effect("date"), Effect::ReadOnly);
