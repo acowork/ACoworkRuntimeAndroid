@@ -1372,11 +1372,67 @@ async fn report_shell_semantics(
         );
     }
 
+    // 6. A destination carried inside a flag rather than in the operand list. The classifier now
+    //    reads `-o FILE`, the glued `-oFILE`, and a `w FILE` buried in a sed script; each of those
+    //    is a claim about how *this* shell parses its arguments, and a claim that is wrong here is
+    //    a write nobody was shown. The relative-path probe above already caught one such claim.
+    println!("  ── a destination hidden in a flag ──");
+    for (label, command, probe) in [
+        (
+            "sort -o FILE",
+            format!("sort -o {dir}/sorted {dir}/src/a"),
+            format!("test -e {dir}/sorted && echo WROTE-THE-FILE || echo NO-SUCH-FILE"),
+        ),
+        (
+            "sort -oFILE glued",
+            format!("sort -o{dir}/glued {dir}/src/a"),
+            format!("test -e {dir}/glued && echo WROTE-THE-FILE || echo NO-SUCH-FILE"),
+        ),
+        (
+            "sed w FILE",
+            format!("sed 'w {dir}/sedout' {dir}/src/a"),
+            format!("test -e {dir}/sedout && echo WROTE-THE-FILE || echo NO-SUCH-FILE"),
+        ),
+        // Whether this `date` accepts a clock-setting flag at all — probed by *empty* argument,
+        // never by setting the time. A harness that moved the clock backward would not put it
+        // back, and TLS, package caches and every file timestamp on the phone would notice.
+        (
+            "date -s accepted?",
+            "date -s".to_string(),
+            "date +%Y".to_string(),
+        ),
+    ] {
+        let outcome = observe(&observer, probe).await;
+        match write_record(&chain, &command, session).await {
+            Ok(record) => println!(
+                "  {label:<20} exit {:?} → {}  [{}]",
+                record.exit_code,
+                outcome,
+                record.stderr.trim()
+            ),
+            Err(error) => println!("  {label:<20} refused before execution: {error}"),
+        }
+    }
+    // The classifier's own answer for the same four shapes, printed beside the device's.
+    for command in [
+        "sort -o /data/local/tmp/sorted /data/local/tmp/src/a",
+        "sort -o/data/local/tmp/glued /data/local/tmp/src/a",
+        "sed 'w /data/local/tmp/sedout' /data/local/tmp/src/a",
+        "date -s '2026-01-01 00:00:00'",
+    ] {
+        let verdict = acowork_android::host::classify_script(command).strongest();
+        println!(
+            "  classifier says {verdict:?} for {}",
+            command.split_whitespace().next().unwrap_or(command)
+        );
+    }
+
     // Teardown: the ledger's own undo list is not what cleans these up (the harness wrote them,
     // so an honest restore would *recreate* the pre-state), so remove the area explicitly and
     // then show what the ledger still holds for the session.
     write(&chain, &format!("rm -rf {dir}"), session).await?;
     write(&chain, "rm -f /data/local/tmp/acowork-rel.txt", session).await?;
+    write(&chain, "rm -f /data/local/tmp/glued", session).await?;
     let left = pending_for(&chain, session);
     let report = chain.restore(session).await;
     println!(

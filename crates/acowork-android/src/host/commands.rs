@@ -1042,11 +1042,11 @@ pub fn file_writes(words: &[String]) -> Option<Vec<FileWrite>> {
             .iter()
             .map(|p| (p.to_string(), FileChange::Metadata))
             .collect(),
-        "logcat" => args
-            .iter()
-            .position(|a| a == "-f" || a == "--file")
-            .and_then(|i| args.get(i + 1))
-            .map(|path| vec![(path.clone(), FileChange::Content)])
+        "logcat" => flag_value(&args, &["-f", "--file"])
+            .map(|path| vec![(path, FileChange::Content)])
+            .unwrap_or_default(),
+        "sort" => flag_value(&args, &["-o", "--output"])
+            .map(|path| vec![(path, FileChange::Content)])
             .unwrap_or_default(),
         "tee" | "truncate" => paths
             .iter()
@@ -1196,7 +1196,84 @@ fn looks_like_path(operand: &str) -> bool {
     operand.starts_with('/') || operand.starts_with('.') || operand.contains('/')
 }
 
-/// True when an operand names something to read but does not say which file.
+/// The value a flag carries, in its separate (`-o FILE`), glued (`-oFILE`) or `=` (`--output=FILE`)
+/// form.
+///
+/// All three spellings are accepted because all three work on the shell this port targets, and a
+/// classifier that reads only the separate form answers "filter" to `sort -o/system/x`. The first
+/// non-empty value wins: a script naming two output files is a script whose last write is the one
+/// that matters, and `sort` does not take two — this is not a general multi-flag reader.
+fn flag_value(args: &[String], names: &[&str]) -> Option<String> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        for name in names {
+            if arg == *name {
+                // The separate form: `-o FILE`. A flag that carries no value carries no
+                // destination either, and the loop simply moves on.
+                if let Some(value) = iter.next()
+                    && !value.is_empty()
+                {
+                    return Some(value.clone());
+                }
+                continue;
+            }
+            // The `=` form, which `--output` takes and a short flag does not.
+            let glued = format!("{name}=");
+            if let Some(value) = arg.strip_prefix(glued.as_str())
+                && !value.is_empty()
+            {
+                return Some(value.to_string());
+            }
+            // Short flags only glue without `=`: `-o/system/x`.
+            if !name.starts_with("--") && arg.starts_with(*name) && arg.len() > name.len() {
+                let value = &arg[name.len()..];
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// True when a sed program carries a `w FILE` or `r FILE` command — a file named inside the
+/// script text rather than in the operand list.
+///
+/// A program is a `;`- and newline-separated list of commands, and `w`/`r` name a file when they
+/// *begin* one (`w /tmp/x`), when they follow the closing delimiter of the command before them
+/// (`s/a/b/w /tmp/x`), or when they do that without even the space (`s/a/b/w/tmp/x`). The
+/// delimiter count in the last of the three is what keeps `s/a/w/` — a substitution *to* the
+/// letter — out of the refused pile: a `w` after the third `/` has nothing left to substitute.
+///
+/// Approximate in the safe direction on purpose. A program that trips it is refused even when it
+/// writes nothing, because the alternative is deciding what a sed program does with something that
+/// is not a sed parser, and an approval that names `/data/local/tmp/x` in front of a write to
+/// `/system/y` is the failure this module has now been asked to avoid five times.
+fn script_names_a_file(program: &str) -> bool {
+    program.split(['\n', ';']).any(|command| {
+        let trimmed = command.trim_start();
+        // A command that *begins* with the letter: `w /tmp/x`, `w/tmp/x`.
+        let leading = matches!(trimmed.chars().next(), Some('w' | 'r'))
+            && trimmed[1..]
+                .chars()
+                .next()
+                .is_some_and(|next| matches!(next, ' ' | '\t' | '/'));
+        // The same command attached to the end of the one before it, with the file after a space:
+        // `s/a/b/w /tmp/x`, `/x/w /tmp/x`.
+        let attached = ["/w ", "/r ", "/w\t", "/r\t"]
+            .iter()
+            .any(|needle| trimmed.contains(needle));
+        // And attached without the space (`s/a/b/w/tmp/x`), which sed accepts. The two checks
+        // above cannot see it, and `s/a/w/` — a substitution *to* the letter — looks identical
+        // until the delimiters are counted: a `w` is only a command when it follows the third
+        // `/`, because the third one is what closes the substitution.
+        let glued = trimmed.match_indices('/').nth(2).is_some_and(|(index, _)| {
+            let rest = &trimmed[index + 1..];
+            matches!(rest.chars().next(), Some('w' | 'r')) && rest[1..].starts_with('/')
+        });
+        leading || attached || glued
+    })
+}
 ///
 /// This is `destination`'s question asked of a read: the same three shapes — expansion (`$F`,
 /// `` ` `` , `~`), a path that is not anchored at the root, and a glob whose directory sits above
@@ -1394,14 +1471,13 @@ fn effect_of(head: &str, args: &[String]) -> Finding {
                 // `-f` names the file the log goes to, so it is tiered by that file:
                 // `logcat -f /system/build.prop` is not an outside-app write, and hard-coding the
                 // answer here is the same mistake `sed -i` made until it was tiered by its file.
+                // The glued spelling (`-f/system/log`) is read too, because it works on this
+                // shell and a classifier that only sees the separate form calls it a file write
+                // into nowhere.
                 // `-r` on its own is a rotation *size*, not a path, and is left at the file tier
                 // it has always been given.
-                if let Some(path) = args
-                    .iter()
-                    .position(|a| a == "-f" || a == "--file")
-                    .and_then(|i| args.get(i + 1))
-                {
-                    let effect = file_effect(path);
+                if let Some(path) = flag_value(args, &["-f", "--file"]) {
+                    let effect = file_effect(&path);
                     return Finding::new(head, effect, format!("writes the log to `{path}`"));
                 }
                 return Finding::new(
@@ -1411,6 +1487,30 @@ fn effect_of(head: &str, args: &[String]) -> Finding {
                 );
             }
         }
+        if head == "sed" {
+            // sed's `w FILE` command writes matching lines to a file named *inside the script*,
+            // and `r FILE` reads one in. Neither is in the operand list, so neither was ever
+            // tiered: `sed '/x/w /system/y' f` sat on the read allow-list and wrote a partition.
+            // The port does not parse sed programs — the same call as refusing to guess which
+            // operand `sed -e` rewrites — so a script that carries one of those commands is
+            // refused. Guessing the filename is the failure mode this module keeps hitting: an
+            // approval that names `/data/local/tmp/x` and a write that lands in `/system`.
+            if let Some(script) = args
+                .iter()
+                .filter(|a| !a.starts_with('-'))
+                .find(|a| script_names_a_file(a))
+            {
+                return Finding::opaque(
+                    head,
+                    format!(
+                        "its script `{script}` carries a `w` or `r` command, which names a file \
+                         inside the script text; this port does not parse sed programs, so the \
+                         file it writes is not one anybody was shown"
+                    ),
+                );
+            }
+        }
+
         if head == "sed" && flag("i") {
             // `-i` rewrites the files named *after* the script expression, and the classifier
             // used to stop at "an in-place edit happened" and hand out FileWrite whatever the
@@ -1446,6 +1546,43 @@ fn effect_of(head: &str, args: &[String]) -> Finding {
                 effect.unwrap_or(Effect::Opaque),
                 format!("rewrites `{}` in place", operands[1..].join("`, `")),
             );
+        }
+        if head == "sort" {
+            // `-o FILE` is the output file. `sort` is on the read list because it is a filter,
+            // and a filter that writes is not a filter: `sort -o /system/x f` was asking the tier
+            // that auto-passes to put a partition file in place.
+            if let Some(target) = flag_value(args, &["-o", "--output"]) {
+                return Finding::new(
+                    head,
+                    file_effect(&target),
+                    format!("writes the sorted output to `{target}`"),
+                );
+            }
+        }
+        if head == "date" {
+            // `date` prints, unless it is being told what the clock should read. `-s`, and the
+            // classic positional form (`date 010100002026`), set the system time; `date -u` and
+            // `date +FORMAT` only print. The clock is device-global and nothing snapshots it, so
+            // this is a write whatever the caller intended.
+            if let Some(value) = flag_value(args, &["-s", "--set"]) {
+                return Finding::new(
+                    head,
+                    Effect::ShellWrite,
+                    format!("sets the system clock to `{value}`"),
+                );
+            }
+            // A bare operand that is neither a `+FORMAT`, an `@EPOCH` nor a flag is the positional
+            // form of the same instruction.
+            if let Some(value) = args
+                .iter()
+                .find(|a| !a.starts_with(['-', '@', '+']) && !a.is_empty())
+            {
+                return Finding::new(
+                    head,
+                    Effect::ShellWrite,
+                    format!("sets the system clock to `{value}`"),
+                );
+            }
         }
         if head == "screencap" {
             // `screencap` alone writes nothing; with a path it saves a capture there.
@@ -2589,6 +2726,10 @@ mod tests {
             "cp /sdcard/x /data/data/com.foo/y",
             "rm -fr /data/data/com.foo",
             "cat /data/data/com.foo/db > /data/local/tmp/out",
+            // The destination hidden in a flag, on a command the read list used to answer for.
+            "sort -o /system/x /data/local/tmp/f",
+            "sort -o /data/local/tmp/x /data/local/tmp/f",
+            "logcat -f/system/log",
         ];
         for script in corpus {
             let verdict = classify(script);
@@ -2790,6 +2931,76 @@ mod tests {
         assert_eq!(effect("sed 's/a/b/' /x"), Effect::ReadOnly);
         assert_eq!(effect("umount /system"), Effect::SystemWrite);
         assert_eq!(effect("mount /dev/x /y"), Effect::SystemWrite);
+    }
+
+    #[test]
+    fn a_command_on_the_read_list_that_writes_is_tiered_by_the_file_it_writes() {
+        // Three read-list commands write a file when the argument is right, and all three were
+        // answering "filter" while putting one in place.
+        assert_eq!(
+            effect("sort -o /system/x /data/local/tmp/f"),
+            Effect::SystemWrite,
+            "`sort -o` is the output file"
+        );
+        assert_eq!(
+            effect("sort -o/system/x /data/local/tmp/f"),
+            Effect::SystemWrite,
+            "the glued spelling works on this shell and is the same write"
+        );
+        assert_eq!(
+            effect("toybox sort -o /system/x /data/local/tmp/f"),
+            Effect::SystemWrite,
+            "through the multiplexer it is still `sort`"
+        );
+        assert_eq!(
+            effect("sort -o /data/local/tmp/x /data/local/tmp/f"),
+            Effect::FileWrite,
+            "and a scratch destination is still the light tier"
+        );
+        assert_eq!(effect("sort -c /data/local/tmp/f"), Effect::ReadOnly);
+        assert_eq!(effect("sort /data/local/tmp/f"), Effect::ReadOnly);
+
+        // `date` prints, unless it is being told what the clock reads.
+        assert_eq!(effect("date"), Effect::ReadOnly);
+        assert_eq!(effect("date -u +'%F'"), Effect::ReadOnly);
+        assert_eq!(
+            effect("date @1700000000"),
+            Effect::ReadOnly,
+            "an epoch argument is a conversion, not a setting"
+        );
+        assert_eq!(
+            effect("date -s '2026-01-01 00:00'"),
+            Effect::ShellWrite,
+            "-s sets the clock"
+        );
+        assert_eq!(
+            effect("date 010100002026"),
+            Effect::ShellWrite,
+            "and so does the positional form, with no flag to spot"
+        );
+
+        // sed's `w FILE` writes a file named inside the program, where no operand list can see it.
+        for script in [
+            "sed '/x/w /system/y' /data/local/tmp/f",
+            "sed '/x/r /system/y' /data/local/tmp/f",
+            "sed 's/a/b/w /tmp/x' /data/local/tmp/f",
+            "sed 's/a/b/w/tmp/x' /data/local/tmp/f",
+            "sed -i 's/a/b/w /tmp/x' /data/local/tmp/f",
+        ] {
+            assert_eq!(effect(script), Effect::Opaque, "{script}");
+        }
+        // The same test in the other direction: a program that mentions the letters without a
+        // file after them is an ordinary read, and refusing these is the false positive that
+        // would put every `sed` on the device behind an approval.
+        for script in [
+            "sed 's/a/w/' /data/local/tmp/f",
+            "sed 's/w/x/' /data/local/tmp/f",
+            "sed 's/foo/bar/g; s/baz/qux/' /data/local/tmp/f",
+            "sed -n '/x/p' /data/local/tmp/f",
+            "sed 's/a/b/' /data/local/tmp/f",
+        ] {
+            assert_eq!(effect(script), Effect::ReadOnly, "{script}");
+        }
     }
 
     #[test]

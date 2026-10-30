@@ -2418,6 +2418,44 @@ mod tests {
     }
 
     #[test]
+    fn a_destination_carried_in_a_flag_is_snapshotted_like_a_positional_one() {
+        // `sort -o FILE` is the same write as `sort > FILE`, and the ledger is asked about it
+        // through the classifier's `file_writes`, which now reads the flag. Without that the
+        // script is approved as a partition write and restored as nothing at all.
+        let planned = plan("sort -o /data/local/tmp/sorted.txt /data/local/tmp/f");
+        assert_eq!(
+            planned.captures[0].target,
+            UndoTarget::File("/data/local/tmp/sorted.txt".to_string()),
+            "{:?}",
+            planned.captures
+        );
+        assert!(planned.unundoable.is_empty(), "{:?}", planned.unundoable);
+        // The glued spelling too — it works on this shell, so it is the same file.
+        let planned = plan("sort -o/data/local/tmp/sorted.txt /data/local/tmp/f");
+        assert_eq!(planned.captures.len(), 1, "{:?}", planned.captures);
+        // A plain filter still owes the ledger nothing.
+        assert!(plan("sort /data/local/tmp/f").is_empty());
+    }
+
+    #[test]
+    fn a_write_the_classifier_refuses_to_locate_is_said_so_rather_than_planned_blindly() {
+        // `sed 'w FILE'` names its file inside the script text. The classifier answers Opaque
+        // rather than guessing which file, and the ledger has to agree that it does not know —
+        // a plan that snapshots nothing while the script writes somewhere would be the silent
+        // gap, and in dangerous mode the script runs anyway.
+        let planned = plan("sed 'w /data/local/tmp/out' /data/local/tmp/f");
+        assert!(
+            planned.captures.is_empty(),
+            "a guessed destination is not a snapshot: {:?}",
+            planned.captures
+        );
+        assert!(
+            !planned.unundoable.is_empty(),
+            "the ledger must say it has nothing to put back"
+        );
+    }
+
+    #[test]
     fn a_disclosure_is_reported_as_nothing_to_restore() {
         // `cat /data/data/com.foo/db` costs an approval and changes no state. The first version
         // of that rule raised the tier and left the ledger to work out the rest, and it produced
