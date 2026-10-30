@@ -889,22 +889,35 @@ fn file_effect(target: &str) -> Effect {
     }
 }
 
-/// Whether a move/copy/link request carries its destination in a flag rather than an operand.
+/// The destination a move/copy/link/install request carries in a flag, if it carries one.
 ///
-/// `-t DIR` and `--target-directory=DIR` are the two spellings, glued or separate. The guard is
-/// scoped to `cp`/`mv`/`ln` on purpose: `touch -t 202401010000 file` uses the same letters for a
-/// timestamp, and refusing that would be the classifier inventing a rule the command does not
-/// have. Whether this toybox implements `-t` at all is a device fact nobody has measured here —
-/// the refusal does not wait for the measurement, because the cost of refusing a spelling the
-/// device ignores is one clarification, and the cost of blessing one is an approval for a
-/// directory nobody read.
-fn destination_is_in_a_flag(args: &[String]) -> bool {
-    args.iter().any(|a| {
-        a == "-t"
-            || a == "--target-directory"
-            || a.starts_with("--target-directory=")
-            || (a.starts_with("-t") && a.len() > 2 && a.as_bytes()[2] == b'/')
-    })
+/// `-t DIR` and `--target-directory=DIR`, glued or separate. The guard is scoped to those four
+/// commands on purpose: `touch -t 202401010000 file` uses the same letters for a timestamp, and
+/// reading that as a directory would be the classifier inventing a rule the command does not have.
+///
+/// Whether this toybox implements `-t` is a device fact nobody has measured here, and the
+/// classification does not wait for it. Reading the flag costs the port nothing it cannot defend:
+/// the answer is the *heavier* tier of the directory the flag names, so a caller needs
+/// `fs:system` to move files into `/system` either way — and a device that ignores `-t` fails the
+/// write instead of performing one nobody was told about. Refusing to read it, the previous
+/// behaviour, was safe but told the operator nothing about a destination written in plain text.
+fn flag_destination(head: &str, args: &[String]) -> Option<String> {
+    if !matches!(head, "cp" | "mv" | "ln" | "install") {
+        return None;
+    }
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if let Some(dir) = arg.strip_prefix("--target-directory=") {
+            return Some(dir.to_string());
+        }
+        if arg == "-t" || arg == "--target-directory" {
+            return iter.next().cloned();
+        }
+        if arg.starts_with("-t") && arg.len() > 2 && arg.as_bytes()[2] == b'/' {
+            return Some(arg[2..].to_string());
+        }
+    }
+    None
 }
 
 /// Which operands of a filesystem-mutating command name the files it changes.
@@ -935,9 +948,9 @@ fn looks_like_path(operand: &str) -> bool {
 
 fn written_targets<'a>(head: &str, operands: &[&'a str]) -> Option<Vec<&'a str>> {
     match head {
-        "cp" | "ln" if operands.len() > 1 => operands.last().copied().map(|t| vec![t]),
+        "cp" | "ln" | "install" if operands.len() > 1 => operands.last().copied().map(|t| vec![t]),
         "mv" if operands.len() > 1 => Some(operands.to_vec()),
-        "cp" | "ln" | "mv" => None,
+        "cp" | "ln" | "mv" | "install" => None,
         _ if operands.is_empty() => None,
         _ => Some(operands.to_vec()),
     }
@@ -1178,15 +1191,31 @@ fn effect_of(head: &str, args: &[String]) -> Finding {
             .map(String::as_str)
             .filter(|a| looks_like_path(a))
             .collect();
-        if matches!(head, "cp" | "mv" | "ln") && destination_is_in_a_flag(args) {
-            return Finding::opaque(
-                head,
-                "-t puts the destination directory in a flag, so the operand list names only what \
-                 is being moved — the port would be approving the source and letting the \
-                 destination arrive from a flag it never read",
-            );
-        }
-        let Some(targets) = written_targets(head, &operands) else {
+        // A destination carried in a flag is read, not refused: `mv -t /system x` writes
+        // `/system`, and the operand list alone would describe it as writing `x`.
+        let flag_dest = flag_destination(head, args);
+        // `install -d` is mkdir with a mode; every operand it names is a directory it creates.
+        let mkdir_style = head == "install" && args.iter().any(|a| a == "-d" || a == "--directory");
+        let targets = match flag_dest.as_deref() {
+            Some(dir) => {
+                let mut targets = vec![dir];
+                // `mv` also unlinks what it moves, so both sides of every operand belong to the
+                // tier the operation touches — the same rule as a positional `mv`.
+                if head == "mv" {
+                    targets.extend(operands.iter().copied());
+                }
+                Some(targets)
+            }
+            None if mkdir_style => {
+                if operands.is_empty() {
+                    None
+                } else {
+                    Some(operands.clone())
+                }
+            }
+            None => written_targets(head, &operands),
+        };
+        let Some(targets) = targets else {
             return Finding::opaque(
                 head,
                 "the file it would change is not named: with one operand the destination is \
@@ -1382,6 +1411,7 @@ const FILE_WRITE: &[&str] = &[
     "rm",
     "mv",
     "cp",
+    "install",
     "touch",
     "mkdir",
     "rmdir",
@@ -1988,24 +2018,51 @@ mod tests {
     }
 
     #[test]
-    fn a_destination_hiding_inside_a_flag_is_refused_not_blessed() {
+    fn a_destination_carried_in_a_flag_is_read_rather_than_refused() {
         // `cp -t /system/bin x` names the partition where the operand list never looks: `-t` is
         // a flag, `/system/bin` is a non-flag operand, and "the last operand is the destination"
-        // would read this as writing `x`. Whether this toybox implements `-t` is a device fact
-        // nobody has measured here, and the refusal does not wait for the measurement.
+        // would read this as writing `x`. The port used to answer Opaque, which was safe and
+        // useless — the destination is written in plain text two tokens away.
         assert_eq!(
             effect("cp -t /system/bin /data/local/tmp/x"),
-            Effect::Opaque
+            Effect::SystemWrite
         );
         assert_eq!(
             effect("mv --target-directory=/system/bin /data/local/tmp/x"),
-            Effect::Opaque
+            Effect::SystemWrite,
         );
         assert_eq!(
             effect("cp -t/system/bin /data/local/tmp/x"),
-            Effect::Opaque,
+            Effect::SystemWrite,
             "the glued spelling is the same request"
         );
+        // A flag whose value the port cannot see is still refused: reading the flag is not
+        // guessing at it.
+        assert_eq!(effect("cp -t ./system/bin x"), Effect::Opaque);
+        assert_eq!(effect("mv -t $DEST x"), Effect::Opaque);
+        // `touch -t` is a timestamp. The flag is not consulted for a command that does not
+        // carry a destination in it, so the write is still judged by its operand.
+        assert_eq!(
+            effect("touch -t 202401010000 /data/local/tmp/f"),
+            Effect::FileWrite
+        );
+    }
+
+    #[test]
+    fn install_is_a_copy_wearing_a_mode_flag() {
+        // `install SRC DEST` is cp plus chmod; leaving it unmodelled made it Opaque, which is a
+        // refusal to say what the command does rather than a safer answer.
+        assert_eq!(
+            effect("install -m 644 /data/local/tmp/a /system/b"),
+            Effect::SystemWrite
+        );
+        assert_eq!(
+            effect("install -m 644 /data/local/tmp/a /data/local/tmp/b"),
+            Effect::FileWrite
+        );
+        // `-d` is mkdir with a mode: every operand is a directory the command creates.
+        assert_eq!(effect("install -d /system/x"), Effect::SystemWrite);
+        assert_eq!(effect("install -d ./x"), Effect::Opaque);
     }
 
     #[test]
