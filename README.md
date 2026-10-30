@@ -194,7 +194,7 @@ itself — is the artifact a second port should copy.
 
 | # | Scope | Status |
 |---|-------|--------|
-| 1 | Repository skeleton, license, and this README | 🚧 In progress |
+| 1 | Repository skeleton, license, and this README | ✅ **Delivered** — workspace of two crates ([`acowork-platform-contract`](crates/acowork-platform-contract) + [`acowork-android`](crates/acowork-android)), Apache-2.0 [LICENSE](LICENSE) identical to upstream so code flows either way, toolchain mirrors upstream `core/Cargo.toml` (edition 2024, rust-version 1.95), bilingual README, and `docs/` carrying the ADRs, the probe design and the readiness assessment |
 | 2 | Shared crate: extract node + runtime engine behind platform traits | ⛔ **Blocked (B3)** — upstream design 30 §5 and §9 give two different answers on engine ownership. Note this blocks the *engine*; the *host rules* layer shipped independently as #5a and is unaffected by how B3 is ruled |
 | 3 | CLI build running under Termux, enrolling with a real Gateway | ⬜ Planned (depends on #2) |
 | 4 | APK build: foreground service, scoped storage, keep-alive | ⛔ **Blocked (B4)** — collides with upstream `apps/acowork-mobile` (Tauri v2 Android APK, design 25 / ADR-086): same form factor, opposite purpose, ownership unresolved |

@@ -141,7 +141,7 @@ SELinux 是**运行时按 (scontext, tcontext, tclass) 判定**的，静态探�
 
 ### 5.1 工具注册
 
-- `shell` 类工具按 `ShellDialect` 注册为**独立工具**（沿用上游 Windows 上 bash / powershell 双注册的范式）：`bash`（`command -v bash` 解析到了才注册）、`ash`（有 shell 真正执行过就注册，绑定 `/system/bin/sh`）。**已实现**：[`host/tools.rs`](../../crates/acowork-android/src/host/tools.rs) 由 `HostProfile` 纯函数生成描述文本，内容是「方言是什么、§4.4 的哪些命令实测存在、哪些位置被 `touch` 证实可写、**证据源各能拿到什么**、跑在哪个 uid 与 SELinux 模式下」。
+- `shell` 类工具按 `ShellDialect` 注册为**独立工具**（沿用上游 Windows 上 bash / powershell 双注册的范式）：`bash`（`command -v bash` 解析到了才注册）、`ash`（有 shell 真正执行过就注册，绑定 `/system/bin/sh`）。**已实现**：[`host/tools.rs`](../../../crates/acowork-android/src/host/tools.rs) 由 `HostProfile` 纯函数生成描述文本，内容是「方言是什么、§4.4 的哪些命令实测存在、哪些位置被 `touch` 证实可写、**证据源各能拿到什么**、跑在哪个 uid 与 SELinux 模式下」。
   证据那一行按 §4.6 item 6 的固定词表逐源点名并给出实测访问级（`/data/anr names only; /data/tombstones not reachable; …`），
   没探到的写 `not probed` 而不是从列表里消失——悄悄变短的清单会被读成「这台机器没有 dropbox」。
   BLA-AL00 上这一行的实际输出：`Evidence: /data/anr names only; /data/tombstones not reachable; /data/system/dropbox not reachable. \`dumpsys\` has 246 running services to dump from (each needs its own \`android:shell:read\` approval).`

@@ -189,7 +189,7 @@ graph TD
 
 | # | 范围 | 状态 |
 |---|------|------|
-| 1 | 仓库骨架、许可证与本 README | 🚧 进行中 |
+| 1 | 仓库骨架、许可证与本 README | ✅ **已交付** —— 两个 crate 的 workspace（[`acowork-platform-contract`](crates/acowork-platform-contract) + [`acowork-android`](crates/acowork-android)），Apache-2.0 [LICENSE](LICENSE) 与上游一致以便代码双向流动，工具链对齐上游 `core/Cargo.toml`（edition 2024、rust-version 1.95），双语 README，`docs/` 下 ADR、探测设计与就绪评估齐备 |
 | 2 | 共享 crate：把 node + runtime 引擎抽取到平台 trait 之后 | ⛔ **阻塞（B3）** —— 上游 design 30 §5 与 §9 对「Android 引擎是编进 `acowork-runtime` 的 crate，还是依赖已发布 Host crate 的独立引擎」给出两种答案，且后者依赖的契约 crate 尚不存在。⚠️ 注意本项阻塞的是**引擎**归属；**宿主规则层**已按 #5a 独立交付，不受 B3 裁定影响 |
 | 3 | 命令行版本在 Termux 下运行，并注册到真实 Gateway | ⬜ 计划中（依赖 #2） |
 | 4 | App 版本：前台服务、受作用域存储、保活 | ⛔ **阻塞（B4）** —— 与上游 `apps/acowork-mobile`（Tauri v2 Android APK，design 25 / ADR-086）形态撞车而定位相反，归属未裁定 |
