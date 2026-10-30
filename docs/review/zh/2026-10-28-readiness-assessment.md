@@ -4,7 +4,7 @@
 - **范围**：[README.zh.md](../../../README.zh.md)、[ADR-AND-001](../../adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md)、[ADR-AND-002](../../adr/zh/ADR-AND-002-platform-contract-layer.md)（2026-10-29 新增）、[android-host-probe.md](../../design/zh/android-host-probe.md)
 - **核对基准**：上游 `AgentCowork` @ `0b5e8f14`（2026-10-28）
 - **结论**：**文档质量高，但有 3 条硬阻塞（B1/B2/B3）需上游裁定。** P0 只读切片不被阻塞，已交付并通过验收判据。
-  > **已提交上游评审（2026-10-29）**：B1 + B2 已整理成请求裁定文档，提交至 `AgentCowork/docs/review/zh/37-android-write-tier-attribution-and-capability-registry-review.md`（B1 含三个必答问题 Q1 执行点 / Q2 契约归属 / Q3 无主节点；B2 给出 a/b/c/d 四个选项，推荐 a「新增 Node/设备安全域表」）。**等待裁定，未获结论前 P3 生产接线不落地。**
+  > **已提交上游评审（2026-10-29）**：B1 + B2 已整理成请求裁定文档，提交至 `AgentCowork/docs/review/zh/37-android-write-tier-attribution-and-capability-registry-review.md`（2026-11-02 补：该文件此前只存在于工作树、从未进入上游版本控制，现已提交为上游 `e1cc9aab`，未 push）（B1 含三个必答问题 Q1 执行点 / Q2 契约归属 / Q3 无主节点；B2 给出 a/b/c/d 四个选项，推荐 a「新增 Node/设备安全域表」）。**等待裁定，未获结论前 P3 生产接线不落地。**
   > **B3 的影响面已收窄，但未消除。** 规则层抽成只依赖 `serde` 的独立 crate 后，「引擎归属形态二义」无论上游怎么裁定都**不波及规则层**，且这是结构保证（裸机 target 编译 + lib 依赖图无 std 边）而非约定。但 B3 二义的本来就是*引擎*（node + runtime）的归属，README 路线图 #2 的引擎抽取**仍然阻塞**——契约层解决的是宿主规则，不是引擎归属。
   > **三条阻塞的当前形状**：B1 解法已在契约层落地为规则 R7 并有三个测试钉住，**等的是上游对 §7.1 字面修订的确认**（Q1/Q2/Q3）；B2 **无解法可落地**——它缺的是一张上游表，本地领域类型 + 待建适配层只能把改动面积压到一个文件，不能替代裁定；B3 只阻塞引擎抽取，不阻塞 Android 移植。
 
