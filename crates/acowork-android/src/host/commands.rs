@@ -368,23 +368,23 @@ pub struct ParsedCommand {
     ///
     /// `/dev/null` and descriptor duplication (`>&1`, `2>&1`) are `None`: neither leaves
     /// anything where a later reader can find it, so neither has a previous state to restore.
-    pub redirect: Option<String>,
+    pub redirects: Vec<String>,
 }
 
-/// The script's commands *and* their redirections.
+/// The script's commands *and* every file their output goes to.
 ///
 /// [`words`] alone is not enough for a rollback planner: `echo x > /data/local/tmp/hosts`
 /// changes a file that appears nowhere in the argument vector, and a planner that cannot see
-/// the target cannot snapshot it. The redirection is read from the same `Command` the
+/// the target cannot snapshot it. The redirections are read from the same `Command` the
 /// classifier used, so the tier decision and the rollback decision cannot disagree about
-/// which file a script touched.
+/// which files a script touched — including the `cmd > a > b` case, where it touched two.
 pub fn parsed(script: &str) -> Option<Vec<ParsedCommand>> {
     let commands = lex(script).and_then(split).ok()?;
     Some(
         commands
             .into_iter()
             .map(|command| ParsedCommand {
-                redirect: command.writes().map(str::to_string),
+                redirects: command.writes().into_iter().map(str::to_string).collect(),
                 words: command.words,
             })
             .collect(),
@@ -630,44 +630,36 @@ fn quoted<I: Iterator<Item = char>>(
 fn split(toks: Vec<Tok>) -> Result<Vec<Command>, Finding> {
     let mut commands = Vec::new();
     let mut words: Vec<String> = Vec::new();
-    let mut output_to: Option<String> = None;
+    let mut outputs: Vec<String> = Vec::new();
 
-    let mut flush = |words: &mut Vec<String>, output_to: &mut Option<String>| {
-        if !words.is_empty() || output_to.is_some() {
+    let mut flush = |words: &mut Vec<String>, outputs: &mut Vec<String>| {
+        if !words.is_empty() || !outputs.is_empty() {
             commands.push(Command {
                 words: std::mem::take(words),
-                output_to: output_to.take(),
+                outputs: std::mem::take(outputs),
             });
         }
     };
 
     for tok in toks {
         match tok {
-            Tok::Break => flush(&mut words, &mut output_to),
+            Tok::Break => flush(&mut words, &mut outputs),
             Tok::Word(w) => words.push(w),
-            Tok::Out { target } => {
-                if output_to.is_some() {
-                    return Err(Finding::opaque(
-                        ">",
-                        "every redirection is applied — `cmd > a > b` truncates `a` and sends \
-                         stdout to `b`, so two files change — and the rollback ledger snapshots \
-                         one target per command, so the port would be approving a write it \
-                         cannot fully put back",
-                    ));
-                }
-                output_to = Some(target);
-            }
+            // Every redirection is kept, not the last one seen. `cmd > a > b` truncates `a`
+            // and sends stdout to `b`: two files change, and a classifier that read only one
+            // would approve a script whose second write it had never mentioned.
+            Tok::Out { target } => outputs.push(target),
         }
     }
-    flush(&mut words, &mut output_to);
+    flush(&mut words, &mut outputs);
     Ok(commands)
 }
 
-/// One command: its words and the file its output goes to, if any.
+/// One command: its words and every file its output goes to.
 #[derive(Debug)]
 struct Command {
     words: Vec<String>,
-    output_to: Option<String>,
+    outputs: Vec<String>,
 }
 
 impl Command {
@@ -691,13 +683,13 @@ impl Command {
         }
     }
 
-    /// Redirection target that actually writes something a reader could find.
-    fn writes(&self) -> Option<&str> {
-        let target = self.output_to.as_deref()?;
-        if target == "/dev/null" || target.starts_with('&') {
-            return None;
-        }
-        Some(target)
+    /// Redirection targets that actually write something a reader could find.
+    fn writes(&self) -> Vec<&str> {
+        self.outputs
+            .iter()
+            .map(String::as_str)
+            .filter(|target| *target != "/dev/null" && !target.starts_with('&'))
+            .collect()
     }
 }
 
@@ -715,10 +707,8 @@ fn is_assignment(word: &str) -> bool {
 fn analyse(command: &Command) -> Finding {
     let Some(raw_head) = command.head() else {
         // Nothing but assignments, or a bare redirection.
-        return match command.writes() {
-            Some(target) => {
-                Finding::new("", file_effect(target), format!("redirects to `{target}`"))
-            }
+        return match redirect_effect(command) {
+            Some((effect, targets)) => Finding::new("", effect, format!("redirects to {targets}")),
             None => Finding::new("", Effect::ReadOnly, "changes no device state"),
         };
     };
@@ -747,7 +737,7 @@ fn analyse(command: &Command) -> Finding {
             Some(inner) => {
                 let inner_command = Command {
                     words: command.args().to_vec(),
-                    output_to: command.output_to.clone(),
+                    outputs: command.outputs.clone(),
                 };
                 let finding = analyse(&inner_command);
                 Finding::new(
@@ -767,18 +757,35 @@ fn analyse(command: &Command) -> Finding {
     // /data/local/tmp/log` rewrites a partition file and drops the noise in tmp — and a tier
     // decision that reports only the redirect approves the smaller half.
     let own = effect_of(&head, command.args());
-    match command.writes() {
-        Some(target) => {
-            let redirect = file_effect(target);
+    match redirect_effect(command) {
+        Some((redirect, targets)) => {
             let detail = if own.effect == Effect::ReadOnly {
-                format!("redirects its output to `{target}`")
+                format!("redirects its output to {targets}")
             } else {
-                format!("redirects its output to `{target}`, and {}", own.detail)
+                format!("redirects its output to {targets}, and {}", own.detail)
             };
             Finding::new(head, redirect.max(own.effect), detail)
         }
         None => own,
     }
+}
+
+/// The tier all of a command's redirections cost, and the sentence naming them.
+///
+/// `None` when the command redirects nothing a reader could find (`/dev/null`, or `>&2`), which
+/// leaves the command's own effect to decide alone.
+fn redirect_effect(command: &Command) -> Option<(Effect, String)> {
+    let targets = command.writes();
+    if targets.is_empty() {
+        return None;
+    }
+    let effect = targets.iter().map(|t| file_effect(t)).max()?;
+    let named = targets
+        .iter()
+        .map(|t| format!("`{t}`"))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    Some((effect, named))
 }
 
 /// Where a write target actually lands, as far as this port can tell.
@@ -2260,6 +2267,36 @@ mod tests {
         assert_eq!(
             classify("echo x > /data/local/tmp/./f").strongest(),
             Effect::FileWrite
+        );
+    }
+
+    #[test]
+    fn every_redirection_of_a_command_counts_not_just_the_last_one() {
+        // POSIX applies each redirection in order: `cmd > a > b` truncates `a` and sends stdout
+        // to `b`. Both files change, so the approval has to cost the heavier of the two and name
+        // both — reporting only one is the same "first match wins" reflex that had `dd` classify
+        // one destination out of several.
+        let v = classify("echo x > /data/local/tmp/a > /system/b");
+        assert_eq!(v.strongest(), Effect::SystemWrite);
+        assert_eq!(v.findings[0].command, "echo");
+        let detail = &v.findings[0].detail;
+        assert!(
+            detail.contains("/data/local/tmp/a") && detail.contains("/system/b"),
+            "{detail}"
+        );
+        // `/dev/null` and a duplicated fd are not files a reader can find, so they add no tier
+        // and no second snapshot: the write that matters is the one that remains.
+        assert_eq!(
+            classify("logcat -d > /dev/null > /data/local/tmp/a").strongest(),
+            Effect::FileWrite
+        );
+        // Two redirections do not cancel the command's own effect either.
+        assert_eq!(
+            classify(
+                "sed -i s/a/b/ /system/build.prop > /data/local/tmp/log1 > /data/local/tmp/log2"
+            )
+            .strongest(),
+            Effect::SystemWrite
         );
     }
 

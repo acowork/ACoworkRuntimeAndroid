@@ -377,9 +377,11 @@ impl Capture {
 }
 
 impl Capture {
-    /// A write whose target is a file the script redirects into.
+    /// Every file the script redirects into, one capture each.
     ///
-    /// Only a *plain absolute path* is modelled. Three cases are refused rather than guessed
+    /// `cmd > a > b` writes two files, so it gets two snapshots; a ledger that held one would
+    /// read as complete while leaving the other change on the device. Only a *plain absolute
+    /// path* is modelled. Three cases are refused rather than guessed
     /// at, and each would break the snapshot in a different way:
     ///
     /// - relative paths resolve against the write's working directory, which the capture cannot
@@ -388,11 +390,17 @@ impl Capture {
     ///   may write several files;
     /// - `/dev/…` is a character device: writing it changes nothing readable afterwards, and
     ///   `base64` of it would block or spin.
-    fn from_redirect(command: &commands::ParsedCommand) -> Option<Capture> {
-        let path = command.redirect.as_deref()?;
-        if !is_snapshotable_path(path) {
-            return None;
-        }
+    fn from_redirect(command: &commands::ParsedCommand) -> Vec<Capture> {
+        command
+            .redirects
+            .iter()
+            .filter(|p| is_snapshotable_path(p))
+            .map(|path| Self::file_capture(path))
+            .collect()
+    }
+
+    /// One snapshot plan for one file the script writes into.
+    fn file_capture(path: &str) -> Capture {
         let literal = quote_posix(path);
         // The envelope is built from ordinary read-tier commands with no subshells and no
         // braces: `$( )` and `{ }` make a script unanalysable to the classifier, and a capture
@@ -403,14 +411,14 @@ impl Capture {
             "{probe} && printf 'PRESENT\n'; {probe} && wc -c < {literal}; {probe} || printf \
              'ABSENT\n'"
         );
-        Some(Capture {
+        Capture {
             target: UndoTarget::File(path.to_string()),
             read,
             writing: Writing::Unknown,
             // A file is durable in a way a property is not: it is still there after a reboot
             // without anyone declaring it so.
             persists_reboot: true,
-        })
+        }
     }
 }
 
@@ -778,46 +786,94 @@ pub fn plan(script: &str) -> Plan {
         if finding.effect.is_read_only() {
             continue;
         }
-        let capture =
-            Capture::from_args(&command.words, finding).or_else(|| Capture::from_redirect(command));
-        match capture {
-            Some(capture) => {
+        let own = Capture::from_args(&command.words, finding);
+        let snapshots = Capture::from_redirect(command);
+        // The heaviest tier any of this command's redirections costs. A command can also change
+        // something the redirections do not name — `sed -i 's/a/b/' /system/build.prop >
+        // /data/local/tmp/log` rewrites a partition file and drops the noise in tmp — and that
+        // difference has to be said out loud, because the snapshot of the log says nothing about
+        // build.prop. Silence here would leave a teardown report whose undo list looks complete,
+        // which is the failure this module was written to avoid.
+        let redirected = command
+            .redirects
+            .iter()
+            .map(|t| commands::file_write_effect(t))
+            .max();
+        match (own, snapshots) {
+            (Some(capture), snaps) => {
                 out.captures.push(capture);
-                // A command can write twice. `sed -i 's/a/b/' /system/build.prop >
-                // /data/local/tmp/log` rewrites a partition file and redirects the noise into
-                // tmp; the ledger holds one undo per command, so a snapshot of the log says
-                // nothing about build.prop. Silence here would leave a teardown report whose undo
-                // list looks complete, which is the failure this module was written to avoid.
-                if let Some(target) = command.redirect.as_deref() {
-                    let redirected = commands::file_write_effect(target);
-                    if finding.effect > redirected {
-                        out.unundoable.push(Unundoable {
-                            command: finding.command.clone(),
-                            why: format!(
-                                "writes something besides the file it redirects into — the \
-                                 ledger holds one undo per command, so the snapshot of \
-                                 {target:?} does not cover this command's heavier effect ({:?})",
-                                finding.effect
-                            ),
-                            kind: UnundoableKind::NotModelled,
-                        });
-                    }
+                out.captures.extend(snaps);
+            }
+            (None, snaps) if !snaps.is_empty() => {
+                // A target the capture refused is not a target the script did not write. Without
+                // this line the ledger holds a snapshot of the one file it could name and reports
+                // nothing about the rest — which is the "looks complete" failure, arrived at by a
+                // route the heavier-effect test below does not cross.
+                let missed: Vec<String> = command
+                    .redirects
+                    .iter()
+                    .filter(|t| !is_snapshotable_path(t))
+                    .map(|t| format!("{t:?}"))
+                    .collect();
+                if !missed.is_empty() {
+                    out.unundoable.push(Unundoable {
+                        command: finding.command.clone(),
+                        why: format!(
+                            "also redirects to {}, which {} not a plain absolute path — a \
+                             relative name, a glob or a `$variable` names a file this capture \
+                             cannot identify, so no snapshot was taken and this change stays \
+                             after the session ends",
+                            missed.join(", "),
+                            if missed.len() == 1 { "is" } else { "are" }
+                        ),
+                        kind: UnundoableKind::IndeterminateTarget,
+                    });
+                }
+                let heavier_than_snapshots = redirected.is_none_or(|r| finding.effect > r);
+                let names = command
+                    .redirects
+                    .iter()
+                    .map(|t| format!("{t:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.captures.extend(snaps);
+                if heavier_than_snapshots {
+                    out.unundoable.push(Unundoable {
+                        command: finding.command.clone(),
+                        why: format!(
+                            "changes something besides the file(s) it redirects into ({names}) — \
+                             the ledger snapshots those, so this command's heavier effect ({:?}) \
+                             is not covered by them",
+                            finding.effect
+                        ),
+                        kind: UnundoableKind::NotModelled,
+                    });
                 }
             }
             // A redirect the planner *saw* and rejected deserves its own sentence: "no inverse
             // is modelled" reads like a gap in the port's ambition, when the real reason is
             // that the target was not a name the capture could trust.
-            None if command.redirect.is_some() => out.unundoable.push(Unundoable {
+            (None, _) if !command.redirects.is_empty() => out.unundoable.push(Unundoable {
                 command: finding.command.clone(),
                 why: format!(
-                    "redirects to {:?}, which is not a plain absolute path — a relative name, a \
+                    "redirects to {}, which {} not a plain absolute path — a relative name, a \
                      glob or a `$variable` names a file this capture cannot identify, so no \
                      snapshot was taken and this change stays after the session ends",
-                    command.redirect.as_deref().unwrap_or("")
+                    command
+                        .redirects
+                        .iter()
+                        .map(|t| format!("{t:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if command.redirects.len() == 1 {
+                        "is"
+                    } else {
+                        "are"
+                    }
                 ),
                 kind: UnundoableKind::IndeterminateTarget,
             }),
-            None => {
+            (None, _) => {
                 // The dispatcher tables answer this before the planner falls back to admitting
                 // it has no model. Getting the two apart is the point: `input tap` does not
                 // "leave a change behind" that the session failed to clean, and saying so would
@@ -2702,9 +2758,9 @@ mod tests {
 
     #[test]
     fn a_command_that_writes_twice_says_which_half_the_ledger_cannot_put_back() {
-        // One undo per command is the ledger's shape, and a script can write twice inside one
-        // command. The snapshot of the redirected file must not read as a restore of the
-        // in-place edit too.
+        // The ledger captures every file a command writes into, and an in-place edit is not one
+        // of those files: the snapshot of the redirected log must not read as a restore of the
+        // build.prop the `sed` rewrote.
         let plan = plan("sed -i 's/a/b/' /system/build.prop > /data/local/tmp/log");
         assert_eq!(plan.captures.len(), 1, "the redirect is still snapshotted");
         assert_eq!(
@@ -2714,11 +2770,55 @@ mod tests {
             plan.unundoable
         );
         assert!(
-            plan.unundoable[0].why.contains("one undo per command"),
+            plan.unundoable[0].why.contains("not covered by them"),
             "{:?}",
             plan.unundoable[0]
         );
         assert_eq!(plan.unundoable[0].kind, UnundoableKind::NotModelled);
+    }
+
+    #[test]
+    fn a_command_that_redirects_into_two_files_snapshots_both() {
+        // `cmd > a > b` changes two files. One undo would leave the ledger looking complete while
+        // the second change stays on the device, which is the failure this module exists to avoid.
+        let twice = plan("echo x > /data/local/tmp/a > /data/local/tmp/b");
+        let targets: Vec<String> = twice.captures.iter().map(|c| c.target.describe()).collect();
+        assert_eq!(
+            targets,
+            vec!["file /data/local/tmp/a", "file /data/local/tmp/b"],
+            "one capture per file the command writes"
+        );
+        assert!(twice.unundoable.is_empty(), "{:?}", twice.unundoable);
+        // A target the capture cannot trust is still named, rather than silently dropped.
+        // A glob is approvable (its directory bounds it) but not snapshottable (the port cannot
+        // name the file), so it has to appear in the teardown while the plain path still gets its
+        // snapshot.
+        let one_bad = plan("echo x > /data/local/tmp/a > /data/local/tmp/*.log");
+        assert_eq!(one_bad.captures.len(), 1, "{one_bad:?}");
+        assert_eq!(one_bad.unundoable.len(), 1, "{one_bad:?}");
+        assert_eq!(
+            one_bad.unundoable[0].kind,
+            UnundoableKind::IndeterminateTarget
+        );
+        assert!(
+            one_bad.unundoable[0].why.contains("*.log"),
+            "{}",
+            one_bad.unundoable[0].why
+        );
+        // A property write plus a redirected log: both are recorded, where the ledger previously
+        // held only the property and left the log to appear from nowhere.
+        let prop_and_log = plan("setprop debug.a.b 1 > /data/local/tmp/log");
+        assert_eq!(
+            prop_and_log.captures.len(),
+            2,
+            "{:?}",
+            prop_and_log.captures
+        );
+        assert!(
+            prop_and_log.unundoable.is_empty(),
+            "{:?}",
+            prop_and_log.unundoable
+        );
     }
 
     #[test]
