@@ -399,6 +399,56 @@ impl Capture {
             .collect()
     }
 
+    /// What the command changes in files *of its own* — an in-place edit, a copy, a removal —
+    /// as distinct from what its redirections write into.
+    ///
+    /// The question goes to the classifier (`commands::file_writes`), not to a rule written here:
+    /// "which operand is the destination" is answered once, and the tier the gate approves and the
+    /// files this ledger snapshots cannot drift apart. Each answer splits three ways:
+    ///
+    /// - a content change at a name the capture can trust gets a snapshot, which is a real undo;
+    /// - a removal gets one too, because the bytes can be put back even though the inode, owner
+    ///   and mtime cannot — `undo_for` marks that `faithful: false` from the pre-state it reads;
+    /// - a mode, ownership, timestamp or label change gets *no* snapshot and says why. Restoring
+    ///   the bytes of a file whose bytes never changed would report a restore that did not happen.
+    fn from_command_files(command: &commands::ParsedCommand) -> (Vec<Capture>, Vec<Unundoable>) {
+        let Some(writes) = commands::file_writes(&command.words) else {
+            return (Vec::new(), Vec::new());
+        };
+        let mut captures = Vec::new();
+        let mut notes = Vec::new();
+        for write in writes {
+            if write.change == commands::FileChange::Metadata {
+                notes.push(Unundoable {
+                    command: command.words.join(" "),
+                    why: format!(
+                        "`{}` changes {}'s mode, owner, timestamp or label, and a content \
+                         snapshot would not put that back — the bytes are already what they were",
+                        command.words.first().map(String::as_str).unwrap_or(""),
+                        write.path
+                    ),
+                    kind: UnundoableKind::NotModelled,
+                });
+                continue;
+            }
+            if !is_snapshotable_path(&write.path) {
+                notes.push(Unundoable {
+                    command: command.words.join(" "),
+                    why: format!(
+                        "changes {:?}, which is not a plain absolute path — a relative name, a \
+                         glob or a `$variable` names a file this capture cannot identify, so no \
+                         snapshot was taken and this change stays after the session ends",
+                        write.path
+                    ),
+                    kind: UnundoableKind::IndeterminateTarget,
+                });
+                continue;
+            }
+            captures.push(Capture::file_capture(&write.path));
+        }
+        (captures, notes)
+    }
+
     /// One snapshot plan for one file the script writes into.
     fn file_capture(path: &str) -> Capture {
         let literal = quote_posix(path);
@@ -787,117 +837,97 @@ pub fn plan(script: &str) -> Plan {
             continue;
         }
         let own = Capture::from_args(&command.words, finding);
-        let snapshots = Capture::from_redirect(command);
-        // The heaviest tier any of this command's redirections costs. A command can also change
-        // something the redirections do not name — `sed -i 's/a/b/' /system/build.prop >
-        // /data/local/tmp/log` rewrites a partition file and drops the noise in tmp — and that
-        // difference has to be said out loud, because the snapshot of the log says nothing about
-        // build.prop. Silence here would leave a teardown report whose undo list looks complete,
-        // which is the failure this module was written to avoid.
-        let redirected = command
+        let redirects = Capture::from_redirect(command);
+        // Which files this command changes *itself* — an in-place edit, a copy, a removal. The
+        // question is asked of the classifier, so the tier a caller approves and the files this
+        // ledger snapshots are decided by the same reading of the same operands.
+        let (files, file_notes) = if own.is_some() {
+            (Vec::new(), Vec::new())
+        } else {
+            Capture::from_command_files(command)
+        };
+        let captured = redirects.len() + files.len();
+        // The heaviest tier anything here can actually put back. If the approval is heavier,
+        // something changed that no undo describes, and the session has to be told so at teardown
+        // rather than left with a list that looks complete — which is the failure this module was
+        // written to avoid.
+        let covered: Vec<commands::Effect> = command
             .redirects
             .iter()
-            .map(|t| commands::file_write_effect(t))
-            .max();
-        match (own, snapshots) {
-            (Some(capture), snaps) => {
-                out.captures.push(capture);
-                out.captures.extend(snaps);
-            }
-            (None, snaps) if !snaps.is_empty() => {
-                // A target the capture refused is not a target the script did not write. Without
-                // this line the ledger holds a snapshot of the one file it could name and reports
-                // nothing about the rest — which is the "looks complete" failure, arrived at by a
-                // route the heavier-effect test below does not cross.
-                let missed: Vec<String> = command
-                    .redirects
-                    .iter()
-                    .filter(|t| !is_snapshotable_path(t))
-                    .map(|t| format!("{t:?}"))
-                    .collect();
-                if !missed.is_empty() {
-                    out.unundoable.push(Unundoable {
-                        command: finding.command.clone(),
-                        why: format!(
-                            "also redirects to {}, which {} not a plain absolute path — a \
-                             relative name, a glob or a `$variable` names a file this capture \
-                             cannot identify, so no snapshot was taken and this change stays \
-                             after the session ends",
-                            missed.join(", "),
-                            if missed.len() == 1 { "is" } else { "are" }
-                        ),
-                        kind: UnundoableKind::IndeterminateTarget,
-                    });
-                }
-                let heavier_than_snapshots = redirected.is_none_or(|r| finding.effect > r);
-                let names = command
-                    .redirects
-                    .iter()
-                    .map(|t| format!("{t:?}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                out.captures.extend(snaps);
-                if heavier_than_snapshots {
-                    out.unundoable.push(Unundoable {
-                        command: finding.command.clone(),
-                        why: format!(
-                            "changes something besides the file(s) it redirects into ({names}) — \
-                             the ledger snapshots those, so this command's heavier effect ({:?}) \
-                             is not covered by them",
-                            finding.effect
-                        ),
-                        kind: UnundoableKind::NotModelled,
-                    });
-                }
-            }
-            // A redirect the planner *saw* and rejected deserves its own sentence: "no inverse
-            // is modelled" reads like a gap in the port's ambition, when the real reason is
-            // that the target was not a name the capture could trust.
-            (None, _) if !command.redirects.is_empty() => out.unundoable.push(Unundoable {
+            .map(String::as_str)
+            .filter(|t| is_snapshotable_path(t))
+            .chain(files.iter().filter_map(|c| match &c.target {
+                UndoTarget::File(path) => Some(path.as_str()),
+                _ => None,
+            }))
+            .map(commands::file_write_effect)
+            .collect();
+        let answered =
+            own.is_some() || !command.redirects.is_empty() || captured + file_notes.len() > 0;
+        let missed: Vec<String> = command
+            .redirects
+            .iter()
+            .filter(|t| !is_snapshotable_path(t))
+            .map(|t| format!("{t:?}"))
+            .collect();
+
+        out.captures.extend(own.clone());
+        out.captures.extend(files);
+        out.unundoable.extend(file_notes);
+        out.captures.extend(redirects);
+
+        if !missed.is_empty() {
+            // A redirect the capture could not trust is still a file the script wrote.
+            out.unundoable.push(Unundoable {
                 command: finding.command.clone(),
                 why: format!(
-                    "redirects to {}, which {} not a plain absolute path — a relative name, a \
-                     glob or a `$variable` names a file this capture cannot identify, so no \
+                    "also redirects to {}, which {} not a plain absolute path — a relative name, \
+                     a glob or a `$variable` names a file this capture cannot identify, so no \
                      snapshot was taken and this change stays after the session ends",
-                    command
-                        .redirects
-                        .iter()
-                        .map(|t| format!("{t:?}"))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    if command.redirects.len() == 1 {
-                        "is"
-                    } else {
-                        "are"
-                    }
+                    missed.join(", "),
+                    if missed.len() == 1 { "is" } else { "are" }
                 ),
                 kind: UnundoableKind::IndeterminateTarget,
-            }),
-            (None, _) => {
-                // The dispatcher tables answer this before the planner falls back to admitting
-                // it has no model. Getting the two apart is the point: `input tap` does not
-                // "leave a change behind" that the session failed to clean, and saying so would
-                // teach the operator to distrust every line in the teardown.
-                let (kind, why) = irreversible(
-                    command.words.first().map(String::as_str).unwrap_or(""),
-                    subcommand(&command.words),
+            });
+        }
+
+        if !answered {
+            // The dispatcher tables answer this before the planner falls back to admitting it has
+            // no model. Getting the two apart is the point: `input tap` does not "leave a change
+            // behind" that the session failed to clean, and saying so would teach the operator to
+            // distrust every line in the teardown.
+            let (kind, why) = irreversible(
+                command.words.first().map(String::as_str).unwrap_or(""),
+                subcommand(&command.words),
+            )
+            .unwrap_or_else(|| {
+                (
+                    UnundoableKind::NotModelled,
+                    format!(
+                        "{} — this port has no inverse modelled for it yet, so the change stays \
+                         after the session ends",
+                        finding.detail
+                    ),
                 )
-                .unwrap_or_else(|| {
-                    (
-                        UnundoableKind::NotModelled,
-                        format!(
-                            "{} — this port has no inverse modelled for it yet, so the change \
-                             stays after the session ends",
-                            finding.detail
-                        ),
-                    )
-                });
-                out.unundoable.push(Unundoable {
-                    command: finding.command.clone(),
-                    why,
-                    kind,
-                })
-            }
+            });
+            out.unundoable.push(Unundoable {
+                command: finding.command.clone(),
+                why,
+                kind,
+            });
+        } else if own.is_none()
+            && captured > 0
+            && covered.iter().max().is_none_or(|c| finding.effect > *c)
+        {
+            out.unundoable.push(Unundoable {
+                command: finding.command.clone(),
+                why: format!(
+                    "costs {:?}, which is heavier than any file this ledger can put back — the \
+                     command changes something the file names do not describe",
+                    finding.effect
+                ),
+                kind: UnundoableKind::NotModelled,
+            });
         }
     }
     out
@@ -2340,12 +2370,26 @@ mod tests {
             planned.unundoable[0]
         );
 
-        // `rm` deletes a file the script never redirected into: the content is gone by the time
-        // the planner looks, and no capture could have run sooner than the command itself.
+        // `rm` deletes a file the script never redirected into. The content can still be put
+        // back — the pre-state read runs *before* the removal — so it is captured now instead of
+        // waved through as irreversible. What cannot come back is the inode, the owner and the
+        // mtime, which is what `faithful: false` is for on the restore.
         let planned = plan("rm -f /data/local/tmp/note.txt");
-        assert!(planned.captures.is_empty());
+        assert_eq!(planned.captures.len(), 1, "{:?}", planned.captures);
+        assert!(
+            matches!(planned.captures[0].target, UndoTarget::File(_)),
+            "{:?}",
+            planned.captures[0].target
+        );
+        assert!(planned.unundoable.is_empty(), "{:?}", planned.unundoable);
+        // A removal whose file the port cannot name is still declared, not silently skipped.
+        let planned = plan("rm -f /data/local/tmp/*.log");
+        assert!(planned.captures.is_empty(), "{:?}", planned.captures);
         assert_eq!(planned.unundoable.len(), 1);
-        assert_eq!(planned.unundoable[0].command, "rm");
+        assert_eq!(
+            planned.unundoable[0].kind,
+            UnundoableKind::IndeterminateTarget
+        );
     }
 
     #[test]
@@ -2761,20 +2805,31 @@ mod tests {
         // The ledger captures every file a command writes into, and an in-place edit is not one
         // of those files: the snapshot of the redirected log must not read as a restore of the
         // build.prop the `sed` rewrote.
-        let plan = plan("sed -i 's/a/b/' /system/build.prop > /data/local/tmp/log");
-        assert_eq!(plan.captures.len(), 1, "the redirect is still snapshotted");
+        // Both halves of this one are now covered: the in-place edit is a file the classifier
+        // names, so it gets its own snapshot next to the redirected log.
+        let edited = plan("sed -i 's/a/b/' /system/build.prop > /data/local/tmp/log");
+        assert_eq!(edited.captures.len(), 2, "{:?}", edited.captures);
+        assert!(edited.unundoable.is_empty(), "{:?}", edited.unundoable);
+        // The note belongs to the case where the command changes something the port cannot name
+        // at all: `sed -i -e` interleaves expressions with files, so no operand can be read as
+        // the file — and the ledger must still say the approval is heavier than anything it can
+        // put back, rather than reporting the one snapshot it did take as the whole story.
+        let rotated = plan("sed -i -e s/a/b/ /system/build.prop > /data/local/tmp/log");
+        assert_eq!(rotated.captures.len(), 1, "{:?}", rotated.captures);
         assert_eq!(
-            plan.unundoable.len(),
+            rotated.unundoable.len(),
             1,
-            "and the second write is named: {:?}",
-            plan.unundoable
+            "and the heavier half is named: {:?}",
+            rotated.unundoable
         );
         assert!(
-            plan.unundoable[0].why.contains("not covered by them"),
+            rotated.unundoable[0]
+                .why
+                .contains("heavier than any file this ledger can put back"),
             "{:?}",
-            plan.unundoable[0]
+            rotated.unundoable[0]
         );
-        assert_eq!(plan.unundoable[0].kind, UnundoableKind::NotModelled);
+        assert_eq!(rotated.unundoable[0].kind, UnundoableKind::NotModelled);
     }
 
     #[test]

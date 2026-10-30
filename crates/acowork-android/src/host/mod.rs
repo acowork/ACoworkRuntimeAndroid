@@ -88,8 +88,8 @@ pub use capability::{
 };
 pub use chain::{root_shell, shell, shell_with_runner, wrap};
 pub use commands::{
-    Effect, Finding, Refusal, RefusalKind, Verdict, check as check_script,
-    classify as classify_script,
+    Effect, FileChange, FileWrite, Finding, Refusal, RefusalKind, Verdict, check as check_script,
+    classify as classify_script, file_writes,
 };
 pub use denial::{
     DenialLedger, SelinuxClassifier, SelinuxDenial, classify, parse_denials, redact_denials,

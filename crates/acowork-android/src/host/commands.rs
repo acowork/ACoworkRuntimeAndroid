@@ -837,6 +837,152 @@ fn destination(target: &str) -> Destination {
     }
 }
 
+/// How a command changes a file it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileChange {
+    /// The bytes in the file are different afterwards. A content snapshot is a real undo.
+    Content,
+    /// Ownership, mode, timestamp or label — the bytes are the same. A content snapshot would
+    /// "restore" a file that was never changed in that way and leave the metadata alone, so the
+    /// ledger is told not to offer one.
+    Metadata,
+    /// The name goes away. Its bytes can be put back, but not its inode, owner or mtime, so the
+    /// undo is honest only with `faithful: false` attached.
+    Deletion,
+}
+
+/// One file a command changes, and what happens to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileWrite {
+    /// The path as the script spells it. Resolving it is the caller's job, and the rollback
+    /// planner needs the raw spelling to decide whether it can name the file at all.
+    pub path: String,
+    /// What the command does to it, which decides whether a content snapshot is an honest undo.
+    pub change: FileChange,
+}
+
+/// Which files a command changes, and how — or `None` when the port cannot say.
+///
+/// This is the same operand-role reasoning the tier decision uses (`looks_like_path`,
+/// `flag_destination`, `written_targets`), not a second reading of the arguments: the rollback
+/// planner asks this question instead of re-deriving "which operand is the destination", because
+/// a planner that decides that for itself is how a script ends up approved as one file and
+/// restored as another. `None` is a real answer and means the command is not one whose operands
+/// this port reads as files at all — `echo` with a redirection, an unknown binary, a wrapper.
+pub fn file_writes(words: &[String]) -> Option<Vec<FileWrite>> {
+    let head_index = words.iter().position(|w| !is_assignment(w))?;
+    let head = normalise(&words[head_index]);
+    let args: Vec<String> = words[head_index + 1..].to_vec();
+    // A multiplexer is its subcommand: `toybox cp a b` changes the same file as `cp a b`.
+    if matches!(head.as_str(), "toybox" | "busybox") {
+        let inner = args.first()?;
+        if inner.starts_with('-') {
+            return None;
+        }
+        let mut inner_words = vec![inner.clone()];
+        inner_words.extend(args.iter().skip(1).cloned());
+        return file_writes(&inner_words);
+    }
+    let paths: Vec<&str> = args
+        .iter()
+        .filter(|a| !a.starts_with('-') && looks_like_path(a))
+        .map(String::as_str)
+        .collect();
+    let flag = |f: &str| args.iter().any(|a| a.starts_with('-') && a.contains(f));
+    let operands: Vec<&str> = args
+        .iter()
+        .filter(|a| !a.starts_with('-'))
+        .map(String::as_str)
+        .collect();
+
+    let writes: Vec<(String, FileChange)> = match head.as_str() {
+        "dd" => args
+            .iter()
+            .filter_map(|a| a.strip_prefix("of="))
+            .map(|t| (t.to_string(), FileChange::Content))
+            .collect(),
+        "sed" if flag("i") => {
+            // Same refusal as the tier decision: `-e` interleaves expressions with file names, so
+            // which operand gets rewritten cannot be told apart, and the first operand is the
+            // script rather than a file.
+            if operands.len() < 2
+                || args
+                    .iter()
+                    .any(|a| a.starts_with("-e") || a.starts_with("--expression"))
+            {
+                return None;
+            }
+            operands[1..]
+                .iter()
+                .map(|f| (f.to_string(), FileChange::Content))
+                .collect()
+        }
+        "mv" => {
+            let mut v = Vec::new();
+            if let Some(dir) = flag_destination(&head, &args) {
+                v.push((dir, FileChange::Content));
+            }
+            for (index, operand) in operands.iter().enumerate() {
+                let last_of_two =
+                    flag_destination(&head, &args).is_none() && index == operands.len() - 1;
+                if last_of_two {
+                    v.push((operand.to_string(), FileChange::Content));
+                } else {
+                    v.push((operand.to_string(), FileChange::Deletion));
+                }
+            }
+            v
+        }
+        "cp" | "ln" | "install" => {
+            let mkdir_style =
+                head == "install" && args.iter().any(|a| a == "-d" || a == "--directory");
+            if mkdir_style {
+                operands
+                    .iter()
+                    .map(|o| (o.to_string(), FileChange::Metadata))
+                    .collect()
+            } else if let Some(dir) = flag_destination(&head, &args) {
+                vec![(dir, FileChange::Content)]
+            } else {
+                written_targets(&head, &operands)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|t| (t.to_string(), FileChange::Content))
+                    .collect()
+            }
+        }
+        "rm" | "unlink" | "rmdir" => paths
+            .iter()
+            .map(|p| (p.to_string(), FileChange::Deletion))
+            .collect(),
+        "chmod" | "chown" | "chgrp" | "chattr" | "touch" | "mkdir" | "chcon" | "restorecon"
+        | "setcontext" => paths
+            .iter()
+            .map(|p| (p.to_string(), FileChange::Metadata))
+            .collect(),
+        "logcat" => args
+            .iter()
+            .position(|a| a == "-f" || a == "--file")
+            .and_then(|i| args.get(i + 1))
+            .map(|path| vec![(path.clone(), FileChange::Content)])
+            .unwrap_or_default(),
+        "tee" | "truncate" => paths
+            .iter()
+            .map(|p| (p.to_string(), FileChange::Content))
+            .collect(),
+        _ => return None,
+    };
+    if writes.is_empty() {
+        return None;
+    }
+    Some(
+        writes
+            .into_iter()
+            .map(|(path, change)| FileWrite { path, change })
+            .collect(),
+    )
+}
+
 /// The tier a write to this path costs, for callers that must compare it against something.
 ///
 /// The rollback planner is that caller: when a command's finding is heavier than its own
@@ -1108,6 +1254,19 @@ fn effect_of(head: &str, args: &[String]) -> Finding {
                 );
             }
             if flag("r") || flag("f") {
+                // `-f` names the file the log goes to, so it is tiered by that file:
+                // `logcat -f /system/build.prop` is not an outside-app write, and hard-coding the
+                // answer here is the same mistake `sed -i` made until it was tiered by its file.
+                // `-r` on its own is a rotation *size*, not a path, and is left at the file tier
+                // it has always been given.
+                if let Some(path) = args
+                    .iter()
+                    .position(|a| a == "-f" || a == "--file")
+                    .and_then(|i| args.get(i + 1))
+                {
+                    let effect = file_effect(path);
+                    return Finding::new(head, effect, format!("writes the log to `{path}`"));
+                }
                 return Finding::new(
                     head,
                     Effect::FileWrite,
@@ -2100,6 +2259,110 @@ mod tests {
             "{}",
             finding.detail
         );
+    }
+
+    #[test]
+    fn the_files_a_command_changes_never_outrank_the_approval_it_gets() {
+        // The planner asks `file_writes` which files to snapshot; the gate asks the same lexer
+        // what to approve. If those two ever disagree in the permissive direction, a script is
+        // approved as one file and restored as another — so the relationship is pinned here for a
+        // corpus rather than trusted because both read the same helpers.
+        let corpus = [
+            "sed -i s/a/b/ /data/local/tmp/f",
+            "sed -i 's/a/b/' /system/build.prop",
+            "cp /data/local/tmp/a /system/b",
+            "mv /system/x /data/local/tmp/y",
+            "mv -t /system /data/local/tmp/a",
+            "install -m 644 /data/local/tmp/a /system/b",
+            "install -d /system/x",
+            "ln -s /data/local/tmp/x /system/bin/y",
+            "rm -r /data/local/tmp/x",
+            "unlink /system/x",
+            "chmod 777 /data/local/tmp/f",
+            "chcon u:object_r:x:s0 /system/bin/sh",
+            "tee /system/f",
+            "truncate -s 0 /data/local/tmp/f",
+            "echo x > /data/local/tmp/f",
+            "toybox cp /data/local/tmp/a /system/b",
+            "busybox sed -i s/a/b/ /system/build.prop",
+        ];
+        for script in corpus {
+            let verdict = classify(script);
+            let effect = verdict.strongest();
+            let words: Vec<String> = script.split_whitespace().map(str::to_string).collect();
+            let Some(writes) = file_writes(&words) else {
+                continue;
+            };
+            for write in writes {
+                let tier = file_effect(&write.path);
+                assert!(
+                    tier <= effect || matches!(effect, Effect::Opaque | Effect::Banned),
+                    "`{script}`: `{}` ({tier:?}) outranks the approval {effect:?}",
+                    write.path
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_command_word_and_its_operands_are_told_apart_when_answering() {
+        // `echo` changes a file its *arguments* never mention, so the answer here is "cannot say"
+        // rather than an empty list: an empty list would read to the planner as "this command
+        // writes no file", which is a different claim.
+        assert!(file_writes(&["echo".into(), "x".into()]).is_none());
+        // A leading assignment is not the command word.
+        let writes = file_writes(&[
+            "PATH=/system/bin".into(),
+            "rm".into(),
+            "-f".into(),
+            "/data/local/tmp/x".into(),
+        ])
+        .expect("rm is still rm behind an assignment");
+        assert_eq!(writes[0].change, FileChange::Deletion);
+        // A multiplexer is its subcommand.
+        let writes = file_writes(&[
+            "toybox".into(),
+            "cp".into(),
+            "/data/local/tmp/a".into(),
+            "/system/b".into(),
+        ])
+        .expect("toybox cp is cp");
+        assert_eq!(
+            writes,
+            vec![FileWrite {
+                path: "/system/b".into(),
+                change: FileChange::Content
+            }]
+        );
+        // A sed whose script and file cannot be told apart answers "cannot say", the same refusal
+        // the tier decision makes.
+        assert!(
+            file_writes(&[
+                "sed".into(),
+                "-i".into(),
+                "-e".into(),
+                "s/a/b/".into(),
+                "/system/f".into()
+            ])
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_log_written_to_a_partition_is_a_partition_write() {
+        // `-f` names a file, and a file under /system is a system write whoever opened it. The
+        // answer used to be hard-coded to the light tier for every log path, which is the same
+        // mistake `sed -i` made before it was tiered by its file.
+        assert_eq!(effect("logcat -f /system/x"), Effect::SystemWrite);
+        assert_eq!(
+            effect("logcat -f /data/data/com.foo/log"),
+            Effect::SystemWrite
+        );
+        assert_eq!(effect("logcat -d -f /data/local/tmp/x"), Effect::FileWrite);
+        assert_eq!(effect("logcat -f ./x"), Effect::Opaque);
+        // `-r` is a rotation *size*, not a path, so there is no file to tier and the older answer
+        // stands rather than being invented from the number.
+        assert_eq!(effect("logcat -r 100"), Effect::FileWrite);
     }
 
     #[test]
