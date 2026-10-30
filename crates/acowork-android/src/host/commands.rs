@@ -1230,6 +1230,32 @@ fn effect_of(head: &str, args: &[String]) -> Finding {
         return Finding::new(head, effect, format!("modifies `{}`", targets.join("`, `")));
     }
 
+    // Relabelling is a metadata write *to a file*, so it is tiered by that file rather than by
+    // the verb. `chcon … /system/bin/sh` and `chmod 777 /system/bin/sh` change inodes in the same
+    // partition; before this, one of them needed `fs:system` and the other needed only
+    // `android:shell:write`, which is a difference in spelling and not in what happens to the
+    // device. The security context argument is deliberately not read as a path — it is a label,
+    // and counting it would invent a write the command does not perform.
+    if matches!(head, "chcon" | "restorecon" | "setcontext") {
+        let paths: Vec<&str> = args
+            .iter()
+            .filter(|a| !a.starts_with('-') && looks_like_path(a))
+            .map(String::as_str)
+            .collect();
+        let Some(effect) = paths.iter().map(|p| file_effect(p)).max() else {
+            return Finding::opaque(
+                head,
+                "the file whose label it changes is not named, so the port cannot say which \
+                 partition is being written",
+            );
+        };
+        return Finding::new(
+            head,
+            effect,
+            format!("changes the SELinux label of `{}`", paths.join("`, `")),
+        );
+    }
+
     if SHELL_WRITE.contains(&head) {
         return Finding::new(head, Effect::ShellWrite, "changes device state");
     }
@@ -1387,9 +1413,6 @@ const SHELL_WRITE: &[&str] = &[
     "stop",
     "start",
     "sync",
-    "restorecon",
-    "chcon",
-    "setcontext",
     "insmod",
     "rmmod",
     "modprobe",
@@ -1412,6 +1435,7 @@ const FILE_WRITE: &[&str] = &[
     "mv",
     "cp",
     "install",
+    "unlink",
     "touch",
     "mkdir",
     "rmdir",
@@ -2046,6 +2070,43 @@ mod tests {
             effect("touch -t 202401010000 /data/local/tmp/f"),
             Effect::FileWrite
         );
+    }
+
+    #[test]
+    fn a_label_change_costs_the_tier_of_the_file_it_labels() {
+        // `chcon`/`restorecon` change an inode's security context, which is metadata *of that
+        // file* — the same class of change as `chmod`. Classifying them as generic device state
+        // let a caller holding `android:shell:write` relabel a partition file, while the
+        // identical write via `chmod` needed `fs:system`. The difference was the verb, not the
+        // effect.
+        assert_eq!(
+            effect("chcon u:object_r:system_file:s0 /system/bin/sh"),
+            Effect::SystemWrite
+        );
+        assert_eq!(effect("restorecon /data/local/tmp/f"), Effect::FileWrite);
+        assert_eq!(
+            effect("chcon -R -v u:object_r:app_data_file:s0 /data/data/com.foo"),
+            Effect::SystemWrite,
+            "recursion does not change whose file it is"
+        );
+        // A label change whose file the port cannot name is refused, not blessed as state.
+        assert_eq!(effect("chcon -R u:object_r:x:s0 ./f"), Effect::Opaque);
+        assert_eq!(effect("restorecon"), Effect::Opaque);
+        // And the label argument is not read as a path: it is a context string, and treating it
+        // as a destination would invent a second write.
+        let finding = first_finding("chcon u:object_r:system_file:s0 /system/bin/sh");
+        assert!(
+            finding.detail.contains("/system/bin/sh"),
+            "{}",
+            finding.detail
+        );
+    }
+
+    #[test]
+    fn unlink_is_a_removal_of_the_name_it_is_given() {
+        assert_eq!(effect("unlink /system/x"), Effect::SystemWrite);
+        assert_eq!(effect("unlink /data/local/tmp/x"), Effect::FileWrite);
+        assert_eq!(effect("unlink x"), Effect::Opaque, "no root in the name");
     }
 
     #[test]
