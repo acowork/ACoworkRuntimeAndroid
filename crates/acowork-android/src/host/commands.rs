@@ -65,6 +65,21 @@ pub enum Effect {
     ShellWrite,
     /// Creates or modifies a file outside the app's own directory.
     FileWrite,
+    /// Takes the contents of files that belong to another uid out of the app's containment.
+    ///
+    /// This is not a write, and it is not a free read either, which is why it is its own effect
+    /// and not one of the two it sits between. §4.4 auto-passes reads because nothing changes;
+    /// on the root tier `cat /data/data/<pkg>/databases/app.db` changes nothing on the device and
+    /// still hands somebody else's database to the caller. The ledger has to know the difference:
+    /// an undo list for a read is a phantom, and a teardown that reports "a change stays after
+    /// the session" for a command that changed nothing teaches the operator to ignore the report.
+    ///
+    /// It is authorised by `android:fs:system` because this port's vocabulary has no app-data
+    /// capability yet — that is question B2 of the upstream review. Borrowing the heaviest
+    /// filesystem tier is the conservative direction: the cost is one approval the caller may not
+    /// have needed, the alternative is a permission nobody asked for. It also means a disclosure
+    /// read takes the device write lock, since the capability that covers it is a mutating one.
+    ForeignRead,
     /// Touches a mounted partition or a block device: `mount -o remount`, writes under
     /// `/system`.
     SystemWrite,
@@ -88,6 +103,9 @@ impl Effect {
             Effect::ReadOnly => Some(Capability::ShellRead),
             Effect::ShellWrite => Some(Capability::ShellWrite),
             Effect::FileWrite => Some(Capability::FsOutsideApp),
+            // The heaviest filesystem tier the port has, for a read: see the variant. When B2
+            // gives this vocabulary an app-data capability, this arm is the one that changes.
+            Effect::ForeignRead => Some(Capability::FsSystem),
             Effect::SystemWrite => Some(Capability::FsSystem),
             Effect::SelinuxChange => Some(Capability::SelinuxPermissive),
             Effect::Opaque | Effect::Banned => None,
@@ -97,6 +115,39 @@ impl Effect {
     /// True when nothing is modified. This is the entire content of the auto-pass rule.
     pub fn is_read_only(self) -> bool {
         matches!(self, Effect::ReadOnly)
+    }
+
+    /// True when the device is different afterwards.
+    ///
+    /// Not the same question as [`is_read_only`](Effect::is_read_only), and the difference is
+    /// [`Effect::ForeignRead`]: reading another uid's files leaves the device exactly as it was
+    /// and still needs an approval. The rollback ledger asks this one — a command that changes
+    /// nothing has no inverse to plan, and filing one anyway would put a phantom in the teardown
+    /// report. The gate asks the other: what has to be claimed.
+    ///
+    /// Stated as [`state_effect`](Effect::state_effect) rather than as its own list of variants,
+    /// so the two cannot drift into disagreeing about the same command.
+    pub fn changes_state(self) -> bool {
+        self.state_effect() != Effect::ReadOnly
+    }
+
+    /// This effect with any disclosure taken out of it.
+    ///
+    /// The rollback ledger compares it against the files it managed to snapshot: when the
+    /// approval is heavier than every one of them, something changed that no file name describes,
+    /// and the session has to be told. A disclosure is not that.
+    /// `cp /data/data/com.foo/db /sdcard/db` was reporting "changes something the file names do
+    /// not describe" for a copy whose destination the ledger had just backed up, because the
+    /// heavier half of its effect was about *reading* the source.
+    ///
+    /// Projecting to [`ReadOnly`](Effect::ReadOnly) loses a write that the disclosure outranked —
+    /// and that write is exactly the one the ledger already snapshotted, which is why the
+    /// comparison it feeds is against captured files rather than against nothing.
+    pub fn state_effect(self) -> Effect {
+        match self {
+            Effect::ReadOnly | Effect::ForeignRead => Effect::ReadOnly,
+            other => other,
+        }
     }
 }
 
@@ -757,7 +808,7 @@ fn analyse(command: &Command) -> Finding {
     // /data/local/tmp/log` rewrites a partition file and drops the noise in tmp — and a tier
     // decision that reports only the redirect approves the smaller half.
     let own = effect_of(&head, command.args());
-    match redirect_effect(command) {
+    let mut finding = match redirect_effect(command) {
         Some((redirect, targets)) => {
             let detail = if own.effect == Effect::ReadOnly {
                 format!("redirects its output to {targets}")
@@ -767,7 +818,38 @@ fn analyse(command: &Command) -> Finding {
             Finding::new(head, redirect.max(own.effect), detail)
         }
         None => own,
+    };
+
+    // Reading a file that belongs to another uid is not a read this port passes unattended. The
+    // read tier is auto-approved by design (§4.4), which is only safe while "read" means
+    // something the shell is entitled to see: on a root-tier device `cat
+    // /data/data/<pkg>/databases/app.db` succeeds, and before this it cost nothing and was
+    // logged as an ordinary read. The same rule covers the exfiltration shape — `cp` decides its
+    // tier by the destination, so a copy *out* of an app's home was a light write with no word
+    // about what it read.
+    //
+    // It is its own effect and not a heavier write, because the two questions the port asks about
+    // a command are not the same question: what has to be claimed to run it, and what the ledger
+    // has to put back afterwards. This one changes the answer to the first and not the second.
+    if !matches!(finding.effect, Effect::Banned | Effect::Opaque) {
+        let reached = command
+            .args()
+            .iter()
+            .map(String::as_str)
+            .filter(|a| looks_like_path(a))
+            .find(|a| is_private_data_path(a));
+        if let Some(path) = reached {
+            finding.effect = finding.effect.max(Effect::ForeignRead);
+            finding.detail = format!(
+                "{}; reads `{path}`, which belongs to another uid — nothing on the device changes, \
+                 and this port has no app-data capability to ask for yet, so it costs the \
+                 heaviest filesystem tier it has instead of the read tier that would have passed \
+                 it unattended",
+                finding.detail
+            );
+        }
     }
+    finding
 }
 
 /// The tier all of a command's redirections cost, and the sentence naming them.
@@ -999,28 +1081,50 @@ pub fn file_write_effect(target: &str) -> Effect {
 fn effect_at(path: &str) -> Effect {
     if is_block_device(path) {
         Effect::Banned
-    } else if is_partition_path(path) || is_app_data_path(path) {
+    } else if is_partition_path(path) || is_private_data_path(path) {
         Effect::SystemWrite
     } else {
         Effect::FileWrite
     }
 }
 
-/// Paths that hold one application's private files.
+/// The homes of uids other than the caller.
+const PRIVATE_ROOTS: &[&str] = &[
+    "/data/data",
+    "/data/user",
+    "/data/user_de",
+    "/data/system",
+    "/data/misc",
+];
+
+/// Paths that belong to a uid other than the caller.
 ///
-/// `android:fs:outside-app` is named for exactly the thing these are not: writes outside app
-/// data. `/data/local/tmp` is the shell's own scratch and belongs to the light tier; a path under
-/// another uid's home does not, and treating it the same way would let a capability whose name
-/// promises containment approve reading a bank app's database into the open. There is no app-data
-/// tier in this port's vocabulary yet (that is question B2 of the upstream review), so it borrows
-/// the heavier one rather than the lighter: the cost is an approval the caller might not need,
-/// the alternative is a permission nobody asked for.
-fn is_app_data_path(path: &str) -> bool {
+/// Two questions use this, and they are the same question: writing into one changes someone
+/// else's files, and reading one takes their contents out. `/data/local/tmp` — the shell's own
+/// scratch — and the world-readable partitions are deliberately *not* in this list; the evidence
+/// surface reads `/data/anr` and `/data/tombstones` at the read tier and must keep doing so.
+///
+/// The root itself counts: `ls /data/data` names no single app, but it enumerates every app's
+/// home, which is the same disclosure asked one level up. It is matched as a whole segment, so
+/// `/data/database` is not mistaken for `/data/data`.
+fn is_private_data_path(path: &str) -> bool {
     let path = super::script::resolve_path(path);
-    const APP_DATA_ROOTS: &[&str] = &["/data/data", "/data/user", "/data/user_de"];
-    APP_DATA_ROOTS
+    PRIVATE_ROOTS
         .iter()
-        .any(|root| path.starts_with(&format!("{root}/")))
+        .any(|root| path == *root || path.starts_with(&format!("{root}/")))
+}
+
+/// True when a directory has one of those homes below it, so a pattern centred there can expand
+/// into it: `/data/*/com.foo/db` is confined to `/data`, and `/data` contains every app's home.
+/// `/data/anr/*` is confined to `/data/anr`, which contains none.
+fn contains_private_data(directory: &str) -> bool {
+    let directory = super::script::resolve_path(directory);
+    if directory == "/" {
+        return true;
+    }
+    PRIVATE_ROOTS
+        .iter()
+        .any(|root| root.starts_with(&format!("{directory}/")))
 }
 
 /// Effect of writing to a path: partition and device nodes are the heavier tiers, writing a
@@ -1090,6 +1194,39 @@ fn flag_destination(head: &str, args: &[String]) -> Option<String> {
 /// is refused as opaque.
 fn looks_like_path(operand: &str) -> bool {
     operand.starts_with('/') || operand.starts_with('.') || operand.contains('/')
+}
+
+/// True when an operand names something to read but does not say which file.
+///
+/// This is `destination`'s question asked of a read: the same three shapes — expansion (`$F`,
+/// `` ` `` , `~`), a path that is not anchored at the root, and a glob whose directory sits above
+/// another uid's home — mean the file is chosen by the device after the approval was given.
+///
+/// Only an operand that *begins* like a path is asked. `contains('/')` would be the obvious test
+/// and it is wrong: it reads `sed`'s `s/a/b/` expression, a `content://` URI and a `com.foo/bar`
+/// component name as files, and turns ordinary reads into refusals. The cost is that a relative
+/// path spelled without its `./` (`cat data/local/tmp/x`) stays a read — see the note in the
+/// read-list branch for why the port does not guess at those.
+fn unbounded_read_operand(operand: &str) -> bool {
+    if operand.starts_with('-') {
+        return false;
+    }
+    if operand.contains(['$', '`']) || operand.starts_with('~') {
+        return true;
+    }
+    let anchored = operand.starts_with('/')
+        || operand.starts_with("./")
+        || operand.starts_with("../")
+        || operand == "."
+        || operand == "..";
+    if !anchored {
+        return false;
+    }
+    match destination(operand) {
+        Destination::Known(_) => false,
+        Destination::Bounded { directory } => contains_private_data(&directory),
+        Destination::Unknown => true,
+    }
 }
 
 fn written_targets<'a>(head: &str, operands: &[&'a str]) -> Option<Vec<&'a str>> {
@@ -1319,6 +1456,32 @@ fn effect_of(head: &str, args: &[String]) -> Finding {
                     format!("saves a capture to `{target}`"),
                 );
             }
+        }
+        // A read is only free while the port can say *what* is being read. The write side has
+        // refused unbounded operands since `destination` was written; the read side is where that
+        // asymmetry mattered, because the read tier is the one §4.4 auto-passes. `cat $F` is a
+        // read of a path the device picks after the approval, and `cat ./db` is a read relative
+        // to a working directory this port never sees — either one is also how the private-data
+        // rule in `analyse` gets walked around: `F=/data/data/com.foo/db` costs nothing to set.
+        //
+        // A bare word, or a relative path spelled without its `./` (`cat data/local/tmp/x`), is
+        // deliberately not escalated. It is indistinguishable from the arguments the same
+        // commands take that are not files at all — the pattern in `grep secret /data/anr`, the
+        // count in `head -n 5 /data/local/tmp/x`, `sed`'s script expression — and guessing at
+        // those would refuse the common reads to catch the rare one. It only reaches past the
+        // read tier if the working directory is somebody's home, and the working directory comes
+        // from the request, not from the script: a caller that pins it into an app's home has
+        // already said so in its own call. A script cannot move there on its own — `cd` is not on
+        // the read list, and `cd /data/data/com.foo && cat db` is refused as an unknown command.
+        if let Some(operand) = args.iter().find(|a| unbounded_read_operand(a)) {
+            return Finding::opaque(
+                head,
+                format!(
+                    "`{head}` reads `{operand}`, which the port cannot bound: a variable, a home \
+                     directory, a path relative to an unseen working directory, or a pattern that \
+                     can expand into another uid's files"
+                ),
+            );
         }
         return Finding::new(head, Effect::ReadOnly, "on the read allow-list");
     }
@@ -1660,9 +1823,18 @@ fn is_partition_path(path: &str) -> bool {
 }
 
 /// The roots `rm` is hard-banned for, §4.6.3 item 3's `rm -rf /data`.
+///
+/// Exact roots only. `rm -fr /data/data/com.foo` is one app clearing its own home — the same
+/// thing `pm clear` does, and approvable. `rm -fr /data/data` is every app's home at once, which
+/// is the destruction the ban already covers one level up, reached by a path the ban list did not
+/// name. The same argument holds for `/data/system`, where the package list, the users and the
+/// account state live: deleting it does not need a partition, it needs the framework's own home.
 fn is_destructive_root(path: &str) -> bool {
     let path = super::script::resolve_path(path);
-    path == "/" || path == "/data" || path == "/sdcard" || path == "/storage"
+    ["/", "/data", "/sdcard", "/storage"]
+        .iter()
+        .chain(PRIVATE_ROOTS.iter())
+        .any(|root| path == *root)
 }
 
 #[cfg(test)]
@@ -1722,6 +1894,124 @@ mod tests {
                 "`{name}` is advertised as needing approval but the classifier has no rule for it"
             );
         }
+    }
+
+    #[test]
+    fn a_read_the_port_cannot_bound_is_not_a_read_it_can_pass_free() {
+        // §4.4 auto-passes reads, which is only safe while the port can say what was read. These
+        // four shapes are the ones that made the answer "whatever the device picks": an
+        // expansion, a path relative to an unseen working directory, a home reference, and a
+        // pattern centred on `/data` — the directory every app's home sits in.
+        for script in [
+            "cat $F",
+            "cat `which db`",
+            "cat ~/db",
+            "cat ./db",
+            "cat ../db",
+            "cat /data/*/com.foo/db",
+            "head -n 5 ./db",
+            "sha256sum $HOME/db",
+        ] {
+            assert_eq!(effect(script), Effect::Opaque, "{script}");
+            assert!(
+                check(script, None).is_err(),
+                "{script} must not auto-pass at the read tier"
+            );
+        }
+        // And the reads the same rule must leave alone. Each of these is a real shape from the
+        // port's own scripts and from the harness, and each names a file the port can see.
+        for script in [
+            "cat /data/local/tmp/x",
+            "cat '/data/local/tmp/my file.txt'",
+            "cat /data/anr/*",
+            "cat /proc/*/cmdline",
+            "head -n 5 /data/local/tmp/x",
+            "grep -r secret /data/anr",
+            "sed 's/a/b/' /data/local/tmp/x",
+            "ls /data/local/tmp",
+            "dumpsys window",
+            "content query --uri content://settings/system",
+        ] {
+            assert_eq!(effect(script), Effect::ReadOnly, "{script}");
+            assert!(
+                check(script, Some(Capability::ShellRead)).is_ok(),
+                "{script} must keep auto-passing without approval"
+            );
+        }
+    }
+
+    #[test]
+    fn reading_another_uids_files_is_not_free() {
+        // The write side has needed `fs:system` for an app's home since the partition table was
+        // fixed; the read side was still calling the same file a free read, which on the root
+        // tier is a copy of somebody's database into the open with no approval and one log line
+        // saying "read".
+        //
+        // It costs `fs:system` because that is the heaviest filesystem tier this vocabulary has
+        // (question B2 of the upstream review is the app-data capability that would replace it),
+        // and it is a *disclosure* rather than a write because the device is unchanged either way.
+        for script in [
+            "cat /data/data/com.foo/databases/app.db",
+            "ls /data/data",
+            "ls /data/system",
+            "head -c 100 /data/user/0/com.foo/files/x",
+            "grep -r token /data/misc",
+            "cat /data/data/com.foo/db > /data/local/tmp/out",
+            "cp /data/data/com.foo/db /sdcard/db",
+        ] {
+            assert_eq!(effect(script), Effect::ForeignRead, "{script}");
+            assert!(
+                check(script, Some(Capability::FsOutsideApp)).is_err(),
+                "{script} must not be covered by the capability whose name says outside app data"
+            );
+            assert!(
+                check(script, Some(Capability::FsSystem)).is_ok(),
+                "{script} is covered by the tier that is actually being claimed"
+            );
+        }
+        // Writing into one of those trees is still the heavier thing it always was: the tier
+        // answers what has to be put back, and a deletion answers it as a write, not a read.
+        assert_eq!(effect("rm -fr /data/data/com.foo"), Effect::SystemWrite);
+        assert_eq!(
+            effect("cp /sdcard/x /data/data/com.foo/y"),
+            Effect::SystemWrite
+        );
+        // The boundary of the rule is the uid, not the word "data": the evidence surface reads
+        // these at the read tier on every device the port has measured, and it must go on doing
+        // so or the fix costs the port its own diagnostics.
+        for script in [
+            "cat /data/anr/trace_00",
+            "ls /data/anr",
+            "ls /data/local/tmp",
+            "cat /data/local/tmp/x",
+            "cat /data/misc/../local/tmp/x",
+            "ls /data",
+        ] {
+            assert_eq!(effect(script), Effect::ReadOnly, "{script}");
+        }
+    }
+
+    #[test]
+    fn removing_a_whole_uid_home_is_banned_and_one_app_home_is_not() {
+        // `rm -rf /data` is on the §4.6.3 hard-ban list. `/data/data` is the same destruction
+        // one level down — every app's home at once — and was costing the lightest write tier.
+        for script in [
+            "rm -fr /data/data",
+            "rm -fr /data/user",
+            "rm -fr /data/user_de",
+            "rm -fr /data/system",
+            "rm -fr /data/misc",
+        ] {
+            assert!(
+                matches!(
+                    check(script, Some(Capability::FsSystem)),
+                    Err(Refusal::Banned { .. })
+                ),
+                "{script} destroys every uid's state and no approval covers it"
+            );
+        }
+        // One app clearing its own home is `pm clear` in another spelling: heavy, and approvable.
+        assert_eq!(effect("rm -fr /data/data/com.foo"), Effect::SystemWrite);
     }
 
     // ── §4.4: the read allow-list, which is what the auto-pass buys ──────────
@@ -1976,18 +2266,25 @@ mod tests {
     }
 
     #[test]
-    fn a_walk_that_stops_short_of_the_root_is_not_a_system_write() {
-        // The resolver has to resolve, not spot the word "system". `/data/local/tmp/../../system`
-        // is `/data/system` — a real directory, owned by a real app's data, and *not* the system
-        // partition. Classifying it as a system write would ask the caller to approve something
-        // the script never did.
+    fn a_walk_is_resolved_before_it_is_tiered() {
+        // The resolver has to resolve, not spot the word "system". Each of these lands somewhere
+        // different from what its spelling suggests, and the tier follows the landing.
+        assert_eq!(
+            effect("getprop > /data/local/tmp/../../local/tmp/x"),
+            Effect::FileWrite,
+            "`/data/local/tmp/../../local/tmp` is the shell's own scratch"
+        );
         assert_eq!(
             effect("getprop > /data/local/tmp/../../system/x"),
-            Effect::FileWrite
+            Effect::SystemWrite,
+            "`/data/local/tmp/../../system` is /data/system — not the system partition, but the \
+             framework uid's home, which is the heavier tier for a different reason"
         );
         assert_eq!(
             effect("rm -fr /data/local/tmp/../../data"),
-            Effect::FileWrite
+            Effect::Banned,
+            "and `rm` of what that walk reaches — /data/data, every app's home — is the ban that \
+             `rm -fr /data/data` already carries"
         );
     }
 
@@ -2285,6 +2582,13 @@ mod tests {
             "echo x > /data/local/tmp/f",
             "toybox cp /data/local/tmp/a /system/b",
             "busybox sed -i s/a/b/ /system/build.prop",
+            // The two directions through another uid's home. The first is a disclosure whose only
+            // write is the light one, the second is a write that the disclosure ladder does not
+            // outrank; both have to keep the invariant the corpus exists to pin.
+            "cp /data/data/com.foo/db /sdcard/db",
+            "cp /sdcard/x /data/data/com.foo/y",
+            "rm -fr /data/data/com.foo",
+            "cat /data/data/com.foo/db > /data/local/tmp/out",
         ];
         for script in corpus {
             let verdict = classify(script);

@@ -335,6 +335,10 @@ fn effect_word(effect: commands::Effect) -> &'static str {
         commands::Effect::ReadOnly => "readable without approval",
         commands::Effect::ShellWrite => "a write",
         commands::Effect::FileWrite => "a file write",
+        // Named for what it is, because the sentence this builds goes into a tool description:
+        // "a system write" would tell the model that claiming `fs:system` is about changing the
+        // partition, when the command that lands here changes nothing on the device at all.
+        commands::Effect::ForeignRead => "a read of another app's files",
         commands::Effect::SystemWrite => "a system write",
         commands::Effect::SelinuxChange => "an SELinux change",
     }

@@ -833,6 +833,11 @@ pub fn plan(script: &str) -> Plan {
     // rollback restoring the wrong value.
     let findings = commands::classify(script).findings;
     for (command, finding) in parsed.iter().zip(findings.iter()) {
+        // Nothing is modified and no file is written into: the read tier, which is the whole
+        // reason §4.4 can auto-pass it. A redirect makes a read a write, and the classifier
+        // already says so — `getprop > /data/local/tmp/x` is not read-only. Note what this skip
+        // does *not* cover: [`Effect::ForeignRead`] costs an approval and changes nothing, so it
+        // comes here and leaves again with an honest line in the report rather than silently.
         if finding.effect.is_read_only() {
             continue;
         }
@@ -896,20 +901,37 @@ pub fn plan(script: &str) -> Plan {
             // no model. Getting the two apart is the point: `input tap` does not "leave a change
             // behind" that the session failed to clean, and saying so would teach the operator to
             // distrust every line in the teardown.
-            let (kind, why) = irreversible(
-                command.words.first().map(String::as_str).unwrap_or(""),
-                subcommand(&command.words),
-            )
-            .unwrap_or_else(|| {
+            //
+            // A disclosure read is the same mistake in the other direction. `cat
+            // /data/data/com.foo/db` was reported as a change with no modelled inverse, which is
+            // a sentence about a device that is unchanged: nothing stays behind to clean, and the
+            // teardown would have promised an undo that had no meaning. What is unrecoverable is
+            // the copy that left, and no session-end operation can take it back.
+            let (kind, why) = if finding.effect == commands::Effect::ForeignRead {
                 (
-                    UnundoableKind::NotModelled,
+                    UnundoableKind::NotAStateChange,
                     format!(
-                        "{} — this port has no inverse modelled for it yet, so the change stays \
-                         after the session ends",
+                        "{} — nothing on the device is different, so there is no undo to run; \
+                         what cannot be taken back is the copy of it that left",
                         finding.detail
                     ),
                 )
-            });
+            } else {
+                irreversible(
+                    command.words.first().map(String::as_str).unwrap_or(""),
+                    subcommand(&command.words),
+                )
+                .unwrap_or_else(|| {
+                    (
+                        UnundoableKind::NotModelled,
+                        format!(
+                            "{} — this port has no inverse modelled for it yet, so the change \
+                             stays after the session ends",
+                            finding.detail
+                        ),
+                    )
+                })
+            };
             out.unundoable.push(Unundoable {
                 command: finding.command.clone(),
                 why,
@@ -917,7 +939,10 @@ pub fn plan(script: &str) -> Plan {
             });
         } else if own.is_none()
             && captured > 0
-            && covered.iter().max().is_none_or(|c| finding.effect > *c)
+            && covered
+                .iter()
+                .max()
+                .is_none_or(|c| finding.effect.state_effect() > *c)
         {
             out.unundoable.push(Unundoable {
                 command: finding.command.clone(),
@@ -2390,6 +2415,53 @@ mod tests {
             planned.unundoable[0].kind,
             UnundoableKind::IndeterminateTarget
         );
+    }
+
+    #[test]
+    fn a_disclosure_is_reported_as_nothing_to_restore() {
+        // `cat /data/data/com.foo/db` costs an approval and changes no state. The first version
+        // of that rule raised the tier and left the ledger to work out the rest, and it produced
+        // "this port has no inverse modelled for it yet, so the change stays after the session
+        // ends" about a command that leaves nothing behind — the same phantom `am broadcast` was
+        // corrected for, arriving by a different route.
+        let planned = plan("cat /data/data/com.foo/databases/app.db");
+        assert!(planned.captures.is_empty(), "{:?}", planned.captures);
+        assert_eq!(planned.unundoable.len(), 1, "{:?}", planned.unundoable);
+        assert_eq!(
+            planned.unundoable[0].kind,
+            UnundoableKind::NotAStateChange,
+            "a read is not a gap in the undo model"
+        );
+        assert!(
+            !planned.unundoable[0]
+                .why
+                .contains("stays after the session"),
+            "a read must not be reported as a leftover change: {:?}",
+            planned.unundoable[0]
+        );
+
+        // The copy out of an app's home is the case the two questions have to answer separately:
+        // the *destination* is a real write and gets a real snapshot, and the disclosure that
+        // raised the tier is not a second change the ledger failed to describe.
+        let planned = plan("cp /data/data/com.foo/db /sdcard/db");
+        assert_eq!(planned.captures.len(), 1, "{:?}", planned.captures);
+        assert_eq!(
+            planned.captures[0].target,
+            UndoTarget::File("/sdcard/db".to_string())
+        );
+        assert!(planned.unundoable.is_empty(), "{:?}", planned.unundoable);
+
+        // Same with a redirect, where the file the contents land in is the write.
+        let planned = plan("cat /data/data/com.foo/db > /data/local/tmp/out");
+        assert_eq!(
+            planned.captures[0].target,
+            UndoTarget::File("/data/local/tmp/out".to_string())
+        );
+        assert!(planned.unundoable.is_empty(), "{:?}", planned.unundoable);
+
+        // And a plain read is still silent, so the new line is about the disclosure and not
+        // about every `cat` in a script.
+        assert!(plan("cat /data/local/tmp/x").is_empty());
     }
 
     #[test]

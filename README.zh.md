@@ -18,7 +18,7 @@
 ---
 
 > **状态：早期开发。** 设计文档齐备，P0 切片（HostProfile 探测、脚本装配、进程生成、
-> `ExecutionBackend` 实现、§4.4 只读档护栏、§4.5 动态工具描述、§4.6.1 审计日志出口、§4.6 item 6 证据面实测、§4.6.4 写操作可撤销）已交付为可构建、可测试的 Rust 库，550 个测试通过，
+> `ExecutionBackend` 实现、§4.4 只读档护栏、§4.5 动态工具描述、§4.6.1 审计日志出口、§4.6 item 6 证据面实测、§4.6.4 写操作可撤销）已交付为可构建、可测试的 Rust 库，554 个测试通过，
 > 且整条链路已在真机上跑通过（华为 BLA-AL00，经 adb：20 条只读探测 → `HostProfile` → 真实命令，
 > ~120ms / exit 0，其中 `logcat` 之所以能跑，是因为探测项 6c 去抽查了它）。
 > **仍无 node 二进制产物**——目前唯一可运行的东西就是那个真机 harness——不适合用于生产环境。
@@ -199,7 +199,7 @@ graph TD
 | 6 | 电池 / Doze 调优与长跑稳定性测试 | ⬜ 计划中 |
 | 7 | 发布产物（Termux 包 + 签名 APK） | ⬜ 计划中（依赖 #2/#4；NDK 管线可复用上游 `apps/acowork-mobile`） |
 | 5c | §7.1 上报边界的**三个出口**：能力摘要 / 后端错误文案 / 命令自己的 stdout·stderr | ✅ **已交付** —— 第三个出口是量出来的而不是想出来的：`logcat -d` 的 181 条 avc 审计记录原本原样过线，而守门测试对 `Vec<u8>` 的 JSON 序列化做子串断言，**任何内容都能通过**。现在审计记录在投影处重写成「权限集 + 对象类 + 目标类型」，user / role / MLS 区间与路径留在设备上；`ps -Z` 这类非记录行逐字节不动 |
-| 8 | `root-shell` 宿主档，**仅只读能力**（`logcat` / `dumpsys` / `getprop`） | 🚧 **大部分交付** —— 只读档现在按**脚本内容**放行而非按调用方标签（[`host/commands.rs`](crates/acowork-android/src/host/commands.rs)），且覆盖的命令是被探测出来的而非假定的（探测项 6c）；已在 BLA-AL00 上端到端验证。剩余：`RootShellBackend` 在一台真有 `su` 的设备上跑一次——它至今没碰过真实的 su |
+| 8 | `root-shell` 宿主档，**仅只读能力**（`logcat` / `dumpsys` / `getprop`） | 🚧 **大部分交付** —— 只读档现在按**脚本内容**放行而非按调用方标签（[`host/commands.rs`](crates/acowork-android/src/host/commands.rs)），覆盖的命令是被探测出来的而非假定的（探测项 6c），且这一档说到做到：路径说不清的读（`$F`、相对名、以 `/data` 为中心的通配）与读别人 uid 的文件都不在这一档里。已在 BLA-AL00 上端到端验证。剩余：`RootShellBackend` 在一台真有 `su` 的设备上跑一次——它至今没碰过真实的 su |
 | 9 | Android 调试工具集（截屏、ANR / tombstone / bugreport 采集）+ 命令审计日志 | 🚧 **交付一半** —— 审计日志已交付（[`host/audit.rs`](crates/acowork-android/src/host/audit.rs)）：`AuditedBackend` 在碰设备**之前**落一条 `attempted`、出结果后落收尾记录；开口记录写不进去就**不执行命令**。证据面已实测（探测项 13 / 13b）：无 root 时 ADR §4.6 item 6 那六个源**没有一个能取到 `/data/anr` 的内容**，`dumpsys` 那边是 246 个服务各自一项。**采集动作现已交付**（[`host/evidence.rs`](crates/acowork-android/src/host/evidence.rs)）：`screencap -p`、`logcat -d`、`dumpsys <service>`、`bugreportz` 都能作为文件落进 Agent 工作区，并用**设备在传输前自己算出的 digest** 验收——BLA-AL00 实测 1 377 361 字节的 PNG 走 6 次读、4 101 144 字节的 bugreport zip 走 16 次读。仍未做的是**关联分析**那一半（把产物交给分析步骤）；`/data/anr` 与 `/data/tombstones` 依旧读不到，那是设备说的，不是端口没写到 |
 | 10 | 写能力档：审批门控、设备级写锁、prop / 文件自动回滚 | ⛔ **阻塞（B1）** —— ADR §7.4 的 owner 合取项与上游 ADR-087 D1/D5 冲突；门控骨架已按「两权威分解」实现，待上游确认。**回滚已不在阻塞项里**：§4.6.4 已落地为 [`host/rollback.rs`](crates/acowork-android/src/host/rollback.rs)（捕获前态 → 逆操作 → LIFO 恢复），装饰器顺序收在 [`host/chain.rs`](crates/acowork-android/src/host/chain.rs) 里——回滚在审计**外层**，捕获与恢复因此都是日志里看得见的命令；**两类写都有**——属性逆操作与文件快照：字节以 base64 离机、存进 Agent 自己的工作区、按 48 KiB 分片回写，且必须与设备在写之前自报的 digest 一致（真机验证：61440 字节随机文件被 9 字节覆盖后两片回写，逐字节还原）。写档剩下的阻塞是审批归属与设备级写锁，不是「没有撤销路径」 |
 | 11 | Magisk 模块形态，用于长期挂机的调试设备农场 —— **仅当该需求真实成立** | ⬜ 暂缓 |
@@ -219,7 +219,7 @@ graph TD
 
 ```bash
 cargo build                                        # 构建
-cargo test                                         # 550 个测试（Android 单元 366 + 契约层 86 + 契约集成 27 + 规则一致性 43 + 真进程 13 + 真机地面实况 15）
+cargo test                                         # 554 个测试（Android 单元 370 + 契约层 86 + 契约集成 27 + 规则一致性 43 + 真进程 13 + 真机地面实况 15）
 cargo clippy --all-targets -- -D warnings          # 上游 CI 约定，须零告警
 cargo fmt --check
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps      # 文档链接必须都能解析

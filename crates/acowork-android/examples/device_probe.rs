@@ -1239,8 +1239,14 @@ async fn report_file_snapshot(
 /// rules, so what has to be checked here is the rules themselves — a classifier that describes a
 /// shell which is not this one is wrong in whichever direction it is wrong.
 ///
+/// A fourth question joined them when the read side got the same treatment as the write side:
+/// which of another uid's homes this tier can actually open. That one is not about the rule's
+/// shape but about what the rule is worth on this device, so it is printed rather than asserted.
+///
 /// Everything written sits under `/data/local/tmp`, the one area §11 proved this uid can write,
-/// and is removed again. Nothing here changes a capability or a tier.
+/// and is removed again. Nothing here changes a capability or a tier, and nothing here reads a
+/// file that belongs to an application: the listings are of the directory names, at the uid the
+/// harness runs as.
 async fn report_shell_semantics(
     profile: &HostProfile,
     transport: &AdbTransport,
@@ -1331,6 +1337,40 @@ async fn report_shell_semantics(
         "  `printf R > acowork-rel.txt` → {rel_outcome}; the read tier sits at {cwd}, where the \
          file is {landed} — a name with no root in it is a different file per working directory"
     );
+
+    // 5. Whose files this uid can open. The classifier now costs an approval for reading another
+    //    uid's home, and the honest question about that rule is whether it protects something on
+    //    *this* device or only on a rooted one: a `user` build's shell uid is expected to be
+    //    refused by SELinux at every one of those paths, in which case the tier is buying the
+    //    root tier's safety and costing this tier nothing but a claim. `/data/anr` and
+    //    `/data/local/tmp` are the controls — the rule deliberately leaves both at the read tier,
+    //    and if either shows up readable here and refused by the gate, the boundary is drawn wrong.
+    println!("  ── whose files this uid can open ──");
+    for path in [
+        "/data/data",
+        "/data/user",
+        "/data/user_de",
+        "/data/system",
+        "/data/misc",
+        "/data/anr",
+        "/data/local/tmp",
+    ] {
+        let listed = observe(&observer, format!("ls {path} 2>/dev/null | head -3")).await;
+        let denied = observe(&observer, format!("ls {path} 2>&1 >/dev/null | head -1")).await;
+        let verdict = if listed.trim().is_empty() {
+            "no listing".to_string()
+        } else {
+            format!("reads: {}", listed.replace('\n', " / "))
+        };
+        println!(
+            "  {path:<18} {verdict}{}",
+            if denied.trim().is_empty() {
+                String::new()
+            } else {
+                format!("  [stderr: {}]", denied.replace('\n', " "))
+            }
+        );
+    }
 
     // Teardown: the ledger's own undo list is not what cleans these up (the harness wrote them,
     // so an honest restore would *recreate* the pre-state), so remove the area explicitly and
