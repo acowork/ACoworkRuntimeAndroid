@@ -1047,8 +1047,15 @@ impl Capture {
                     // package that is not installed prints nothing and exits 1, and an
                     // unenveloped read would be treated as "pre-state not observed" — which
                     // means no undo, for the one case where an undo exists.
+                    //
+                    // The exit status is tested directly rather than piped through `grep -q .`,
+                    // which is what this used to do: the port's own read probe was refused by the
+                    // port's own gate, because `.` is a relative path to the destination rules and
+                    // a relative path is something the classifier cannot bound (measured on the
+                    // BLA-AL00 — the generated probe never reached the device). Testing the status
+                    // needs one fewer process and says the same thing.
                     read: format!(
-                        "pm path {} 2>/dev/null | grep -q . && printf 'PRESENT\\n' || printf \
+                        "pm path {} >/dev/null 2>&1 && printf 'PRESENT\\n' || printf \
                          'ABSENT\\n'",
                         quote_posix(name)
                     ),
