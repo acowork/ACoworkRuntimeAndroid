@@ -58,6 +58,7 @@ pub mod backends;
 pub mod capability;
 pub mod chain;
 pub mod commands;
+pub mod config;
 pub mod denial;
 pub mod evidence;
 pub mod facts;
@@ -86,10 +87,14 @@ pub use backends::{AppSandboxBackend, RootShellBackend, ShellBackend};
 pub use capability::{
     Capability, PLATFORM, android_vocabulary, derive_claims, explain_absence, lookup,
 };
-pub use chain::{root_shell, shell, shell_with_runner, wrap};
+pub use chain::{root_shell, shell, shell_with_runner, wrap, wrap_with_store};
 pub use commands::{
     Effect, FileChange, FileWrite, Finding, Refusal, RefusalKind, Verdict, check as check_script,
     classify as classify_script, file_writes,
+};
+pub use config::{
+    AUDIT_FILE_NAME, Assembly, AssemblyError, BudgetConfig, ConfigError, EvidenceConfig,
+    HostConfig, PreparedHost, StorageConfig,
 };
 pub use denial::{
     DenialLedger, SelinuxClassifier, SelinuxDenial, classify, parse_denials, redact_denials,

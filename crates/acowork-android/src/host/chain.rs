@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use crate::host::{
     AuditSink, AuditedBackend, BackendError, ExecutionBackend, HostProfile, ReversibleBackend,
-    RootShellBackend, ShellBackend, SpawnRunner,
+    RootShellBackend, ShellBackend, SnapshotStore, SpawnRunner,
 };
 
 /// Log every command and make every write undoable.
@@ -49,8 +49,23 @@ pub fn wrap(
     sink: Arc<dyn AuditSink>,
     snapshot_dir: impl Into<PathBuf>,
 ) -> Arc<ReversibleBackend> {
+    wrap_with_store(backend, sink, SnapshotStore::new(snapshot_dir))
+}
+
+/// The same chain, over a snapshot store the caller configured.
+///
+/// [`wrap`] is the default-budget case, and the default is a number the *port* chose. This is
+/// the entry behind a settings screen: an operator decided how much of the workspace a
+/// session's backups may take, and a budget that only exists on a `SnapshotStore` nobody
+/// constructs is a setting that silently does nothing. The nesting rule is identical — which is
+/// the point of putting it here rather than letting the caller re-derive it one layer at a time.
+pub fn wrap_with_store(
+    backend: Arc<dyn ExecutionBackend>,
+    sink: Arc<dyn AuditSink>,
+    store: SnapshotStore,
+) -> Arc<ReversibleBackend> {
     let audited: Arc<dyn ExecutionBackend> = Arc::new(AuditedBackend::new(backend, sink));
-    Arc::new(ReversibleBackend::new(audited, snapshot_dir))
+    Arc::new(ReversibleBackend::with_store(audited, store))
 }
 
 /// The chain over a shell backend that starts real processes.

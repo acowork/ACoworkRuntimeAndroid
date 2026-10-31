@@ -377,6 +377,25 @@ impl FileAuditSink {
         &self.path
     }
 
+    /// Bytes the audit file occupies right now.
+    ///
+    /// Read from the filesystem rather than counted in memory, for the same reason the snapshot
+    /// store sums its directory: a counter would be a second answer to "how full is the log",
+    /// and the two disagree the first time rotation drops a line. `0` when the file does not
+    /// exist yet — which is not an error, it is a session that has not attempted anything.
+    pub fn used_bytes(&self) -> u64 {
+        std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// The size cap in force.
+    ///
+    /// A getter rather than a field read because the number is a *decision* — the settings
+    /// screen shows it back to the person who set it, and a log that rotates at a cap nobody
+    /// can name is indistinguishable from one that lost records.
+    pub fn max_bytes(&self) -> u64 {
+        self.max_bytes
+    }
+
     fn fail(&self, err: AuditError) -> AuditError {
         self.failures.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut guard) = self.last_error.lock() {
