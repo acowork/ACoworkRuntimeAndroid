@@ -29,6 +29,31 @@
 //! are not symmetric: the device is a phone someone is using, and the approval round trip
 //! §4.4 puts on the write tier is cheap.
 //!
+//! # The refusals are decisions, and here is the list of them
+//!
+//! A sweep of 290 script shapes puts 86 of them at `Opaque`. That number means nothing unless
+//! the 86 are named, because a refusal nobody wrote down is indistinguishable from a command
+//! nobody thought about — which is exactly how `find` came to be refused for a whole release.
+//! Each class below is a fact about the device or about the text, with the rule that follows
+//! from it.
+//!
+//! | Refused | The fact | The rule |
+//! |---|---|---|
+//! | `sh -c`, `eval`, `xargs`, `env <cmd>`, `$(…)`, `awk -f`, `find -exec` | a second command runs that this classifier never sees | never look inside a nested interpreter |
+//! | `tar -x`, `unzip`, `find -delete`, `rm $GLOB` | the file set is chosen by the device, or is named inside an archive | refuse rather than tier: no approval can name what is written, and the snapshot store cannot restore what it never saw |
+//! | `awk` with `>`/`|`/`system()`/`getline` | the program can write files and run programs, and `>` is also its comparison operator | blacklist the letters; `awk '$1 > 5'` is refused with the redirect, and says so |
+//! | `sed`/`awk`/`grep` where the script interpolates | `'{print $1}'` and `'{print $1}'$SUF` are the same word once the quotes are off | ask the raw text whether anything expands `has_unquoted_expansion` and withdraw the program-slot exemption if it does |
+//! | `sqlite3` | SQL is a second language, and even a `SELECT` can write a `-wal`/`-journal` file next to the database | refused on purpose, not overlooked |
+//! | `cd`, `export`, `alias`, `set`, `unset` | they change what the *later* words in the same script mean: `cd /data/data/com.x; cat db` reads a file whose path never appears, `export LD_PRELOAD` changes which binary a classified head is, `alias ls='rm -rf …'` runs something other than what was approved | refused; the read tier is a promise about this text, not about the shell's state |
+//! | `ping`, `nslookup`, `getent` | no device state changes, but the script reaches the network, and this vocabulary has no capability for egress | refused until the capability exists — the upstream B2 registry question, not a classifier bug |
+//! | `ifconfig wlan0` | measured: `ioctl 8927: Permission denied` at uid 2000 | left at the write tier its name carries; the device is the one refusing, so the classifier has no read shape to exempt |
+//! | `zip`, `screenrecord`, `media`, bare `deviceidle`, `sqlite3` | absent from the one device this port has ground truth for (BLA-AL00, Android 10) | not tiered at all. A flag surface guessed from another vendor's build is how a classifier starts lying |
+//!
+//! The last row is the only one that is work rather than a decision: it needs a device that
+//! has those binaries, and then the same procedure as `find`/`tar`/`unzip`/`awk` above —
+//! read the usage text off the handset, admit the shapes that read, refuse the shapes that do
+//! not, and put the measured line in the comment.
+//!
 //! # One capability per request
 //!
 //! A script containing both a `setprop` and a file write exercises two capabilities, and
