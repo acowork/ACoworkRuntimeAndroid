@@ -381,12 +381,49 @@ impl std::error::Error for Refusal {}
 /// Never fails and never panics: a script that cannot be analysed yields a verdict whose
 /// strongest effect is [`Effect::Opaque`], which the caller turns into a refusal.
 pub fn classify(script: &str) -> Verdict {
+    // Asked of the raw text, once, because the answer is not in the words: see
+    // `has_unquoted_expansion`.
+    let expandable = has_unquoted_expansion(script);
     Verdict {
         findings: match lex(script).and_then(split) {
-            Ok(commands) => commands.iter().map(analyse).collect(),
+            Ok(commands) => commands
+                .iter()
+                .map(|command| analyse(command, expandable))
+                .collect(),
             Err(opaque) => vec![opaque],
         },
     }
+}
+
+/// Does this script hold a `$` or a backtick that the shell would expand — one that is not
+/// inside single quotes?
+///
+/// The classifier reads words *after* the lexer has taken their quotes off, so `'{print $1}'` and
+/// `'{print $1}'$SUF` are the same word: both contain a `$`. They are not the same fact. In the
+/// first the `$` is awk's field marker and nothing expands; in the second the shell substitutes
+/// `$SUF` into the program before awk ever sees it, so the program the device runs is not the one
+/// anybody read. That is why the read tier may treat a `$` inside a sed script or an awk program
+/// as syntax rather than as a path with a hole in it only when this says nothing expands: the
+/// exemption is bought with a fact the token itself cannot give.
+///
+/// A `$` inside double quotes counts as expanding, because it does. `\$` does not, because the
+/// backslash is what it says it is.
+fn has_unquoted_expansion(script: &str) -> bool {
+    let mut single_quoted = false;
+    let mut escaped = false;
+    for c in script.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if !single_quoted => escaped = true,
+            '\'' => single_quoted = !single_quoted,
+            '$' | '`' if !single_quoted => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// The script's commands as the argument vectors the shell would pass them.
@@ -813,7 +850,7 @@ fn is_assignment(word: &str) -> bool {
 
 // ── Classification ───────────────────────────────────────────────────────────
 
-fn analyse(command: &Command) -> Finding {
+fn analyse(command: &Command, expandable: bool) -> Finding {
     let Some(raw_head) = command.head() else {
         // Nothing but assignments, or a bare redirection.
         return match redirect_effect(command) {
@@ -848,7 +885,7 @@ fn analyse(command: &Command) -> Finding {
                     words: command.args().to_vec(),
                     outputs: command.outputs.clone(),
                 };
-                let finding = analyse(&inner_command);
+                let finding = analyse(&inner_command, expandable);
                 Finding::new(
                     format!("{head} {inner}"),
                     finding.effect,
@@ -865,7 +902,7 @@ fn analyse(command: &Command) -> Finding {
     // script can write twice from one command — `sed -i 's/a/b/' /system/build.prop >
     // /data/local/tmp/log` rewrites a partition file and drops the noise in tmp — and a tier
     // decision that reports only the redirect approves the smaller half.
-    let own = effect_of(&head, command.args());
+    let own = effect_of(&head, command.args(), expandable);
     let mut finding = match redirect_effect(command) {
         Some((redirect, targets)) => {
             let detail = if own.effect == Effect::ReadOnly {
@@ -1191,6 +1228,18 @@ pub fn file_writes(words: &[String]) -> Option<Vec<FileWrite>> {
             .first()
             .map(|o| vec![(o.to_string(), FileChange::Content)])
             .unwrap_or_default(),
+        // `tar -c -f ARCHIVE` — the archive is the file it writes, read through the same helper
+        // the tier decision uses so the two cannot drift apart. Listing and extracting report
+        // nothing: `-t` writes no file, and `-x` is refused by the classifier before the ledger
+        // is ever asked, because the names it writes live inside the archive. Reporting the
+        // archive as a *destination* for `tar -tf /data/data/x/a.tar` would also have removed it
+        // from the disclosure scan below, which reads the operand list for exactly that path.
+        "tar" => match tar_operation(&args).0 {
+            TarOperation::Create => tar_archive(&args)
+                .map(|path| vec![(path, FileChange::Content)])
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        },
         "sort" => flag_value(&args, &["-o", "--output"])
             .map(|path| vec![(path, FileChange::Content)])
             .unwrap_or_default(),
@@ -1530,11 +1579,67 @@ fn script_names_a_file(program: &str) -> bool {
 /// component name as files, and turns ordinary reads into refusals. The cost is that a relative
 /// path spelled without its `./` (`cat data/local/tmp/x`) stays a read — see the note in the
 /// read-list branch for why the port does not guess at those.
+/// The operand that carries a *program* or a *pattern* rather than a file: sed's and awk's
+/// script, grep's pattern. This is the slot the "path the device picks" rule has been refusing
+/// ever since it was written, and it is not a path — `sed '$d'` is the commonest one-liner in
+/// sed, `grep '$'` prints the non-empty lines, and each begins with the very character that
+/// means "unbounded" for a file.
+///
+/// `None` — no exemption — as soon as a flag makes an operand a file after all: `-f FILE` reads
+/// the program or the pattern list out of a file, and `-e` interleaves expressions with file
+/// names, which is why `sed -i` with `-e` is refused rather than guessed at.
+///
+/// The caller withdraws this exemption for a script that expands anything: see
+/// `has_unquoted_expansion`.
+fn program_slot(head: &str, args: &[String]) -> Option<usize> {
+    if !matches!(head, "sed" | "awk" | "grep" | "egrep" | "fgrep") {
+        return None;
+    }
+    if args.iter().any(|a| {
+        matches!(a.as_str(), "-f" | "--file" | "-e" | "-regexp" | "--regexp")
+            || (a.starts_with("-f") || a.starts_with("-e")) && a.len() > 2 && !a.starts_with("--")
+    }) {
+        return None;
+    }
+    args.iter().position(|a| !a.starts_with('-'))
+}
+
+/// The first operand that is not a flag and not the value of a flag that takes one.
+fn first_operand(args: &[String]) -> Option<String> {
+    let mut skip_value = false;
+    for arg in args {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if arg == "-v" || arg == "--assign" {
+            skip_value = true;
+            continue;
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        return Some(arg.clone());
+    }
+    None
+}
+
 fn unbounded_read_operand(operand: &str) -> bool {
     if operand.starts_with('-') {
         return false;
     }
-    if operand.contains(['$', '`']) || operand.starts_with('~') {
+    // A token that *is* a substitution — `$F`, `` `id` ``, `~root/.ssh/id_rsa` — names a path
+    // nobody can read off the text, and that is the fact this rule exists for. A `$` in the
+    // *middle* of a word is a different fact: it is awk's field syntax in `{print $1}`, sed's
+    // end-of-line anchor in `s/foo$//`, and grep's pattern `'$'`, and all three take their most
+    // important operand as a program or a pattern rather than as a file. Treating every `$` as a
+    // path hole refused the commonest use of each of them.
+    //
+    // What is left of the risk is covered twice over: a path that merely *contains* a hole is
+    // still caught below, because `destination` cannot bound `/data/$F/x` and returns Unknown;
+    // and an awk or sed program that writes or execs is caught by its own branch, which reads
+    // the program text rather than guessing at the operand's type.
+    if operand.starts_with(['$', '`', '~']) {
         return true;
     }
     let anchored = operand.starts_with('/')
@@ -1577,7 +1682,175 @@ fn normalise(word: &str) -> String {
         .to_string()
 }
 
-fn effect_of(head: &str, args: &[String]) -> Finding {
+/// The five actions this device's `find` accepts that are not a search. Read off its own usage
+/// text, measured on the BLA-AL00: `Actions: -print -print0 -exec -execdir -ok -okdir -delete`.
+/// Every other option it takes is a match filter or a print, and `find` has no `-fprint`/`-fls`
+/// the GNU one has, so this list is complete for the binary that was asked.
+const FIND_ACTIONS_THAT_WRITE: &[&str] = &["-delete", "-exec", "-execdir", "-ok", "-okdir"];
+
+/// The letters this device's `tar` accepts in an option cluster, measured from
+/// `tar -[cxtjzhmvO] [-X FILE] [-T FILE] [-f TARFILE] [-C DIR]`.
+const TAR_CLUSTER_LETTERS: &str = "cxtjzhmvOfFXCT";
+
+/// Which of `tar`'s three operations a call asks for.
+enum TarOperation {
+    /// `t` — print the archive's index. Reads the archive, writes nothing.
+    List,
+    /// `c` — build an archive: writes the one file `-f` names, or stdout when there is none.
+    Create,
+    /// `x` — unpack: writes as many files as the archive holds, under names stored inside it.
+    Extract,
+    /// The arguments do not spell an operation this port recognises. Refused rather than
+    /// defaulted: a command that sits on the read list would otherwise inherit "read" for an
+    /// option nobody modelled, which is a hole with a name on it.
+    Unclear,
+}
+
+/// The operation and whether `-O`/`--to-stdout` redirects whatever it does to the caller.
+///
+/// The cluster is read with or without its leading dash because this device accepts both —
+/// `tar -tf a.tar` and `tar tvf a.tar` listed the same archive when asked.
+fn tar_operation(args: &[String]) -> (TarOperation, bool) {
+    let mut ops: Vec<char> = Vec::new();
+    let mut to_stdout = false;
+    for (index, arg) in args.iter().enumerate() {
+        let letters = if let Some(long) = arg.strip_prefix("--") {
+            match long.split('=').next().unwrap_or("") {
+                "list" => "t".to_string(),
+                "extract" | "get" => "x".to_string(),
+                "create" => "c".to_string(),
+                "to-stdout" => {
+                    to_stdout = true;
+                    String::new()
+                }
+                _ => return (TarOperation::Unclear, to_stdout),
+            }
+        } else if let Some(rest) = arg.strip_prefix('-') {
+            rest.to_string()
+        } else if index == 0
+            && !arg.is_empty()
+            && arg.chars().all(|c| TAR_CLUSTER_LETTERS.contains(c))
+        {
+            // Only the first argument can be a dashless cluster. After that a bare word is a
+            // file name, and `tar cvf a.tar txt` must not read `txt` as three options.
+            arg.clone()
+        } else {
+            continue;
+        };
+        for letter in letters.chars() {
+            if letter == 'f' {
+                // The rest of the cluster is the archive's name, not more options. Measured on
+                // the BLA-AL00: `tar -czf/data/local/tmp/a.tar td` creates that file, and a
+                // classifier that read the whole tail as option letters would call the call
+                // unrecognisable and refuse a write it can name exactly.
+                break;
+            }
+            if matches!(letter, 'c' | 'x' | 't') {
+                ops.push(letter);
+            } else if letter == 'O' {
+                to_stdout = true;
+            } else if !TAR_CLUSTER_LETTERS.contains(letter) {
+                return (TarOperation::Unclear, to_stdout);
+            }
+        }
+    }
+    let mut ops = ops.into_iter();
+    let Some(first) = ops.next() else {
+        return (TarOperation::Unclear, to_stdout);
+    };
+    // Two different operations in one call is not a shape with one answer, and picking the
+    // lighter of the two is the mistake this module keeps making.
+    if ops.any(|other| other != first) {
+        return (TarOperation::Unclear, to_stdout);
+    }
+    let op = match first {
+        't' => TarOperation::List,
+        'c' => TarOperation::Create,
+        _ => TarOperation::Extract,
+    };
+    (op, to_stdout)
+}
+
+/// The archive `tar` was told to write or read, from `-f` — which arrives as its own word
+/// (`-f a.tar`), at the end of a cluster with the name next (`-czf a.tar`), or glued inside it
+/// (`-czfa.tar`). `-` is stdin/stdout and is not a file this port can name or snapshot.
+fn tar_archive(args: &[String]) -> Option<String> {
+    for (index, arg) in args.iter().enumerate() {
+        if let Some(value) = arg.strip_prefix("--file=") {
+            if !value.is_empty() && value != "-" {
+                return Some(value.to_string());
+            }
+            continue;
+        }
+        let glued = arg.starts_with('-') || index == 0;
+        let cluster = arg.strip_prefix('-').unwrap_or(arg);
+        if !glued || cluster.is_empty() {
+            continue;
+        }
+        // Only the option letters *before* the `f` are recognised as options; everything after it
+        // is the name. A bare word further along is a file being added to the archive, and
+        // reading it as `-f` would name the wrong destination.
+        let Some((prefix, tail)) = cluster.split_once('f') else {
+            continue;
+        };
+        if !prefix.chars().all(|c| TAR_CLUSTER_LETTERS.contains(c)) {
+            continue;
+        }
+        if !tail.is_empty() {
+            return (tail != "-").then(|| tail.to_string());
+        }
+        let next = args.get(index + 1)?;
+        if next != "-" {
+            return Some(next.clone());
+        }
+    }
+    None
+}
+
+/// What an awk program does besides filter text, as far as a reader that does not parse awk can
+/// tell. Measured on the device's awk: `print "x" > "f"` and `print $1 > "f"` both created a
+/// file, `BEGIN{system("touch f")}` created one, and `BEGIN{"echo hi" | getline x}` ran a program.
+///
+/// `>` is also awk's comparison operator, so `awk '$1 > 5'` is refused with the rest of them.
+/// The port cannot tell a redirect from a comparison without a second parser, and the two shapes
+/// this module has already refused for that reason — `sed`'s `w` command, every `NESTED`
+/// interpreter — cost the caller a narrower question than a wrong approval costs anybody.
+fn awk_effect(program: &str) -> Option<&'static str> {
+    const CONSTRUCTS: &[(&str, &str)] = &[
+        (
+            ">",
+            "a `>`, which is either a redirect to a file or a comparison — this port does not \
+             parse awk programs to tell them apart, and a file written from inside the program \
+             is one no approval named",
+        ),
+        (
+            "|",
+            "a `|`, which in awk is a pipe to a command (awk has no bitwise-or for the same \
+             letters to be confused with)",
+        ),
+        (
+            "system(",
+            "a `system()` call, which runs whatever string the program holds",
+        ),
+        (
+            "getline",
+            "a `getline`, which reads from a file or a pipe the operand list never mentions",
+        ),
+    ];
+    CONSTRUCTS
+        .iter()
+        .find(|(needle, _)| program.contains(needle))
+        .map(|(_, why)| *why)
+}
+
+/// The inline program text of an `awk` call: the first operand that is not a flag and not the
+/// value of a `-v` assignment. `-f FILE` is handled by the caller — that program is in a file
+/// this classifier does not open.
+fn awk_program(args: &[String]) -> Option<String> {
+    first_operand(args)
+}
+
+fn effect_of(head: &str, args: &[String], expandable: bool) -> Finding {
     let flag = |f: &str| args.iter().any(|a| a.starts_with('-') && a.contains(f));
 
     // Hard bans first (§4.6.3 item 3): these are refused at every tier.
@@ -1732,6 +2005,17 @@ fn effect_of(head: &str, args: &[String]) -> Finding {
             }
         }
         if head == "sed" {
+            // The same fact as awk: a script that expands cannot be read for its `w`/`r`
+            // commands, because the text that reaches sed is not the text that was looked at.
+            if expandable
+                && let Some(script) = first_operand(args)
+                && script.contains(['$', '`'])
+            {
+                return Finding::opaque(
+                    head,
+                    "the shell expands something inside the script text, so the script sed runs                      is not the one this port read",
+                );
+            }
             // sed's `w FILE` command writes matching lines to a file named *inside the script*,
             // and `r FILE` reads one in. Neither is in the operand list, so neither was ever
             // tiered: `sed '/x/w /system/y' f` sat on the read allow-list and wrote a partition.
@@ -1929,6 +2213,138 @@ fn effect_of(head: &str, args: &[String]) -> Finding {
                 ),
             );
         }
+        // `find` is the commonest way to look at a filesystem, and this port refused every use of
+        // it: the word was on no list at all, so `find /sdcard -name '*.txt'` — a search that
+        // opens nothing for write — cost the caller an approval for a tier it could not be given.
+        // What makes `find` unsafe is its actions, and the device's usage text names five; the
+        // search itself falls through to the read tier with the rest of them.
+        //
+        // `-delete` is refused rather than tiered as a file write on purpose. The files it removes
+        // are the ones the device matched while running, so no approval could have named them
+        // beforehand and the snapshot store cannot put back what it never saw — the same fact that
+        // refuses `rm $GLOB`. `-exec` and its three siblings run a program this classifier never
+        // looks inside, which is the `NESTED` rule again.
+        if head == "find"
+            && let Some(action) = args
+                .iter()
+                .find(|a| FIND_ACTIONS_THAT_WRITE.contains(&a.as_str()))
+        {
+            return Finding::opaque(
+                head,
+                format!(
+                    "`{action}` is one of the actions this device's `find` has that change the \
+                     filesystem or run a program the classifier never sees; the search is a read, \
+                     so run what it prints as its own request"
+                ),
+            );
+        }
+        if head == "tar" {
+            let (operation, to_stdout) = tar_operation(args);
+            match operation {
+                TarOperation::List => {}
+                TarOperation::Create => {
+                    // The archive is the file. Without `-f` the archive goes to stdout, which
+                    // writes nothing on the device and is bounded by the output cap like any
+                    // other read; with it, the tier is the tier of that path.
+                    if let Some(archive) = tar_archive(args) {
+                        let effect = file_effect(&archive);
+                        return Finding::new(
+                            head,
+                            effect,
+                            format!("writes an archive to `{archive}`"),
+                        );
+                    }
+                }
+                TarOperation::Extract if to_stdout => {}
+                TarOperation::Extract => {
+                    return Finding::opaque(
+                        head,
+                        "unpacking writes one file per archive member, under names stored \
+                         inside the archive — the approval cannot list them beforehand and the \
+                         snapshot store cannot restore what it never saw. `tar -xO` sends them \
+                         to stdout instead, which writes nothing",
+                    );
+                }
+                TarOperation::Unclear => {
+                    return Finding::opaque(
+                        head,
+                        "its operation is not one of the three this port recognises (`t` list, \
+                         `c` create, `x` extract), and a command on the read list does not get to \
+                         be a read just because nobody modelled the flags it was given",
+                    );
+                }
+            }
+        }
+        // Measured usage on the BLA-AL00: `unzip [-d DIR] [-lnopqv] ZIP [FILE...] [-x FILE...]`.
+        // `-l` and `-v` print the index and `-p` prints one member to stdout — all three read the
+        // archive and touch nothing. Everything else, including the default and including `-n`,
+        // `-o` and `-d`, which only say *how* to extract, writes the members out under the names
+        // stored inside the archive: the `tar -x` problem, with the same answer.
+        if head == "unzip" {
+            let letters: String = args
+                .iter()
+                .filter_map(|a| a.strip_prefix('-'))
+                .filter(|a| !a.starts_with('-'))
+                .flat_map(|a| a.chars())
+                .collect();
+            if !letters.contains(['l', 'v', 'p']) {
+                return Finding::opaque(
+                    head,
+                    format!(
+                        "it extracts (`{letters}` selects no listing flag, and `-n`/`-o`/`-d` \
+                         only change how extraction writes), which puts one file per archive \
+                         member on the device under names stored inside it. `unzip -l` lists \
+                         without writing"
+                    ),
+                );
+            }
+        }
+        // `awk` is on the read list for the same reason `sed` is: most of the time it is a filter
+        // over text. Unlike `sed`, its program can also open files and run programs, and the
+        // letters involved are the ones its comparison operators use, so the check is a blacklist
+        // that errs by refusing — see `awk_effect` for what was measured and what is over-refused.
+        if head == "awk" {
+            if args
+                .iter()
+                .any(|a| a == "-f" || a == "--file" || a.starts_with("-f"))
+            {
+                return Finding::opaque(
+                    head,
+                    "its program is in a file this classifier does not open, so what it writes \
+                     is whatever that file says",
+                );
+            }
+            if let Some(program) = awk_program(args) {
+                // The construct blacklist reads the program text. That is only the text awk will
+                // receive if nothing in it expands first, so a script that both interpolates and
+                // puts a `$` in the program is refused rather than guessed at.
+                if expandable && program.contains(['$', '`']) {
+                    return Finding::opaque(
+                        head,
+                        "the shell expands something inside the program text, so the program                          awk runs is not the one this port read",
+                    );
+                }
+                if let Some(why) = awk_effect(&program) {
+                    return Finding::opaque(head, format!("its program carries {why}"));
+                }
+            }
+        }
+        if head == "top" {
+            // `top` is `ps` refreshed forever: the ADR already auto-passes `ps`, so the process
+            // table is not the objection. The objection is a command that never returns — the
+            // read tier that passed it would sit on the command timeout for the whole budget.
+            let one_cycle = args
+                .iter()
+                .any(|a| a == "-b" || a.starts_with("-n") || a == "--batch");
+            if !one_cycle {
+                return Finding::opaque(
+                    head,
+                    "it refreshes forever unless `-b` or `-n` asks for a fixed number of cycles, \
+                     and a read that never returns spends the whole command timeout on nothing; \
+                     run `top -n 1`",
+                );
+            }
+        }
         // A read is only free while the port can say *what* is being read. The write side has
         // refused unbounded operands since `destination` was written; the read side is where that
         // asymmetry mattered, because the read tier is the one §4.4 auto-passes. `cat $F` is a
@@ -1945,7 +2361,18 @@ fn effect_of(head: &str, args: &[String]) -> Finding {
         // from the request, not from the script: a caller that pins it into an app's home has
         // already said so in its own call. A script cannot move there on its own — `cd` is not on
         // the read list, and `cd /data/data/com.foo && cat db` is refused as an unknown command.
-        if let Some(operand) = args.iter().find(|a| unbounded_read_operand(a)) {
+        let slot = if expandable {
+            None
+        } else {
+            program_slot(head, args)
+        };
+        if let Some(operand) = args
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| Some(*index) != slot)
+            .map(|(_, arg)| arg)
+            .find(|a| unbounded_read_operand(a))
+        {
             return Finding::opaque(
                 head,
                 format!(
@@ -2278,6 +2705,17 @@ const READ_ONLY: &[&str] = &[
     "test",
     "[",
     "[[",
+    // Measured on the BLA-AL00 as present in `/system/bin`, and tiered by their arguments in
+    // `effect_of` rather than by their name alone: each of these has a shape that writes, and the
+    // shape is what is refused. They were on no list at all before, which meant a pure search or
+    // a pure listing cost the caller an approval for a tier it could not be given.
+    "find",
+    "tar",
+    "unzip",
+    "awk",
+    "top",
+    "sleep",
+    "printenv",
 ];
 
 /// Mutating through a system service — `android:shell:write`.
@@ -4062,6 +4500,267 @@ mod tests {
                 Effect::SystemWrite,
                 "`{script}` is not an outside-app write"
             );
+        }
+    }
+
+    /// The shapes this device's `find` was measured to have: five actions change something or
+    /// run a program, everything else is a search. Refusing the whole command because of the
+    /// five is what cost callers a `find` they could not ask for.
+    #[test]
+    fn find_searches_read_and_its_five_actions_do_not() {
+        for script in [
+            "find /data/local/tmp -type f",
+            "find /data/local/tmp -name a -print",
+        ] {
+            assert_eq!(effect(script), Effect::ReadOnly, "{script}");
+        }
+        // Searching the media tree is the disclosure the read tier was never entitled to, which
+        // is the answer `ls /sdcard` and `wc -l /sdcard/a.txt` already give — `find` is not a new
+        // kind of thing, it is the same read of the same files.
+        for script in [
+            "find /sdcard -name '*.txt'",
+            "find /sdcard/Download -maxdepth 1",
+            "find /sdcard -size +1M -print",
+        ] {
+            assert_eq!(effect(script), Effect::ForeignRead, "{script}");
+        }
+        for script in [
+            "find /sdcard -name x -delete",
+            "find /data/local/tmp -exec rm {} ;",
+            "find /data/local/tmp -execdir cat {} ;",
+            "find /sdcard -ok chmod 600 {} ;",
+            "find /sdcard -okdir rm {} ;",
+        ] {
+            assert_eq!(effect(script), Effect::Opaque, "{script}");
+        }
+        // The start path is a read of whatever is under it, so the disclosure rule still applies.
+        assert_eq!(
+            effect("find /data/data -name '*.db'"),
+            Effect::ForeignRead,
+            "a search of somebody else's homes is a disclosure even when it writes nothing"
+        );
+        // And the reason the refusal is not a file write: the device picks the file set while
+        // running, so no approval could have named it.
+        let why = first_finding("find /sdcard -name x -delete").detail;
+        assert!(
+            why.contains("matched") || why.contains("change the filesystem"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn tar_is_tiered_by_which_of_its_three_operations_it_was_asked_for() {
+        for script in [
+            "tar -tf /data/local/tmp/a.tar",
+            "tar tvf /data/local/tmp/a.tar",
+            "tar --list -f /data/local/tmp/a.tar",
+            "tar -tf /data/local/tmp/a.tar -C /data/local/tmp",
+        ] {
+            assert_eq!(effect(script), Effect::ReadOnly, "{script}");
+        }
+        // `-c` writes exactly one file, the one `-f` names, in all three spellings of `-f`.
+        for (script, archive) in [
+            (
+                "tar -czf /data/local/tmp/a.tar /data/local/tmp",
+                "/data/local/tmp/a.tar",
+            ),
+            ("tar czf /data/local/tmp/a.tar x", "/data/local/tmp/a.tar"),
+            ("tar -czf/data/local/tmp/a.tar x", "/data/local/tmp/a.tar"),
+        ] {
+            let finding = first_finding(script);
+            assert_eq!(finding.effect, Effect::FileWrite, "{script}");
+            assert!(
+                finding.detail.contains(archive.rsplit('/').next().unwrap()),
+                "{script} → {}",
+                finding.detail
+            );
+        }
+        // An archive named without a leading `/` is a write into a working directory this port
+        // never sees, which every write tier in this file already refuses — `tar` is not owed an
+        // exception for spelling its destination that way.
+        assert_eq!(effect("tar -cf a.tar x"), Effect::Opaque);
+        assert_eq!(
+            effect("tar -czf /system/a.tar /data/local/tmp"),
+            Effect::SystemWrite,
+            "an archive written into a partition is not an outside-app write"
+        );
+        // Unpacking writes one file per member, under names stored inside the archive.
+        for script in [
+            "tar -xf /data/local/tmp/a.tar",
+            "tar -xf /data/local/tmp/a.tar -C /data/local/tmp/out",
+            "tar xzf /data/local/tmp/a.tar",
+        ] {
+            assert_eq!(effect(script), Effect::Opaque, "{script}");
+        }
+        // `-O` sends the members to stdout, which puts nothing on the device.
+        assert_eq!(
+            effect("tar -xOf /data/local/tmp/a.tar"),
+            Effect::ReadOnly,
+            "extracting to stdout writes no file"
+        );
+        // An option nobody modelled does not inherit the read tier for sitting on the read list.
+        assert_eq!(effect("tar --checkpoint=100 -tf a.tar"), Effect::Opaque);
+    }
+
+    /// The tier decision and the ledger read `tar` through the same helper, and the rollback
+    /// planner is the third reader: an archive written under `/data/anr` has to be named in the
+    /// ledger or the session ends with an undo list that looks complete and is not.
+    #[test]
+    fn the_archive_tar_writes_is_the_file_the_ledger_names() {
+        let writes = |script: &str| {
+            words(script)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|command| file_writes(command))
+                .flatten()
+                .map(|w| (w.path, w.change))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            writes("tar -czf /data/local/tmp/back.tar.gz /data/local/tmp"),
+            vec![(
+                "/data/local/tmp/back.tar.gz".to_string(),
+                FileChange::Content
+            )]
+        );
+        assert!(
+            writes("tar -cf - /data/local/tmp").is_empty(),
+            "an archive on stdout is not a file anybody can snapshot"
+        );
+        assert!(
+            writes("tar -tf /data/local/tmp/a.tar").is_empty(),
+            "listing writes nothing"
+        );
+        // Listing somebody else's archive is still the disclosure: `-f` must not be read as a
+        // *destination* for an operation that only reads it, or the disclosure scan below
+        // excludes it and the read goes unreported.
+        assert_eq!(
+            effect("tar -tf /data/anr/a.tar"),
+            Effect::ForeignRead,
+            "the archive is a disclosure read while it is being listed"
+        );
+    }
+
+    #[test]
+    fn unzip_lists_and_refuses_to_extract_unnamed_files() {
+        // Measured usage: `unzip [-d DIR] [-lnopqv] ZIP [FILE...] [-x FILE...]`.
+        for script in [
+            "unzip -l /data/local/tmp/a.zip",
+            "unzip -v /data/local/tmp/a.zip",
+            "unzip -p /data/local/tmp/a.zip readme.txt",
+            "unzip -lq /data/local/tmp/a.zip",
+        ] {
+            assert_eq!(effect(script), Effect::ReadOnly, "{script}");
+        }
+        for script in [
+            "unzip /data/local/tmp/a.zip",
+            "unzip -q /data/local/tmp/a.zip",
+            "unzip -o /data/local/tmp/a.zip",
+            "unzip -d /data/local/tmp/out /data/local/tmp/a.zip",
+            "unzip -n /data/local/tmp/a.zip '*.txt'",
+        ] {
+            assert_eq!(effect(script), Effect::Opaque, "{script}");
+        }
+        assert_eq!(
+            effect("unzip -l /data/data/com.other/a.zip"),
+            Effect::ForeignRead
+        );
+    }
+
+    /// awk's program text is where its file and command effects live, and the letters are the
+    /// ones its operators use too. The blacklist is therefore deliberately wider than the risk:
+    /// `awk '$1 > 5'` is refused along with `awk '{print > "f"}'`, and says so.
+    #[test]
+    fn awk_filters_unless_its_program_can_open_a_file_or_run_a_program() {
+        for script in [
+            "awk '{print $1}' /data/local/tmp/a.txt",
+            "awk -F: '{print $2}' /data/local/tmp/passwd",
+            "awk '{print $1}' /data/local/tmp/a.txt | wc -l",
+            "awk '$1 ~ /error/' /data/local/tmp/log.txt",
+        ] {
+            assert_eq!(effect(script), Effect::ReadOnly, "{script}");
+        }
+        for script in [
+            "awk '{print $1 > \"/data/local/tmp/out.txt\"}' /data/local/tmp/a.txt",
+            "awk 'BEGIN{system(\"rm -rf /data/local/tmp/x\")}'",
+            "awk 'BEGIN{\"echo hi\" | getline x}'",
+            "awk 'BEGIN{while((getline l < \"/data/anr/t\")>0) print l}'",
+            "awk -f /data/local/tmp/prog.awk /data/local/tmp/a.txt",
+            "awk $PROG /data/local/tmp/a.txt",
+            // The over-refusal, and it is deliberate: `>` is awk's comparison operator too, and
+            // telling a comparison from a redirect means parsing awk.
+            "awk 'NR>0' /data/local/tmp/a.txt",
+            "awk '$1 > 5' /data/local/tmp/a.txt",
+            // The hole the program-slot exemption must not open: the shell puts text into the
+            // program that nobody read, so the program awk runs is not the one that was tiered.
+            "awk '{print $1}'$SUF /data/local/tmp/a.txt",
+        ] {
+            assert_eq!(effect(script), Effect::Opaque, "{script}");
+        }
+        // The over-refusal, named rather than hidden.
+        let why = first_finding("awk '$1 > 5' /data/local/tmp/a.txt").detail;
+        assert!(
+            why.contains("comparison"),
+            "a `>` in an awk program is refused because the port cannot tell it from a \
+             redirect, and the caller is told that: {why}"
+        );
+    }
+
+    #[test]
+    fn top_is_a_read_once_it_is_told_to_stop() {
+        for script in ["top -n 1", "top -b -n 1", "top -b", "top -n 1 -m 20"] {
+            assert_eq!(effect(script), Effect::ReadOnly, "{script}");
+        }
+        assert_eq!(
+            effect("top"),
+            Effect::Opaque,
+            "an interactive refresh loop passed by the auto-pass tier spends the whole command \
+             timeout on nothing"
+        );
+    }
+
+    #[test]
+    fn a_delay_and_the_environment_are_reads() {
+        assert_eq!(effect("sleep 2"), Effect::ReadOnly);
+        assert_eq!(effect("printenv PATH"), Effect::ReadOnly);
+    }
+
+    /// The narrowing that made `awk '{print $1}'` possible at all: a `$` in the middle of a word
+    /// is awk's field syntax, sed's anchor and grep's pattern, not a path with a hole in it.
+    /// The attack the original rule was written for — a variable standing in for a path — is
+    /// still refused, because it is a token that *starts* with the substitution.
+    #[test]
+    fn a_dollar_in_the_middle_of_a_word_is_not_a_path_hole() {
+        for script in [
+            "sed 's/foo$//' /data/local/tmp/a.txt",
+            "sed '$d' /data/local/tmp/a.txt",
+            "grep '$' /data/local/tmp/a.txt",
+            "grep '^[a-z]*$' /data/local/tmp/a.txt",
+            "awk '{print $1}' /data/local/tmp/a.txt",
+            "cut -d: -f1 /data/local/tmp/passwd",
+        ] {
+            assert_eq!(effect(script), Effect::ReadOnly, "{script}");
+        }
+        // The exemption is withdrawn where a flag makes an operand a file after all (`grep -f
+        // LIST` reads LIST), and where the script interpolates: a `$` the shell fills in is not
+        // sed's anchor any more, it is whatever the device put there.
+        for script in [
+            "grep -f $LIST /data/local/tmp/a.txt",
+            "sed -e $SCRIPT /data/local/tmp/a.txt",
+            "sed \"s/$V/x/\" /data/local/tmp/a.txt",
+            "awk \"{print $V}\" /data/local/tmp/a.txt",
+        ] {
+            assert_eq!(effect(script), Effect::Opaque, "{script}");
+        }
+        for script in [
+            "cat $F",
+            "cat `which cat`",
+            "cat ~root/.ssh/id_rsa",
+            "cat /data/$F/x",
+            "cat ./data/$F/x",
+            "F=/data/data/com.foo/db; cat $F",
+        ] {
+            assert_eq!(effect(script), Effect::Opaque, "{script}");
         }
     }
 }

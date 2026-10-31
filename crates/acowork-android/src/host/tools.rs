@@ -153,6 +153,15 @@ fn commands_block(profile: &HostProfile) -> String {
     if !missing.is_empty() {
         line.push_str(&format!(" Not on this device: {}.", missing.join(", ")));
     }
+    // The list above is §4.4's, and it is not the whole read tier: `find`, `tar -t`, `unzip -l`,
+    // `awk` and the rest are tiered by their arguments rather than advertised by name. A caller
+    // that reads this as the exhaustive set will ask for approval it does not need — and a caller
+    // that reads a command *not* listed here as automatically refused will miss the ones that
+    // pass. Saying which it is costs one sentence.
+    line.push_str(
+        " Other commands are tiered by their arguments; a command whose effect cannot be read \
+         off the text is refused rather than guessed at.",
+    );
     line
 }
 
