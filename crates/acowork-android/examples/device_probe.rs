@@ -1297,7 +1297,15 @@ async fn report_shell_semantics(
     println!(
         "  `mv -t {dir}/dst {dir}/src/a` → {}; dst/a {in_dst}, src/a {in_src} ⇒ -t is {}",
         match &moved {
-            Ok(record) => format!("exit {:?}", record.exit_code),
+            Ok(record) => format!(
+                "exit {:?}{}",
+                record.exit_code,
+                if record.stderr.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", record.stderr.trim())
+                }
+            ),
             Err(error) => format!("refused: {error}"),
         },
         if in_dst.contains("PRESENT") && in_src.contains("ABSENT") {
@@ -1343,13 +1351,18 @@ async fn report_shell_semantics(
     );
 
     // 5. Whose files this uid can open. The classifier now costs an approval for reading another
-    //    uid's home, and the honest question about that rule is whether it protects something on
-    //    *this* device or only on a rooted one: a `user` build's shell uid is expected to be
-    //    refused by SELinux at every one of those paths, in which case the tier is buying the
-    //    root tier's safety and costing this tier nothing but a claim. `/data/anr` and
-    //    `/data/local/tmp` are the controls — the rule deliberately leaves both at the read tier,
-    //    and if either shows up readable here and refused by the gate, the boundary is drawn wrong.
-    println!("  ── whose files this uid can open ──");
+    //    uid's data, and the honest question about that rule is whether it protects something on
+    //    *this* device or only on a rooted one. It is not only the root tier: measured here,
+    //    `/data/anr` lists and `head -c 24 /data/anr/dumptrace_MdvzVC` prints another process's
+    //    stack (`crash_dump failed to dum`) — a root-owned 0666 file in a system-owned directory,
+    //    which is what moved `/data/anr` inside the rule. `/data/local/tmp` is the control the
+    //    other way: this uid's own, and it must stay readable at the read tier.
+    //
+    //    Every row is measured with `observe_raw`, outside the gate. The port's own refusal is
+    //    already pinned by the classifier tests; what this row has to establish is what the
+    //    *operating system* allows, and reporting a policy decision as a device answer would be
+    //    the same mistake in the opposite direction.
+    println!("  ── whose files this uid can open (measured outside the gate) ──");
     for path in [
         "/data/data",
         "/data/user",
@@ -1366,6 +1379,16 @@ async fn report_shell_semantics(
         "/proc/1/environ",
         "/proc/self/environ",
         "/dev/block",
+        // The paths the widened data rule added. Each row is run outside the gate — see
+        // `observe_raw` — because the question here is what the *operating system* lets uid 2000
+        // open, and the port now refuses most of these on its own. Measured on this device:
+        // `/data/anr` lists and the root-owned trace in it opens, which is the fact that moved
+        // the directory inside the rule.
+        "/data/app",
+        "/data/tombstones",
+        "/data/vendor",
+        "/sdcard",
+        "/sdcard/DCIM",
     ] {
         let probe = if path.contains("/proc/") && !path.ends_with("environ") {
             format!("ls {path} 2>/dev/null | head -3")
@@ -1374,8 +1397,8 @@ async fn report_shell_semantics(
         } else {
             format!("ls {path} 2>/dev/null | head -3")
         };
-        let listed = observe(&observer, probe).await;
-        let denied = observe(&observer, format!("ls {path} 2>&1 >/dev/null | head -1")).await;
+        let listed = observe_raw(transport, &probe).await;
+        let denied = observe_raw(transport, &format!("ls {path} 2>&1 >/dev/null | head -1")).await;
         let verdict = if listed.trim().is_empty() {
             "no listing".to_string()
         } else {
@@ -1421,16 +1444,30 @@ async fn report_shell_semantics(
             "date +%Y".to_string(),
         ),
     ] {
-        let outcome = observe(&observer, probe).await;
-        match write_record(&chain, &command, session).await {
-            Ok(record) => println!(
-                "  {label:<20} exit {:?} → {}  [{}]",
+        // The command runs *first*: the probe asks about the state the command was supposed to
+        // leave behind. This row used to take the probe before the write, so every one of them
+        // printed NO-SUCH-FILE whatever the device did — a false measurement of exactly the kind
+        // this section exists to make impossible, and the reason `sort -o` had to be established
+        // by hand on the phone instead of here.
+        //
+        // When the port refuses the shape, the fact is still measured — outside the gate, because
+        // a classifier that deliberately cannot read `sed 'w FILE'` is not evidence that the
+        // shell does not write the file.
+        let measured = match write_record(&chain, &command, session).await {
+            Ok(record) => format!(
+                "exit {:?} → {}  [{}]",
                 record.exit_code,
-                outcome,
+                observe(&observer, &probe).await,
                 record.stderr.trim()
             ),
-            Err(error) => println!("  {label:<20} refused before execution: {error}"),
-        }
+            Err(error) => format!(
+                "the port refused it ({}); run outside the gate: {} → {}",
+                error.lines().next().unwrap_or_default(),
+                observe_raw(transport, &command).await,
+                observe_raw(transport, &probe).await
+            ),
+        };
+        println!("  {label:<20} {measured}");
     }
     // The classifier's own answer for the same four shapes, printed beside the device's.
     for command in [
@@ -1740,6 +1777,36 @@ async fn observe(
     {
         Ok(r) if r.succeeded() => r.stdout.trim().to_string(),
         Ok(r) => format!("<exit {:?}: {}>", r.exit_code, r.stderr.trim()),
+        Err(e) => format!("<{e}>"),
+    }
+}
+
+/// Ask the device directly, with no gate in the way.
+///
+/// Two kinds of row need this instrument. A reachability probe — *what may uid 2000 open* — is a
+/// question about the operating system, and since the disclosure rule widened the port refuses
+/// most of those paths itself; printing that refusal as the phone's answer would turn a policy
+/// into a measurement. And a shell-semantics row whose shape the port refuses on purpose (`sed 'w
+/// FILE'`, which the classifier deliberately does not parse) can only be established by running
+/// it. Nothing here automates a device: this is the harness checking the ground the classifier
+/// claims to know, and every row that used it says so.
+async fn observe_raw(transport: &AdbTransport, script: &str) -> String {
+    let invocation = SpawnInvocation::new("/system/bin/sh", format!("{script}\n"));
+    match transport.spawn(invocation).await {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            match (stdout.is_empty(), stderr.is_empty()) {
+                (false, false) => format!("{stdout}  [{stderr}]"),
+                (false, true) => stdout,
+                (true, false) => format!("<exit {:?}: {stderr}>", out.exit_code),
+                // Nothing on either stream and a clean exit is the *absence* of a complaint,
+                // which is what a "did the device object" probe is asking for. Printing it as a
+                // result made the row that asks look like the row that answers.
+                (true, true) if out.exit_code == Some(0) => String::new(),
+                (true, true) => format!("<exit {:?}: no output>", out.exit_code),
+            }
+        }
         Err(e) => format!("<{e}>"),
     }
 }

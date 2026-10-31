@@ -894,27 +894,32 @@ fn analyse(command: &Command) -> Finding {
     // a command are not the same question: what has to be claimed to run it, and what the ledger
     // has to put back afterwards. This one changes the answer to the first and not the second.
     if !matches!(finding.effect, Effect::Banned | Effect::Opaque) {
-        let reached = command
-            .args()
-            .iter()
-            .filter_map(|a| path_in_token(a))
-            .find_map(|a| match inspectable_path(a) {
-                Some(kind) => Some((a, kind)),
-                None => {
-                    if is_private_data_path(a) {
-                        Some((a, "it belongs to another uid"))
-                    } else if is_block_device(a) {
-                        Some((
-                            a,
-                            "it is the partition itself rather than a file on it: every app's \
-                             home, every message and every photo is readable through this one \
-                             argument",
-                        ))
-                    } else {
-                        None
-                    }
-                }
-            });
+        let reached = {
+            // A path this command is already tiering as its destination is not also a disclosure
+            // read. `cp report.pdf /sdcard/report.pdf` writes into the media tree and takes
+            // nothing out of it, and calling that a disclosure would put the commonest automation
+            // shape behind the heaviest filesystem tier this vocabulary has. Sources stay in the
+            // scan — `cp /sdcard/x /data/local/tmp/y` is the copy that moves a photo where the
+            // caller can read it back.
+            let destinations: Vec<String> = command
+                .writes()
+                .into_iter()
+                .map(str::to_string)
+                .chain(
+                    file_writes(&command.words)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|write| write.path),
+                )
+                .map(|target| super::script::resolve_path(&target))
+                .collect();
+            command
+                .args()
+                .iter()
+                .filter_map(|a| path_in_token(a))
+                .filter(|a| !destinations.contains(&super::script::resolve_path(a)))
+                .find_map(|a| disclosure_read(a).map(|why| (a, why)))
+        };
         if let Some((path, what)) = reached {
             finding.effect = finding.effect.max(Effect::ForeignRead);
             finding.detail = format!(
@@ -1179,6 +1184,13 @@ pub fn file_writes(words: &[String]) -> Option<Vec<FileWrite>> {
         "logcat" => flag_value(&args, &["-f", "--file"])
             .map(|path| vec![(path, FileChange::Content)])
             .unwrap_or_default(),
+        // `screencap FILE` — the capture is the file. The tier decision already reads the first
+        // non-flag operand as the destination; the ledger has to agree with it, or a capture into
+        // the media tree looks like a read of the media tree to the disclosure rule below.
+        "screencap" => operands
+            .first()
+            .map(|o| vec![(o.to_string(), FileChange::Content)])
+            .unwrap_or_default(),
         "sort" => flag_value(&args, &["-o", "--output"])
             .map(|path| vec![(path, FileChange::Content)])
             .unwrap_or_default(),
@@ -1229,43 +1241,89 @@ fn effect_at(path: &str) -> Effect {
     }
 }
 
-/// The homes of uids other than the caller.
-const PRIVATE_ROOTS: &[&str] = &[
-    "/data/data",
-    "/data/user",
-    "/data/user_de",
-    "/data/system",
-    "/data/misc",
-];
+/// The one directory under `/data` that belongs to the calling uid.
+///
+/// Measured on the BLA-AL00 as uid 2000: `/data/local/tmp` is `drwxrwx--x shell shell` and the
+/// harness writes, lists and removes there freely (§11 and §12 of the device probe are built on
+/// it). Everything else under `/data` is somebody else's: `/data/anr` is `drwxrwxr-x system`
+/// with a root-owned trace file in it that this uid can open (measured: `head -c 24
+/// /data/anr/dumptrace_MdvzVC` prints `crash_dump failed to dum`), and `/data/system` lists even
+/// though its files are `0660`.
+const OWN_DATA: &str = "/data/local/tmp";
 
 /// Paths that belong to a uid other than the caller.
 ///
 /// Two questions use this, and they are the same question: writing into one changes someone
-/// else's files, and reading one takes their contents out. `/data/local/tmp` — the shell's own
-/// scratch — and the world-readable partitions are deliberately *not* in this list; the evidence
-/// surface reads `/data/anr` and `/data/tombstones` at the read tier and must keep doing so.
+/// else's files, and reading one takes their contents out. The rule is the data root minus the
+/// one directory the caller owns, rather than a list of homes, because the list was always going
+/// to be one directory short: `/data/anr` and `/data/tombstones` were left out on the assumption
+/// that the device refuses them, and on this device it does not — a root-owned ANR trace is
+/// readable at the tier that asks for nothing.
 ///
-/// The root itself counts: `ls /data/data` names no single app, but it enumerates every app's
-/// home, which is the same disclosure asked one level up. It is matched as a whole segment, so
-/// `/data/database` is not mistaken for `/data/data`.
+/// `/data` itself counts: `ls /data` names no single app but enumerates every app's home, which
+/// is the same disclosure one level up.
 fn is_private_data_path(path: &str) -> bool {
     let path = super::script::resolve_path(path);
-    PRIVATE_ROOTS
+    let path = path.trim_end_matches('/');
+    path == "/data"
+        || (path.starts_with("/data/")
+            && path != OWN_DATA
+            && !path.starts_with(&format!("{OWN_DATA}/")))
+}
+
+/// The device owner's own files, as distinct from another app's or the system's.
+///
+/// Measured as uid 2000 on the BLA-AL00: `/sdcard` and `/sdcard/DCIM` both list, and what they
+/// list is the camera roll and the messaging apps' media. This is the read-side rule only —
+/// creating a file under `/sdcard` is exactly what `android:fs:outside-app` was granted for, and
+/// the capability's name says so — but *taking those files out* is a disclosure, and the read
+/// tier was never asked about it. `/data/media` is the same tree under its bind-mount source, and
+/// `/storage` is where the per-user mounts live.
+const MEDIA_ROOTS: &[&str] = &["/sdcard", "/storage", "/mnt/sdcard", "/data/media"];
+
+fn is_user_media_path(path: &str) -> bool {
+    let path = super::script::resolve_path(path);
+    MEDIA_ROOTS
         .iter()
         .any(|root| path == *root || path.starts_with(&format!("{root}/")))
 }
 
+/// What a read of this path takes out of the device that the read tier was never entitled to.
+///
+/// `Some` names the exposure in the sentence the operator reads; `None` means the read tier
+/// answers for it. Four families, asked in one place because they are one question — *whose*
+/// data is this, not *has it changed* — and because a caller that has to remember three predicates
+/// is a caller that adds the fourth path to only two of them.
+fn disclosure_read(path: &str) -> Option<&'static str> {
+    if let Some(why) = inspectable_path(path) {
+        return Some(why);
+    }
+    if is_block_device(path) {
+        return Some(
+            "it is the partition itself rather than a file on it: every app's home, every \
+             message and every photo is readable through this one argument",
+        );
+    }
+    if is_private_data_path(path) {
+        return Some("it belongs to another uid");
+    }
+    if is_user_media_path(path) {
+        return Some(
+            "it is the device owner's own files — the camera roll, the downloads, the \
+             messaging apps' media",
+        );
+    }
+    None
+}
+
 /// True when a directory has one of those homes below it, so a pattern centred there can expand
 /// into it: `/data/*/com.foo/db` is confined to `/data`, and `/data` contains every app's home.
-/// `/data/anr/*` is confined to `/data/anr`, which contains none.
+/// `/data/local/tmp` and its children are the caller's own and stay confined to nothing.
 fn contains_private_data(directory: &str) -> bool {
     let directory = super::script::resolve_path(directory);
-    if directory == "/" {
-        return true;
-    }
-    PRIVATE_ROOTS
-        .iter()
-        .any(|root| root.starts_with(&format!("{directory}/")))
+    directory == "/"
+        || is_private_data_path(&directory)
+        || is_private_data_path(&format!("{directory}/anything"))
 }
 
 /// Effect of writing to a path: partition and device nodes are the heavier tiers, writing a
@@ -2005,6 +2063,9 @@ fn effect_of(head: &str, args: &[String]) -> Finding {
 
 /// `pm`/`am`/`settings`/`cmd`/`wm`/`svc`/`ime`/`content`: the subcommand decides.
 fn dispatcher(head: &str, args: &[String]) -> Finding {
+    if head == "content" {
+        return content_provider(args);
+    }
     let Some(sub) = args.iter().find(|a| !a.starts_with('-')) else {
         // No subcommand at all: `pm` prints usage. Harmless, and refusing it would punish
         // a caller for asking for help.
@@ -2030,6 +2091,88 @@ fn dispatcher(head: &str, args: &[String]) -> Finding {
         Effect::ShellWrite,
         "is a mutating subcommand — §4.4 puts these behind approval",
     )
+}
+
+/// The content authorities whose rows are the device's own configuration rather than a person's.
+///
+/// This is an exception list, not a block-list, and the direction matters: a block-list would have
+/// to name every app installed on the handset, and the one provider nobody thinks to name is the
+/// one that holds the messages. Measured on the BLA-AL00 as uid 2000 — no root, no dangerous
+/// mode — `content query --uri content://sms/` printed real message bodies and
+/// `content://contacts/people` printed real contact names, both at the tier §4.4 passes without
+/// asking. The path rules cannot see this: the sensitive thing is the URI, not an operand that
+/// starts with a separator.
+const PUBLIC_AUTHORITIES: &[&str] = &["settings", "deviceinfo"];
+
+/// `content` reads and writes another app's data through its provider.
+///
+/// Reading a personal provider is the same disclosure as `cat /data/data/<pkg>/databases/app.db`
+/// — the row contents leave the containment without anything on the device changing — and writing
+/// one is a change inside somebody else's home, which the file rules already put at the heaviest
+/// filesystem tier this vocabulary has (question B2 of the upstream review is the app-data
+/// capability that would replace both borrowings).
+fn content_provider(args: &[String]) -> Finding {
+    let Some(sub) = args.iter().find(|a| !a.starts_with('-')) else {
+        return Finding::new(
+            "content",
+            Effect::ReadOnly,
+            "run without a subcommand, prints usage",
+        );
+    };
+    let named = format!("content {sub}");
+    let reads = READ_SUBCOMMANDS
+        .iter()
+        .any(|prefix| sub.to_ascii_lowercase().starts_with(prefix));
+    let Some(authority) = uri_authority(args) else {
+        // No URI, or one this reader cannot take apart (`--uri $PROVIDER`, a variable the device
+        // resolves after the approval). Which provider is named is the whole question, so a
+        // script that does not say it cannot be passed as a read.
+        return Finding::new(
+            named,
+            Effect::Opaque,
+            "names no content URI this classifier can read, so which provider is touched is \
+             not known",
+        );
+    };
+    if PUBLIC_AUTHORITIES.iter().any(|p| authority.starts_with(p)) {
+        return Finding::new(
+            named,
+            if reads {
+                Effect::ReadOnly
+            } else {
+                Effect::ShellWrite
+            },
+            if reads {
+                "reads the device's own configuration provider"
+            } else {
+                "is a mutating subcommand — §4.4 puts these behind approval"
+            },
+        );
+    }
+    Finding::new(
+        named,
+        if reads {
+            Effect::ForeignRead
+        } else {
+            Effect::SystemWrite
+        },
+        format!(
+            "reaches the `{authority}` provider, which is not the caller's own data — the URI, \
+             not a path, is what names the person's messages, contacts or files here"
+        ),
+    )
+}
+
+/// The authority a `content` URI names: the segment after `content://`, up to the next `/`.
+fn uri_authority(args: &[String]) -> Option<String> {
+    let uri = flag_value(args, &["--uri"])?;
+    let authority = uri.strip_prefix("content://")?;
+    let authority = authority
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('/');
+    (!authority.is_empty()).then(|| authority.to_string())
 }
 
 /// §4.6.3 item 3: refused regardless of tier. This text is what the caller sees.
@@ -2243,12 +2386,23 @@ fn is_partition_path(path: &str) -> bool {
 /// is the destruction the ban already covers one level up, reached by a path the ban list did not
 /// name. The same argument holds for `/data/system`, where the package list, the users and the
 /// account state live: deleting it does not need a partition, it needs the framework's own home.
+///
+/// The framework homes are therefore every *first-level* directory under `/data` — `/data/anr`,
+/// `/data/app`, `/data/tombstones` and the rest of the set the device probe listed (measured on
+/// the BLA-AL00: all of them system- or root-owned) — except `local`, which is the shell's own
+/// area and where this port keeps its scratch.
 fn is_destructive_root(path: &str) -> bool {
     let path = super::script::resolve_path(path);
-    ["/", "/data", "/sdcard", "/storage"]
+    if ["/", "/data", "/sdcard", "/storage"]
         .iter()
-        .chain(PRIVATE_ROOTS.iter())
         .any(|root| path == *root)
+    {
+        return true;
+    }
+    let Some(first) = path.strip_prefix("/data/") else {
+        return false;
+    };
+    !first.is_empty() && !first.contains('/') && first != "local"
 }
 
 #[cfg(test)]
@@ -2338,13 +2492,14 @@ mod tests {
         // over pids reads every process's launch arguments, which is the disclosure that rule is
         // about. `/proc/*/attr/current` stays, because it is what the port's own fact probe runs
         // and it names an SELinux context rather than something anybody keeps secret.
+        // `cat /data/anr/*` and `grep -r secret /data/anr` left with the widened data rule: the
+        // directory holds another process's stack, so a glob over it is the disclosure and no
+        // longer something the read tier passes unattended.
         for script in [
             "cat /data/local/tmp/x",
             "cat '/data/local/tmp/my file.txt'",
-            "cat /data/anr/*",
             "cat /proc/*/attr/current",
             "head -n 5 /data/local/tmp/x",
-            "grep -r secret /data/anr",
             "sed 's/a/b/' /data/local/tmp/x",
             "ls /data/local/tmp",
             "dumpsys window",
@@ -2355,6 +2510,63 @@ mod tests {
                 check(script, Some(Capability::ShellRead)).is_ok(),
                 "{script} must keep auto-passing without approval"
             );
+        }
+    }
+
+    #[test]
+    fn a_content_uri_names_a_person_not_a_path() {
+        // The disclosure rules are lexical and read paths. `content` puts the sensitive thing in
+        // the URI, so none of them could see this: measured on the BLA-AL00 as uid 2000, with no
+        // root and no dangerous mode, `content query --uri content://sms/` printed real message
+        // bodies and `content://contacts/people` printed real contact names — at the tier §4.4
+        // passes without asking, and logged as a read.
+        for script in [
+            "content query --uri content://sms/",
+            "content query --uri content://sms/inbox --projection body",
+            "content query --uri=content://mms",
+            "content query --uri content://contacts/people --projection name",
+            "content query --uri content://call_log/calls",
+            "content query --uri content://com.foo.provider/secrets",
+            "content read --uri content://media/external/images/media/12",
+        ] {
+            assert!(
+                matches!(effect(script), Effect::ForeignRead | Effect::SystemWrite),
+                "{script} must not be a free read: {:?}",
+                effect(script)
+            );
+            assert!(
+                check(script, Some(Capability::ShellRead)).is_err(),
+                "{script} must not auto-pass at the read tier"
+            );
+        }
+        // Writing into another app's provider is a change inside somebody else's home, which the
+        // file rules already cost the heaviest filesystem tier this vocabulary has.
+        assert_eq!(
+            effect("content insert --uri content://sms/ --bind body:s:hi"),
+            Effect::SystemWrite
+        );
+        // The device's own configuration provider stays a read: this is the shape the port's
+        // evidence surface uses.
+        assert_eq!(
+            effect("content query --uri content://settings/system"),
+            Effect::ReadOnly
+        );
+        assert!(
+            check(
+                "content query --uri content://settings/system",
+                Some(Capability::ShellRead)
+            )
+            .is_ok(),
+            "and it must keep auto-passing"
+        );
+        // Which provider is touched is the whole question, so a URI the reader cannot take apart
+        // is not a read the port can pass.
+        for script in [
+            "content query --uri $PROVIDER",
+            "content query --uri tel://12345",
+            "content query",
+        ] {
+            assert_eq!(effect(script), Effect::Opaque, "{script}");
         }
     }
 
@@ -2394,18 +2606,56 @@ mod tests {
             effect("cp /sdcard/x /data/data/com.foo/y"),
             Effect::SystemWrite
         );
-        // The boundary of the rule is the uid, not the word "data": the evidence surface reads
-        // these at the read tier on every device the port has measured, and it must go on doing
-        // so or the fix costs the port its own diagnostics.
+        // The boundary of the rule is the uid, not the word "data": `/data/local/tmp` is this
+        // uid's own (measured: `drwxrwx--x shell shell`, and the device probe writes, lists and
+        // removes there in §11 and §12), and a `..` that walks back into it stays an ordinary path.
+        for script in [
+            "cat /data/local/tmp/x",
+            "ls /data/local/tmp",
+            "cat /data/misc/../local/tmp/x",
+            "cat /data/local/tmp/../tmp/x",
+        ] {
+            assert_eq!(effect(script), Effect::ReadOnly, "{script}");
+        }
+        // What the widened rule changed. The old list of homes left `/data/anr` and `/data` out on
+        // the assumption that the device refuses them; on this device it does not — `/data/anr`
+        // lists (measured: three names) and the root-owned trace in it opens (`head -c 24
+        // /data/anr/dumptrace_MdvzVC` printed `crash_dump failed to dum`). An ANR trace is another
+        // process's stack, with its arguments and its allocations, which is the disclosure this
+        // tier exists to name.
         for script in [
             "cat /data/anr/trace_00",
             "ls /data/anr",
-            "ls /data/local/tmp",
-            "cat /data/local/tmp/x",
-            "cat /data/misc/../local/tmp/x",
+            "cat /data/anr/dumptrace_MdvzVC",
             "ls /data",
+            "cat /data/tombstones/x.pb",
+            "ls /data/app",
+            "cat /data/vendor/wifi/wpa_supplicant.conf",
         ] {
-            assert_eq!(effect(script), Effect::ReadOnly, "{script}");
+            assert_eq!(effect(script), Effect::ForeignRead, "{script}");
+        }
+        // The device owner's own files are a different exposure from another app's, and the write
+        // side must not borrow it: saving a report where the user can open it is exactly what
+        // `android:fs:outside-app` was granted for.
+        for script in [
+            "cat /sdcard/DCIM/Camera/img.jpg",
+            "ls /sdcard",
+            "head -c 10 /storage/emulated/0/Download/x.pdf",
+        ] {
+            assert_eq!(effect(script), Effect::ForeignRead, "{script}");
+        }
+        for script in [
+            "echo x > /sdcard/report.txt",
+            "cp /data/local/tmp/a.pdf /sdcard/a.pdf",
+            "tee /sdcard/log.txt",
+            "rm -rf /sdcard/Download/x",
+            "screencap /sdcard/screen.png",
+        ] {
+            assert_eq!(effect(script), Effect::FileWrite, "{script}");
+            assert!(
+                check(script, Some(Capability::FsOutsideApp)).is_ok(),
+                "{script} is the write the outside-app tier was named for"
+            );
         }
     }
 
@@ -2941,8 +3191,15 @@ mod tests {
         // classifier that turned it into a system write would cost the caller an approval it
         // should never have been asked for.
         assert_eq!(
+            effect("logcat -d > /data/local/tmp/../tmp/log.txt"),
+            Effect::FileWrite,
+            "`..` pops a segment, and this one lands back in the shell's own area"
+        );
+        assert_eq!(
             effect("logcat -d > /data/local/tmp/../local/tmp/log.txt"),
-            Effect::FileWrite
+            Effect::SystemWrite,
+            "the same spelling one directory deeper is not the shell's area: `/data/local/local` \
+             does not exist and creating it needs the data root"
         );
         assert_eq!(effect("echo hi > /data/local/tmp/./x"), Effect::FileWrite);
         assert_eq!(effect("echo hi > /data/local/tmp/x/.."), Effect::FileWrite);
@@ -3638,7 +3895,7 @@ mod tests {
 
     #[test]
     fn findings_are_one_per_command_in_order() {
-        let verdict = classify("getprop; setprop a b; logcat -d > /data/x");
+        let verdict = classify("getprop; setprop a b; logcat -d > /data/local/tmp/x");
         let commands: Vec<&str> = verdict
             .findings
             .iter()
@@ -3786,8 +4043,25 @@ mod tests {
             Effect::FileWrite
         );
         assert_eq!(
-            classify("echo x > /data/database.txt").strongest(),
-            Effect::FileWrite
+            classify("echo x > /datapersist/f").strongest(),
+            Effect::FileWrite,
+            "a name that begins like the data root is not inside it"
         );
+        // The rest of `/data` is somebody else's, which is what the widened rule changed: a file
+        // in the framework's own home is not an outside-app write either. Measured on the
+        // BLA-AL00, `/data` is `drwxrwx--x system system` — this uid may traverse it, not create
+        // in it — so a write that lands anywhere else under it is already past the shell's area.
+        for script in [
+            "echo x > /data/anr/trace.txt",
+            "echo x > /data/tombstones/x.pb",
+            "echo x > /data/local/x",
+            "echo x > /data",
+        ] {
+            assert_eq!(
+                classify(script).strongest(),
+                Effect::SystemWrite,
+                "`{script}` is not an outside-app write"
+            );
+        }
     }
 }
