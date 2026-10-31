@@ -65,9 +65,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::host::{
     AuditSink, BackendError, Capability, DEFAULT_EVIDENCE_BUDGET, DEFAULT_MAX_FILE_BYTES,
-    DEFAULT_OUTPUT_CAP, DEFAULT_READ_TIMEOUT, EvidenceSource, ExecutionBackend, FileAuditSink,
-    HostProfile, SNAPSHOT_STORE_BUDGET_BYTES, SnapshotStore, WRITE_LOCK_TTL, chain, derive_claims,
-    evidence, lookup,
+    DEFAULT_OUTPUT_CAP, DEFAULT_READ_TIMEOUT, EvidenceArtifact, EvidenceLimits, EvidenceSource,
+    ExecutionBackend, FileAuditSink, HostProfile, SNAPSHOT_STORE_BUDGET_BYTES, SnapshotStore,
+    WRITE_LOCK_TTL, chain, derive_claims, evidence, lookup,
 };
 use acowork_platform_contract::{Budget, CapabilityClaim, HostCapability};
 
@@ -700,6 +700,14 @@ impl HostConfig {
         self.budgets.output_cap_bytes as usize
     }
 
+    /// The limits one evidence capture runs under.
+    pub fn limits(&self) -> EvidenceLimits {
+        EvidenceLimits {
+            budget: self.budgets.evidence_budget_bytes,
+            bugreport: self.bugreport_timeout(),
+        }
+    }
+
     /// The budget to hand a backend as its default.
     ///
     /// This is what makes the two rows above real rather than decorative. A backend applies it
@@ -736,6 +744,8 @@ impl HostConfig {
             snapshots,
             evidence_dir,
             default_budget: self.budget(),
+            limits: self.limits(),
+            evidence_policy: self.evidence.clone(),
         })
     }
 
@@ -851,6 +861,20 @@ impl TimingConfig {
     }
 }
 
+/// Which settings row refuses which source.
+///
+/// A refusal that does not name its own setting is a dead end: the reader knows the device
+/// declined and has nothing to change.
+fn setting_for(source: &EvidenceSource) -> String {
+    match source {
+        EvidenceSource::Screenshot => "evidence.screenshot".to_string(),
+        EvidenceSource::Logcat { .. } => "evidence.logcat".to_string(),
+        EvidenceSource::Dumpsys { .. } => "evidence.dumpsys".to_string(),
+        EvidenceSource::DeviceFile { .. } => "evidence.device_files".to_string(),
+        EvidenceSource::Bugreport => "evidence.bugreport".to_string(),
+    }
+}
+
 /// The runtime's own objects, built from a validated settings document.
 #[derive(Debug)]
 pub struct PreparedHost {
@@ -866,9 +890,51 @@ pub struct PreparedHost {
     /// chooses its own inner backend — the privileged tier, or an adb-driven harness — cannot
     /// assemble a chain that ignores the operator's timeout.
     pub default_budget: Budget,
+    /// The bytes and minutes one capture may take.
+    pub limits: EvidenceLimits,
+    /// Which sources may be collected at all.
+    pub evidence_policy: EvidenceConfig,
 }
 
 impl PreparedHost {
+    /// Capture one evidence source under this host's policy, limits and directory.
+    ///
+    /// This is the configured entry point, and the reason it exists is that the alternative is
+    /// four settings rows nobody is compelled to consult: the source is filtered by the
+    /// operator's toggles, the byte budget and the bugreport wait come from the caps they set,
+    /// and the bytes land in the directory they named. A caller that goes straight to
+    /// [`capture_evidence`](crate::host::capture_evidence) is choosing the raw mechanism — which
+    /// stays available, because a harness measuring a device is allowed to collect something the
+    /// screen has off, and should have to say so explicitly.
+    ///
+    /// A refused source is reported as
+    /// [`CaptureError::NotAllowed`](crate::host::CaptureError::NotAllowed) with the name of the
+    /// setting that refuses it, so the answer a user gets is "switch it on here", not "the device
+    /// failed".
+    pub async fn capture(
+        &self,
+        backend: &Arc<dyn ExecutionBackend>,
+        source: &EvidenceSource,
+        session: &str,
+        token: Option<&crate::host::ApprovalToken>,
+    ) -> Result<EvidenceArtifact, crate::host::CaptureError> {
+        let Some(allowed) = self.evidence_policy.apply(source) else {
+            return Err(crate::host::CaptureError::NotAllowed {
+                source: source.describe(),
+                setting: setting_for(source),
+            });
+        };
+        crate::host::capture_evidence(
+            backend,
+            &allowed,
+            session,
+            &self.evidence_dir,
+            token,
+            self.limits,
+        )
+        .await
+    }
+
     /// Put an inner backend into the chain this host was configured for.
     ///
     /// Takes the inner backend rather than building one, so a node driving a phone over adb, a
@@ -904,6 +970,7 @@ impl fmt::Debug for Assembly {
             .field("audit_cap", &self.prepared.audit.max_bytes())
             .field("evidence", &self.prepared.evidence_dir)
             .field("command_timeout", &self.prepared.default_budget.timeout)
+            .field("evidence_budget", &self.prepared.limits.budget)
             .field("output_cap", &self.prepared.default_budget.output_cap)
             .finish()
     }
@@ -1493,6 +1560,65 @@ mod tests {
         }
     }
 
+    /// A backend that answers by pattern and keeps every request it was handed.
+    struct Device {
+        profile: HostProfile,
+        answers: Vec<(&'static str, &'static str)>,
+        seen: Arc<std::sync::Mutex<Vec<ExecRequest>>>,
+    }
+
+    impl Device {
+        fn answering(
+            profile: HostProfile,
+            answers: &[(&'static str, &'static str)],
+        ) -> Arc<Device> {
+            Arc::new(Device {
+                profile,
+                answers: answers
+                    .iter()
+                    .map(|(needle, text)| (*needle, *text))
+                    .collect(),
+                seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+            })
+        }
+        fn requests(&self) -> Vec<ExecRequest> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutionBackend for Device {
+        fn name(&self) -> &'static str {
+            "fake(shell)"
+        }
+        fn dialect(&self) -> Option<ShellDialect> {
+            Some(ShellDialect::MkSh)
+        }
+        fn profile(&self) -> &HostProfile {
+            &self.profile
+        }
+        async fn exec(&self, request: ExecRequest) -> Result<ExecRecord, BackendError> {
+            let stdout = self
+                .answers
+                .iter()
+                .find(|(needle, _)| request.script.contains(needle))
+                .map(|(_, text)| (*text).to_string())
+                .unwrap_or_default();
+            self.seen.lock().unwrap().push(request);
+            Ok(ExecRecord {
+                stdout,
+                stderr: String::new(),
+                exit_code: Some(0),
+                selinux_denials: Vec::new(),
+                uid: Some(2000),
+                context: Some("u:r:shell:s0".to_string()),
+                duration_ms: 1,
+                truncated: false,
+                timed_out: false,
+            })
+        }
+    }
+
     // ── the document on disk ────────────────────────────────────────────────
 
     #[test]
@@ -1832,6 +1958,144 @@ mod tests {
         assert_eq!(prepared.default_budget.output_cap, DEFAULT_OUTPUT_CAP);
         assert_eq!(config.lock_ttl(), Duration::from_secs(90));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_source_the_screen_has_off_is_refused_before_the_device_is_asked() {
+        // The refusal has to name the setting, or the user gets "it did not work" on a device
+        // that was never touched. And *nothing* may run: a capture that declines the artifact but
+        // still stages a screenshot on the device has already done the privacy thing the switch
+        // exists to prevent.
+        let root = tempdir("capture-off");
+        let prepared = HostConfig::defaults().prepare(&root).unwrap();
+        let device = Device::answering(
+            shell_profile(),
+            &[("bugreportz", "OK:/data/local/tmp/r.zip\n")],
+        );
+        let err = prepared
+            .capture(
+                &(Arc::clone(&device) as Arc<dyn ExecutionBackend>),
+                &EvidenceSource::Bugreport,
+                "s-1",
+                None,
+            )
+            .await
+            .unwrap_err();
+        match err {
+            crate::host::CaptureError::NotAllowed { source, setting } => {
+                assert!(source.contains("bugreport"), "{source}");
+                assert_eq!(setting, "evidence.bugreport");
+            }
+            other => panic!("expected a policy refusal, got {other:?}"),
+        }
+        assert!(
+            device.requests().is_empty(),
+            "a refused source must not have reached the device"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn the_bugreport_wait_in_the_settings_is_the_wait_the_command_gets() {
+        let root = tempdir("capture-timeout");
+        let config = HostConfig {
+            evidence: EvidenceConfig {
+                bugreport: true,
+                ..EvidenceConfig::default()
+            },
+            timing: TimingConfig {
+                bugreport_timeout_secs: 600,
+                ..TimingConfig::default()
+            },
+            ..HostConfig::defaults()
+        };
+        let prepared = config.prepare(&root).unwrap();
+        // Over the budget on purpose: the assertion is about the timeout on the request that
+        // ran *before* the size was known, and the budget error is the cleanest way to stop the
+        // capture after that first command.
+        let device = Device::answering(
+            shell_profile(),
+            &[
+                ("bugreportz", "OK:/data/local/tmp/r.zip\n"),
+                ("wc -c", "999999999\n"),
+            ],
+        );
+        let err = prepared
+            .capture(
+                &(Arc::clone(&device) as Arc<dyn ExecutionBackend>),
+                &EvidenceSource::Bugreport,
+                "s-1",
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::host::CaptureError::OverBudget { budget, .. } if budget == DEFAULT_EVIDENCE_BUDGET),
+            "the default budget is what should have refused it: {err:?}"
+        );
+        let first = &device.requests()[0];
+        assert!(first.script.contains("bugreportz"));
+        assert_eq!(
+            first.budget.timeout,
+            Some(Duration::from_secs(600)),
+            "the operator's wait, not the crate's constant, is what the child is killed by"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn the_evidence_budget_in_the_settings_is_the_one_that_refuses() {
+        let root = tempdir("capture-budget");
+        let config = HostConfig {
+            evidence: EvidenceConfig {
+                bugreport: true,
+                ..EvidenceConfig::default()
+            },
+            budgets: BudgetConfig {
+                evidence_budget_bytes: EVIDENCE_BUDGET_MIN,
+                ..BudgetConfig::default()
+            },
+            ..HostConfig::defaults()
+        };
+        let prepared = config.prepare(&root).unwrap();
+        assert_eq!(prepared.limits.budget, EVIDENCE_BUDGET_MIN);
+        let device = Device::answering(
+            shell_profile(),
+            &[
+                ("bugreportz", "OK:/data/local/tmp/r.zip\n"),
+                ("wc -c", "999999999\n"),
+            ],
+        );
+        let err = prepared
+            .capture(
+                &(Arc::clone(&device) as Arc<dyn ExecutionBackend>),
+                &EvidenceSource::Bugreport,
+                "s-1",
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::host::CaptureError::OverBudget { budget, .. } if budget == EVIDENCE_BUDGET_MIN),
+            "the refusal must quote the operator's number back: {err:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_narrowed_logcat_is_what_the_capture_would_run() {
+        // The policy's narrowing has to be observable in the source it returns, not just in a
+        // boolean: `tail: None` under a policy that says 200 must produce a 200-line ask.
+        let policy = EvidenceConfig::default();
+        let source = EvidenceSource::Logcat {
+            buffer: None,
+            filter: Vec::new(),
+            tail: None,
+        };
+        match policy.apply(&source) {
+            Some(EvidenceSource::Logcat { tail, .. }) => assert_eq!(tail, Some(200)),
+            other => panic!("expected a narrowed logcat, got {other:?}"),
+        }
     }
 
     #[test]

@@ -1530,7 +1530,7 @@ async fn report_evidence_capture(
     transport: &AdbTransport,
 ) -> Result<(), Box<dyn Error>> {
     use acowork_android::host::{
-        ApprovalToken, CaptureError, DEFAULT_EVIDENCE_BUDGET, EvidenceSource, ExecutionBackend,
+        ApprovalToken, CaptureError, EvidenceLimits, EvidenceSource, ExecutionBackend,
         capture_evidence,
     };
     use std::sync::Arc;
@@ -1550,7 +1550,7 @@ async fn report_evidence_capture(
         session,
         &dir,
         Some(&token),
-        DEFAULT_EVIDENCE_BUDGET,
+        EvidenceLimits::default(),
     )
     .await
     {
@@ -1588,7 +1588,7 @@ async fn report_evidence_capture(
         session,
         &dir,
         Some(&token),
-        DEFAULT_EVIDENCE_BUDGET,
+        EvidenceLimits::default(),
     )
     .await
     {
@@ -1617,7 +1617,7 @@ async fn report_evidence_capture(
         session,
         &dir,
         Some(&token),
-        DEFAULT_EVIDENCE_BUDGET,
+        EvidenceLimits::default(),
     )
     .await
     {
@@ -1643,7 +1643,7 @@ async fn report_evidence_capture(
             session,
             &dir,
             None,
-            DEFAULT_EVIDENCE_BUDGET,
+            EvidenceLimits::default(),
         )
         .await
         {
@@ -1675,7 +1675,7 @@ async fn report_evidence_capture(
             session,
             &dir,
             Some(&token),
-            DEFAULT_EVIDENCE_BUDGET,
+            EvidenceLimits::default(),
         )
         .await
         {
@@ -1730,7 +1730,7 @@ async fn report_evidence_capture(
             Some(&token),
             // The default, deliberately: the constant's doc claims 4 MiB was chosen because it
             // covers a real bugreport, and a claim like that belongs next to a measurement.
-            DEFAULT_EVIDENCE_BUDGET,
+            EvidenceLimits::default(),
         )
         .await
         {

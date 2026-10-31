@@ -101,7 +101,8 @@ pub use denial::{
 };
 pub use evidence::{
     Artifact as EvidenceArtifact, CaptureError, DEFAULT_EVIDENCE_BUDGET, EVIDENCE_CHUNK_BYTES,
-    EVIDENCE_STAGING_DIR, Source as EvidenceSource, capture as capture_evidence,
+    EVIDENCE_STAGING_DIR, Limits as EvidenceLimits, Source as EvidenceSource,
+    capture as capture_evidence,
 };
 pub use facts::{
     AppletSet, BuildType, DeviceFacts, FsRoot, MountEntry, Privilege, SelinuxDomain, SelinuxState,

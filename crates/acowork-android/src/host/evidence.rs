@@ -78,6 +78,43 @@ pub const BUGREPORT_TIMEOUT: Duration = Duration::from_secs(300);
 /// A screenshot and a logcat dump are sub-second operations on the device.
 pub const QUICK_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How much one capture may take.
+///
+/// Both numbers are the operator's to set — how many bytes to bring back, and how long to wait
+/// for the one source measured in minutes rather than seconds — so they travel together instead
+/// of being two more positional arguments on [`capture`], which is how a limit gets passed into
+/// the wrong slot.
+///
+/// The quick sources keep the crate's constant: 30 s for a `screencap` or a chunked `base64` read
+/// is a property of the exec channel, not a preference, and a screen offering it would be
+/// inviting somebody to set it below the time a screenshot takes to write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// Bytes an artifact may weigh before the capture refuses and says so.
+    pub budget: u64,
+    /// How long `bugreportz` gets.
+    pub bugreport: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits {
+            budget: DEFAULT_EVIDENCE_BUDGET,
+            bugreport: BUGREPORT_TIMEOUT,
+        }
+    }
+}
+
+impl Limits {
+    /// The timeout one source gets under these limits.
+    pub fn timeout_for(&self, source: &Source) -> Duration {
+        match source {
+            Source::Bugreport => self.bugreport,
+            _ => QUICK_TIMEOUT,
+        }
+    }
+}
+
 /// What to capture.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
@@ -146,14 +183,6 @@ impl Source {
             Source::Screenshot => "png",
             Source::Bugreport => "zip",
             _ => "txt",
-        }
-    }
-
-    /// How long the producing command gets.
-    fn timeout(&self) -> Duration {
-        match self {
-            Source::Bugreport => BUGREPORT_TIMEOUT,
-            _ => QUICK_TIMEOUT,
         }
     }
 
@@ -258,6 +287,17 @@ pub enum CaptureError {
         value: String,
         /// Which parameter it was rejected as.
         what: String,
+    },
+    /// The operator's evidence policy does not allow this source, so **nothing ran**.
+    ///
+    /// A distinct outcome rather than an empty success: a caller that asked for a bugreport on a
+    /// device whose screen has that switch off needs the answer "not allowed", not a missing file
+    /// that reads as a device failure.
+    NotAllowed {
+        /// What was asked for, in [`Source::describe`]'s words.
+        source: String,
+        /// Which setting refuses it, named because the right next step is the screen.
+        setting: String,
     },
     /// The device could not produce the artifact.
     CommandFailed {
@@ -370,6 +410,10 @@ impl fmt::Display for CaptureError {
                 "the artifact hashes to {got} but the device reported {expected}; the bytes \
                  that came back are not the bytes that were there, and the incomplete file \
                  has been deleted"
+            ),
+            CaptureError::NotAllowed { source, setting } => write!(
+                f,
+                "collecting {source} is switched off by {setting}; nothing ran, and the device                  was not asked"
             ),
             CaptureError::Backend(e) => write!(f, "the backend refused or failed: {e}"),
             CaptureError::Host(e) => write!(f, "cannot write the artifact on the host: {e}"),
@@ -613,7 +657,7 @@ struct Job<'a> {
     session: &'a str,
     dir: &'a Path,
     token: Option<&'a ApprovalToken>,
-    budget: u64,
+    limits: Limits,
     nonce: String,
     stage: String,
     staged: bool,
@@ -632,7 +676,7 @@ pub async fn capture(
     session: &str,
     dir: &Path,
     token: Option<&ApprovalToken>,
-    budget: u64,
+    limits: Limits,
 ) -> Result<Artifact, CaptureError> {
     let nonce = next_nonce();
     let stage = format!("{EVIDENCE_STAGING_DIR}/.acowork-ev-{nonce}.bin");
@@ -642,7 +686,7 @@ pub async fn capture(
         session,
         dir,
         token,
-        budget,
+        limits,
         nonce,
         stage,
         staged: false,
@@ -661,10 +705,10 @@ impl Job<'_> {
     async fn run(&mut self) -> Result<Artifact, CaptureError> {
         let path = self.resolve().await?;
         let (bytes, digest) = measure(self.backend, &path, self.session).await?;
-        if bytes > self.budget {
+        if bytes > self.limits.budget {
             return Err(CaptureError::OverBudget {
                 bytes,
-                budget: self.budget,
+                budget: self.limits.budget,
             });
         }
         // One small read before committing to the chunked transfer. This is the only place the
@@ -732,7 +776,7 @@ impl Job<'_> {
                     "bugreportz",
                     self.session,
                     self.token,
-                    BUGREPORT_TIMEOUT,
+                    self.limits.bugreport,
                 )
                 .await?;
                 if out.exit_code != Some(0) {
@@ -759,7 +803,7 @@ impl Job<'_> {
                     &script,
                     self.session,
                     self.token,
-                    other.timeout(),
+                    self.limits.timeout_for(other),
                 )
                 .await?;
                 if out.exit_code != Some(0) {
@@ -1002,7 +1046,18 @@ mod tests {
         budget: u64,
     ) -> Result<Artifact, CaptureError> {
         let inner = Arc::clone(device) as Arc<dyn ExecutionBackend>;
-        capture(&inner, source, session, dir, None, budget).await
+        capture(
+            &inner,
+            source,
+            session,
+            dir,
+            None,
+            Limits {
+                budget,
+                bugreport: BUGREPORT_TIMEOUT,
+            },
+        )
+        .await
     }
 
     #[tokio::test]
