@@ -18,9 +18,9 @@ use acowork_android::host::{SettingKind, catalog};
 /// A byte count in the unit a person would actually read.
 fn bytes(n: u64) -> String {
     const KIB: u64 = 1024;
-    if n >= 1024 * KIB && n % (1024 * KIB) == 0 {
+    if n >= 1024 * KIB && n.is_multiple_of(1024 * KIB) {
         format!("{} MiB", n / (1024 * KIB))
-    } else if n >= KIB && n % KIB == 0 {
+    } else if n >= KIB && n.is_multiple_of(KIB) {
         format!("{} KiB", n / KIB)
     } else {
         format!("{n} B")

@@ -62,6 +62,13 @@ device = []
 # examples regardless of features unless told otherwise, so without this gate
 # `--no-default-features` — the very configuration the lean-build check exists to prove —
 # fails for a reason that has nothing to do with what that check is measuring.
+# The runtime's assembly path, runnable against a phone. Over the adb transport, so it needs
+# the same feature as the harness — and it is the reason that feature is on by default.
+[[bin]]
+name = "acowork-host"
+path = "src/bin/acowork-host.rs"
+required-features = ["device"]
+
 [[example]]
 name = "device_probe"
 required-features = ["device"]

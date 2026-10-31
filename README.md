@@ -21,7 +21,7 @@
 > Rust libraries: the platform-neutral contract layer (`acowork-platform-contract`) and the Android host
 > layer (`acowork-android`, the P0 slice — HostProfile probe, script assembly, process spawn and
 > `ExecutionBackend` implementations, the §4.4 read-tier guardrail, the §4.5 tool
-> descriptions, the §4.6.1 audit outlet, the measured evidence surface and the §4.6.4 rollback ledger). 620 tests pass, the contract layer also builds for a bare-metal RISC-V
+> descriptions, the §4.6.1 audit outlet, the measured evidence surface and the §4.6.4 rollback ledger). 626 tests pass, the contract layer also builds for a bare-metal RISC-V
 > target, and the chain has been run against a physical device — a Huawei BLA-AL00 over adb:
 > 20 read-only probes → `HostProfile` → real commands, exit 0 in ~120 ms, including `logcat`,
 > which only works because the probe spot-checks for it. **No node binary exists yet** (the
@@ -227,7 +227,7 @@ Both crates are plain Rust libraries with no platform-specific code, so they bui
 
 ```bash
 cargo build                                        # build
-cargo test                                         # 620 tests (Android unit 436 + contract 86 + contract integration 27 + rule conformance 43 + real-process 13 + device ground truth 15)
+cargo test                                         # 626 tests (Android unit 436 + assembly 6 + contract 86 + contract integration 27 + rule conformance 43 + real-process 13 + device ground truth 15)
 cargo clippy --all-targets -- -D warnings          # upstream CI convention; must be warning-free
 cargo fmt --check
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps      # every doc link must resolve
@@ -278,6 +278,29 @@ dependency is the contract crate. Neither depends on `acowork-runtime` / `acowor
 `cargo tree -p acowork-platform-contract --no-default-features -e features --edges no-dev` and confirm no
 `serde_core feature "std"` edge in the lib graph (`--edges no-dev` matters — the `serde_json`
 dev-dependency will otherwise mislead you).
+
+### Is the number I set the number that is in force?
+
+`device_probe` measures a device. `acowork-host` answers the question an operator holding a settings
+screen actually asks:
+
+```bash
+ACOWORK_ADB=/path/to/adb ACOWORK_ADB_SERIAL=<serial> \
+  cargo run --bin acowork-host -- --root ./host "getprop ro.build.version.release"
+```
+
+It reads `host/settings.json` (or reports that it does not exist yet), probes, assembles the chain
+from that document, runs one command through it, restores the session, and prints what the assembled
+host is *actually* using: snapshot directory and budget, audit path and cap, command timeout, output
+cap, evidence budget, the claims the device earned, and which of them the settings switched off.
+Every number is read back out of the assembled host rather than from a crate constant, which is how
+a setting that parses but is never consulted shows up as a disagreement instead of shipping.
+
+A script the classifier says changes state is not run without an approval: it asks on the terminal,
+and when there is no terminal to ask it refuses. `--yes` answers for a scripted run and says so in
+the output. Verified on a BLA-AL00: `printf ... > /data/local/tmp/f` ran, the store captured the
+previous bytes, and `restore` put them back — the audit file then held the capture, the write and
+the undo as attempt/result pairs grouped by `(session_id, id)`.
 
 ### Android side (not started)
 

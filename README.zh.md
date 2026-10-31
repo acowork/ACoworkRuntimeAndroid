@@ -18,7 +18,7 @@
 ---
 
 > **状态：早期开发。** 设计文档齐备，P0 切片（HostProfile 探测、脚本装配、进程生成、
-> `ExecutionBackend` 实现、§4.4 只读档护栏、§4.5 动态工具描述、§4.6.1 审计日志出口、§4.6 item 6 证据面实测、§4.6.4 写操作可撤销）已交付为可构建、可测试的 Rust 库，620 个测试通过，
+> `ExecutionBackend` 实现、§4.4 只读档护栏、§4.5 动态工具描述、§4.6.1 审计日志出口、§4.6 item 6 证据面实测、§4.6.4 写操作可撤销）已交付为可构建、可测试的 Rust 库，626 个测试通过，
 > 且整条链路已在真机上跑通过（华为 BLA-AL00，经 adb：20 条只读探测 → `HostProfile` → 真实命令，
 > ~120ms / exit 0，其中 `logcat` 之所以能跑，是因为探测项 6c 去抽查了它）。
 > **仍无 node 二进制产物**——目前唯一可运行的东西就是那个真机 harness——不适合用于生产环境。
@@ -220,7 +220,7 @@ graph TD
 
 ```bash
 cargo build                                        # 构建
-cargo test                                         # 620 个测试（Android 单元 436 + 契约层 86 + 契约集成 27 + 规则一致性 43 + 真进程 13 + 真机地面实况 15）
+cargo test                                         # 626 个测试（Android 单元 436 + 组装链路 6 + 契约层 86 + 契约集成 27 + 规则一致性 43 + 真进程 13 + 真机地面实况 15）
 cargo clippy --all-targets -- -D warnings          # 上游 CI 约定，须零告警
 cargo fmt --check
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps      # 文档链接必须都能解析
@@ -258,6 +258,24 @@ fixture 永远只能证明解析器与自己自洽，证明不了它对上了任
 工具链对齐上游 `core/Cargo.toml`：edition 2024、rust-version 1.95、license Apache-2.0。
 
 **依赖纪律**：`acowork-platform-contract` 只依赖 `serde`（`default-features = false` + `alloc`/`derive`），连 `async-trait` 都不用——异步靠 `core::future::Future` + GAT 关联 future 类型，不装箱。`acowork-android` 的唯一非 serde 依赖就是契约层。二者都**刻意不依赖** `acowork-runtime` / `acowork-core`：上游 design 30 §9 自己指出「`ExecutionBackend` 在引擎内部，EIP 在引擎外部」，二者正交；保持零引擎依赖使本仓库在 B3 的两种裁定下同时成立。这现在是**结构保证**而非约定——可用 `cargo tree -p acowork-platform-contract --no-default-features -e features --edges no-dev` 复核 lib 依赖图里没有 `serde_core feature "std"` 边（必须带 `--edges no-dev`，否则 dev-dependency `serde_json` 会误导）。
+
+### 我设的数，是不是正在生效的数
+
+`device_probe` 量设备。`acowork-host` 回答的是手里拿着设置界面的操作者真正会问的那一句：
+
+```bash
+ACOWORK_ADB=/path/to/adb ACOWORK_ADB_SERIAL=<serial> \
+  cargo run --bin acowork-host -- --root ./host "getprop ro.build.version.release"
+```
+
+它读 `host/settings.json`（不存在就直说不存在），探测，按这份文档组装链，跑一条命令，恢复会话，
+然后打印组装出来的宿主**实际在用**的值：快照目录与预算、审计路径与上限、命令超时、输出上限、证据
+预算，以及设备挣到的能力清单、其中哪些是被设置关掉的。每个数字都从组装好的宿主读回来，而不是取自
+ crate 常量——一个「能解析但没人读」的设置因此会显示成一处不一致，而不是被发布掉。
+
+分类器判定会改状态的脚本，没有审批不会跑：它在终端上问，没有终端可问就拒绝。`--yes` 为脚本化运行
+代答，并在输出里说明是代答。BLA-AL00 实测：`printf ... > /data/local/tmp/f` 跑通，快照存下原有字节，
+`restore` 把它们放了回去；审计文件里随后是捕获、写、撤销三对 attempt/result，按 `(session_id, id)` 归组。
 
 ### Android 侧（尚未开始）
 

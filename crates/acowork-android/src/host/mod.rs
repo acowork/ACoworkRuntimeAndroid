@@ -99,7 +99,7 @@ pub use commands::{
 };
 pub use config::{
     AUDIT_FILE_NAME, Assembly, AssemblyError, BudgetConfig, ConfigError, EvidenceConfig,
-    HostConfig, PreparedHost, StorageConfig,
+    HostConfig, LoadSource, Loaded, PreparedHost, StorageConfig,
 };
 pub use denial::{
     DenialLedger, SelinuxClassifier, SelinuxDenial, classify, parse_denials, redact_denials,
