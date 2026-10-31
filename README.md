@@ -21,7 +21,7 @@
 > Rust libraries: the platform-neutral contract layer (`acowork-platform-contract`) and the Android host
 > layer (`acowork-android`, the P0 slice — HostProfile probe, script assembly, process spawn and
 > `ExecutionBackend` implementations, the §4.4 read-tier guardrail, the §4.5 tool
-> descriptions, the §4.6.1 audit outlet, the measured evidence surface and the §4.6.4 rollback ledger). 565 tests pass, the contract layer also builds for a bare-metal RISC-V
+> descriptions, the §4.6.1 audit outlet, the measured evidence surface and the §4.6.4 rollback ledger). 595 tests pass, the contract layer also builds for a bare-metal RISC-V
 > target, and the chain has been run against a physical device — a Huawei BLA-AL00 over adb:
 > 20 read-only probes → `HostProfile` → real commands, exit 0 in ~120 ms, including `logcat`,
 > which only works because the probe spot-checks for it. **No node binary exists yet** (the
@@ -114,7 +114,8 @@ process is still confined by policy, `/system` is still verity-protected and rea
 and `/system/bin/sh` is mksh, not bash. The probe measures all of this rather than assuming it.
 
 Design rationale: [ADR-AND-001](docs/adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md) ·
-Probe specification: [android-host-probe.md](docs/design/zh/android-host-probe.md)
+Probe specification: [android-host-probe.md](docs/design/zh/android-host-probe.md) ·
+Settings surface: [android-runtime-settings.md](docs/design/zh/android-runtime-settings.md)
 
 
 ## Why a separate repository?
@@ -169,7 +170,7 @@ graph TD
 | `crates/acowork-android/` | **Android's facts and mechanisms**: which commands to probe, how to parse them, the four-axis values for the five `android:*` capabilities, the `su -c` wrapper, `avc: denied` feedback. The test is: swap the platform and the contract crate does not change by one line, while this crate is rewritten entirely. |
 | `crates/` (planned) | The remaining Rust crates shared by both builds — the Android-aware runtime + node engine. |
 | `apps/` (planned) | The APK application (Gradle project, Kotlin/Java shell, foreground service). |
-| `docs/` | Design notes, platform notes, and the porting rationale — see [ADR-AND-001](docs/adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md) (host profiles & privilege model), [ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md) (the platform contract layer), [android-host-probe.md](docs/design/zh/android-host-probe.md) (startup capability probing), and the [readiness assessment](docs/review/zh/2026-10-28-readiness-assessment.md) (conflicts with upstream). All Chinese. |
+| `docs/` | Design notes, platform notes, and the porting rationale — see [ADR-AND-001](docs/adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md) (host profiles & privilege model), [ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md) (the platform contract layer), [android-host-probe.md](docs/design/zh/android-host-probe.md) (startup capability probing), [android-runtime-settings.md](docs/design/zh/android-runtime-settings.md) (what an operator may set, and what only the device may answer), and the [readiness assessment](docs/review/zh/2026-10-28-readiness-assessment.md) (conflicts with upstream). All Chinese. |
 
 ### Android is only the first port
 
@@ -226,7 +227,7 @@ Both crates are plain Rust libraries with no platform-specific code, so they bui
 
 ```bash
 cargo build                                        # build
-cargo test                                         # 565 tests (Android unit 381 + contract 86 + contract integration 27 + rule conformance 43 + real-process 13 + device ground truth 15)
+cargo test                                         # 595 tests (Android unit 411 + contract 86 + contract integration 27 + rule conformance 43 + real-process 13 + device ground truth 15)
 cargo clippy --all-targets -- -D warnings          # upstream CI convention; must be warning-free
 cargo fmt --check
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps      # every doc link must resolve

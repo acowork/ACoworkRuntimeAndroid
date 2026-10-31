@@ -18,7 +18,7 @@
 ---
 
 > **状态：早期开发。** 设计文档齐备，P0 切片（HostProfile 探测、脚本装配、进程生成、
-> `ExecutionBackend` 实现、§4.4 只读档护栏、§4.5 动态工具描述、§4.6.1 审计日志出口、§4.6 item 6 证据面实测、§4.6.4 写操作可撤销）已交付为可构建、可测试的 Rust 库，565 个测试通过，
+> `ExecutionBackend` 实现、§4.4 只读档护栏、§4.5 动态工具描述、§4.6.1 审计日志出口、§4.6 item 6 证据面实测、§4.6.4 写操作可撤销）已交付为可构建、可测试的 Rust 库，595 个测试通过，
 > 且整条链路已在真机上跑通过（华为 BLA-AL00，经 adb：20 条只读探测 → `HostProfile` → 真实命令，
 > ~120ms / exit 0，其中 `logcat` 之所以能跑，是因为探测项 6c 去抽查了它）。
 > **仍无 node 二进制产物**——目前唯一可运行的东西就是那个真机 harness——不适合用于生产环境。
@@ -109,7 +109,8 @@ user 版上 `/system` 依然有 verity 保护且只读；`/system/bin/sh` 是 mk
 这些事实，而不是假设它们。
 
 设计取舍：[ADR-AND-001](docs/adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md) ·
-探测规格：[android-host-probe.md](docs/design/zh/android-host-probe.md)
+探测规格：[android-host-probe.md](docs/design/zh/android-host-probe.md) ·
+设置面盘点：[android-runtime-settings.md](docs/design/zh/android-runtime-settings.md)
 
 ## 为什么独立建仓？
 
@@ -173,7 +174,7 @@ graph TD
 | `crates/acowork-android/` | **Android 的事实与机制**：探测哪些命令、输出怎么解析、五个 `android:*` 能力的四轴取值、`su -c` 包装、`avc: denied` 回灌。判据是「换一个平台，契约层一行不改，这里全部重写」。 |
 | `crates/`（规划） | 两个版本共用的其余 Rust crate —— 适配 Android 的 runtime + node 引擎。 |
 | `apps/`（规划） | APK 应用（Gradle 工程，Kotlin/Java 外壳，前台服务）。 |
-| `docs/` | 设计说明、平台笔记与移植取舍记录 —— 见 [ADR-AND-001](docs/adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md)（宿主档与权限模型）、[ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md)（平台契约层）、[android-host-probe.md](docs/design/zh/android-host-probe.md)（启动能力探测）与 [开发就绪度评估](docs/review/zh/2026-10-28-readiness-assessment.md)（与上游的冲突核对）。 |
+| `docs/` | 设计说明、平台笔记与移植取舍记录 —— 见 [ADR-AND-001](docs/adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md)（宿主档与权限模型）、[ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md)（平台契约层）、[android-host-probe.md](docs/design/zh/android-host-probe.md)（启动能力探测）、[android-runtime-settings.md](docs/design/zh/android-runtime-settings.md)（哪些参数归人定、哪些只有设备能答）与 [开发就绪度评估](docs/review/zh/2026-10-28-readiness-assessment.md)（与上游的冲突核对）。 |
 
 ## 与上游的关系
 
@@ -219,7 +220,7 @@ graph TD
 
 ```bash
 cargo build                                        # 构建
-cargo test                                         # 565 个测试（Android 单元 381 + 契约层 86 + 契约集成 27 + 规则一致性 43 + 真进程 13 + 真机地面实况 15）
+cargo test                                         # 595 个测试（Android 单元 411 + 契约层 86 + 契约集成 27 + 规则一致性 43 + 真进程 13 + 真机地面实况 15）
 cargo clippy --all-targets -- -D warnings          # 上游 CI 约定，须零告警
 cargo fmt --check
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps      # 文档链接必须都能解析
