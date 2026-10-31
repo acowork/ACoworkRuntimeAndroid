@@ -539,11 +539,30 @@ fn lex(script: &str) -> Result<Vec<Tok>, Finding> {
                     }
                 }
             }
-            '(' | ')' | '{' | '}' => {
+            '(' => {
                 return Err(Finding::opaque(
                     c.to_string(),
-                    "subshells and brace groups are not analysed; run the inner command as \
-                     its own request so it can be classified",
+                    "subshells are not analysed; run the inner command as its own request so it \
+                     can be classified",
+                ));
+            }
+            ')' => {
+                return Err(Finding::opaque(
+                    c.to_string(),
+                    "a closing `)` with no subshell open — the script is not one this classifier \
+                     can read",
+                ));
+            }
+            // `{` and `}` are reserved words only when they stand alone: POSIX requires the braces
+            // to be separate words for `{ cmd; }` to group. As an argument they are literal text,
+            // and `find -exec rm {} +` and `xargs -I{}` are the shapes that hit this. Reading
+            // them as a group refused the command for the wrong reason — the tier was already the
+            // safe one, but the sentence a human reads in the audit log was not.
+            '{' | '}' if stands_alone(&chars) => {
+                return Err(Finding::opaque(
+                    c.to_string(),
+                    "a brace group is not analysed; run the inner command as its own request so \
+                     it can be classified",
                 ));
             }
             // Anything else starts a word, including `$(` and backquotes, which `word`
@@ -557,6 +576,21 @@ fn lex(script: &str) -> Result<Vec<Tok>, Finding> {
         }
     }
     Ok(toks)
+}
+
+/// Whether the character at the front of `chars` is a whole word on its own.
+///
+/// This is POSIX's reserved-word test, and it is what separates `{ cat x; }` — a brace group —
+/// from the `{}` in `find -exec rm {} +`, which is a literal argument the command substitutes.
+/// The classifier cannot tell them apart by the character alone, and getting it wrong produced a
+/// refusal whose stated reason was false.
+fn stands_alone<I: Iterator<Item = char> + Clone>(chars: &std::iter::Peekable<I>) -> bool {
+    let mut after = chars.clone();
+    after.next();
+    matches!(
+        after.peek(),
+        None | Some(' ') | Some('\t') | Some('\n') | Some(';') | Some('|') | Some('&')
+    )
 }
 
 fn skip_space<I: Iterator<Item = char>>(chars: &mut std::iter::Peekable<I>) {
@@ -626,7 +660,7 @@ fn word<I: Iterator<Item = char>>(chars: &mut std::iter::Peekable<I>) -> Result<
                     "backquote substitution runs a second command the classifier never sees",
                 ));
             }
-            '(' | ')' | '{' | '}' => break,
+            '(' | ')' => break,
             c => {
                 chars.next();
                 out.push(c);
@@ -739,9 +773,33 @@ impl Command {
         self.outputs
             .iter()
             .map(String::as_str)
-            .filter(|target| *target != "/dev/null" && !target.starts_with('&'))
+            .filter(|target| !names_no_file(target) && !target.starts_with('&'))
             .collect()
     }
+}
+
+/// True when a write target is a bit bucket rather than a file anybody can read back.
+///
+/// `/dev/null` discards and `/dev/zero` reads zeroes; neither leaves a state for the ledger to
+/// restore or a tier for an approval to name. The redirection reader has always dropped them, and
+/// `dd of=` used to keep them — which made `dd of=/dev/null` cost `fs:system` (the whole of `/dev`
+/// is a partition root) while `echo x > /dev/null` cost nothing. One rule, both places.
+fn names_no_file(target: &str) -> bool {
+    target == "/dev/null" || target == "/dev/zero"
+}
+
+/// The files a `dd` names as its destination: every `of=` value, minus the bit buckets.
+///
+/// Every `of=` and not the first: a copy can name more than one destination, and returning on the
+/// first match is the same reflex that had `cp` classify a source. Discard destinations are
+/// dropped for the reason in [`names_no_file`]. Both the tier decision and the rollback ledger ask
+/// this question, and a second implementation of it is how `dd of=/dev/null` came to cost
+/// `fs:system` in one and a snapshot of the node in the other.
+fn dd_targets(args: &[String]) -> Vec<&str> {
+    args.iter()
+        .filter_map(|a| a.strip_prefix("of="))
+        .filter(|t| !names_no_file(t))
+        .collect()
 }
 
 fn is_assignment(word: &str) -> bool {
@@ -839,8 +897,7 @@ fn analyse(command: &Command) -> Finding {
         let reached = command
             .args()
             .iter()
-            .map(String::as_str)
-            .filter(|a| looks_like_path(a))
+            .filter_map(|a| path_in_token(a))
             .find_map(|a| match inspectable_path(a) {
                 Some(kind) => Some((a, kind)),
                 None => {
@@ -1056,9 +1113,8 @@ pub fn file_writes(words: &[String]) -> Option<Vec<FileWrite>> {
         .collect();
 
     let writes: Vec<(String, FileChange)> = match head.as_str() {
-        "dd" => args
-            .iter()
-            .filter_map(|a| a.strip_prefix("of="))
+        "dd" => dd_targets(&args)
+            .into_iter()
             .map(|t| (t.to_string(), FileChange::Content))
             .collect(),
         "sed" if flag("i") => {
@@ -1294,6 +1350,40 @@ fn looks_like_path(operand: &str) -> bool {
     operand.starts_with('/') || operand.starts_with('.') || operand.contains('/')
 }
 
+/// The path a token carries, with any `key=` / `--flag=` / glued-short-flag prefix removed.
+///
+/// Two operand grammars hide a path behind something that is not a path: `dd
+/// if=/dev/block/mmcblk0` and `grep --file=/proc/1/environ`. Each names a file the shell really
+/// opens, and neither token starts with a separator, so every predicate that compares the *whole*
+/// token against `/data/data/`, `/dev/block/` or a `/proc/<pid>/` prefix misses it. This is not a
+/// hypothetical spelling: on the BLA-AL00 `dd if=<file> of=<file>` copies it (`4 bytes (4 B)
+/// copied`) and toybox `sort -T <dir>` accepts a directory (exit 0), so a rule that only reads
+/// bare operands silently passes the wider read.
+///
+/// `Some` is a candidate, not a verdict — the caller still decides whether it is a path and what
+/// it reaches. The reader is deliberately broad: `--color=/usr/share/x` produces a candidate too.
+/// The cost of an extra candidate is one more approval; the cost of a missed one is the whole
+/// partition read at the tier that needs no approval.
+fn path_in_token(token: &str) -> Option<&str> {
+    if let Some((_, value)) = token.split_once('=')
+        && (value.starts_with('/') || value.starts_with('.'))
+    {
+        return Some(value);
+    }
+    if token.starts_with('/') || token.starts_with('.') {
+        return Some(token);
+    }
+    if let Some(rest) = token.strip_prefix('-') {
+        // A short flag with its value glued on: `-T/system/tmp`, `-f/data/data/x`. The flag's own
+        // letters are dropped and what follows is the candidate.
+        let tail = rest.trim_start_matches(|c: char| c.is_alphabetic() || c == '-');
+        if tail.starts_with('/') || tail.starts_with('.') {
+            return Some(tail);
+        }
+    }
+    None
+}
+
 /// The value a flag carries, in its separate (`-o FILE`), glued (`-oFILE`) or `=` (`--output=FILE`)
 /// form.
 ///
@@ -1443,9 +1533,7 @@ fn effect_of(head: &str, args: &[String]) -> Finding {
         return Finding::new(head, Effect::Banned, BANNED_TEXT);
     }
     if head == "dd" {
-        // Every `of=` in the script, not the first: a copy can name more than one destination,
-        // and returning on the first match is the same reflex that had `cp` classify a source.
-        let targets: Vec<&str> = args.iter().filter_map(|a| a.strip_prefix("of=")).collect();
+        let targets = dd_targets(args);
         if !targets.is_empty() {
             let effect = targets
                 .iter()
@@ -1646,15 +1734,56 @@ fn effect_of(head: &str, args: &[String]) -> Finding {
             );
         }
         if head == "sort" {
-            // `-o FILE` is the output file. `sort` is on the read list because it is a filter,
-            // and a filter that writes is not a filter: `sort -o /system/x f` was asking the tier
-            // that auto-passes to put a partition file in place.
-            if let Some(target) = flag_value(args, &["-o", "--output"]) {
-                return Finding::new(
+            // `-o FILE` is the output file and `-T DIR` is where the temporary files go. `sort`
+            // is on the read list because it is a filter, and neither of those is a filter:
+            // `sort -o /system/x f` was asking the tier that auto-passes to put a partition file
+            // in place, and `sort -T /system/tmp f` writes there for the duration of a sort of
+            // anything large enough to need a temp file. Both flags are accepted by this toybox —
+            // `-T` measured at exit 0 on the BLA-AL00.
+            let output = flag_value(args, &["-o", "--output"]);
+            let scratch = flag_value(args, &["-T", "--temporary-directory"]);
+            // A program `sort` runs to compress its temp files. The classifier does not run
+            // programs named in arguments: `NESTED` only inspects the command word, so this is
+            // the one place a program can be smuggled in as a value. Refused rather than
+            // reasoned about — this toybox rejects `--compress` outright, so the rule costs
+            // nothing on the tier measured and covers the GNU `sort` a Termux host installs.
+            if flag_value(args, &["--compress-program", "--compress"]).is_some()
+                || args
+                    .iter()
+                    .any(|a| a == "-Z" || a.starts_with("-Z") && a.len() > 2)
+            {
+                return Finding::opaque(
                     head,
-                    file_effect(&target),
-                    format!("writes the sorted output to `{target}`"),
+                    "its `--compress-program` names a program for `sort` to run, and that is a \
+                     second command this classifier never sees; run it as its own request",
                 );
+            }
+            match (output, scratch) {
+                (Some(out), Some(dir)) => {
+                    let effect = file_effect(&out).max(file_effect(&dir));
+                    return Finding::new(
+                        head,
+                        effect,
+                        format!(
+                            "writes the sorted output to `{out}` and its scratch files to `{dir}`"
+                        ),
+                    );
+                }
+                (Some(out), None) => {
+                    return Finding::new(
+                        head,
+                        file_effect(&out),
+                        format!("writes the sorted output to `{out}`"),
+                    );
+                }
+                (None, Some(dir)) => {
+                    return Finding::new(
+                        head,
+                        file_effect(&dir),
+                        format!("writes its temporary files to `{dir}`"),
+                    );
+                }
+                (None, None) => {}
             }
         }
         if head == "uniq" {
@@ -1722,6 +1851,25 @@ fn effect_of(head: &str, args: &[String]) -> Finding {
                     format!("saves a capture to `{target}`"),
                 );
             }
+        }
+        // A path argument to `dumpsys` is not input. The command takes a service name and flags,
+        // and some services accept a file to *write* — `dumpsys SurfaceFlinger --screenshot
+        // <file>` being the shape that reaches for a path. On this device the flag is ignored
+        // outright (measured on the BLA-AL00: `--screenshot`, `--screen` and `--screenshot=` all
+        // leave no file behind), so the rule costs nothing here and answers the question the
+        // newer build does. `screencap` is the same shape and was already modelled; leaving this
+        // one at the read tier would mean two commands, two answers, one file.
+        if head == "dumpsys"
+            && let Some(target) = args.iter().find(|a| a.starts_with('/'))
+        {
+            return Finding::new(
+                head,
+                file_effect(target),
+                format!(
+                    "`dumpsys` reads no file argument — `{target}` is somewhere a service was \
+                     asked to put something"
+                ),
+            );
         }
         // A read is only free while the port can say *what* is being read. The write side has
         // refused unbounded operands since `destination` was written; the read side is where that
@@ -2259,6 +2407,148 @@ mod tests {
         ] {
             assert_eq!(effect(script), Effect::ReadOnly, "{script}");
         }
+    }
+
+    #[test]
+    fn a_path_written_behind_a_key_is_still_a_path() {
+        // The disclosure rule reads operands, and two grammars hid a path behind a prefix:
+        // `dd if=<path>` and `--flag=<path>`. Both were invisible to every root predicate,
+        // because the token does not start with a separator. Measured on the BLA-AL00: `dd
+        // if=<file> of=<file>` copies it ("4 bytes (4 B) copied"), so this was a working
+        // route and not a spelling.
+        for script in [
+            "dd if=/dev/block/mmcblk0",
+            "dd if=/dev/block/mmcblk0 of=/data/local/tmp/out",
+            "dd if=/data/data/com.foo/db of=/sdcard/out",
+            "dd if=/data/data/com.foo/db > /data/local/tmp/out",
+            "grep --file=/proc/1/environ /data/local/tmp/x",
+            "wc --files0-from=/data/data/com.foo/list",
+            "chmod --reference=/data/data/com.foo/x /data/local/tmp/f",
+            "sed -f /data/data/com.foo/s /data/local/tmp/x",
+        ] {
+            assert_eq!(effect(script), Effect::ForeignRead, "{script}");
+            assert!(
+                check(script, Some(Capability::FsOutsideApp)).is_err(),
+                "{script} must not be covered by the lightest filesystem tier"
+            );
+        }
+        // The same syntax with nothing sensitive behind it stays where it was, so the reader is
+        // not simply refusing every `key=value`.
+        assert_eq!(
+            effect("dd if=/data/local/tmp/a of=/data/local/tmp/b"),
+            Effect::FileWrite
+        );
+        assert_eq!(effect("wc --help"), Effect::ReadOnly);
+    }
+
+    #[test]
+    fn a_sorts_scratch_directory_is_a_destination_and_a_compression_program_is_a_second_command() {
+        // `-T DIR` is accepted by this toybox (measured: exit 0), and sort writes its temporary
+        // files there. Naming only `-o` would put an approval in front of a partition write.
+        assert_eq!(
+            effect("sort -T /system/tmp /data/local/tmp/f"),
+            Effect::SystemWrite,
+            "the temp directory alone is a destination"
+        );
+        assert_eq!(
+            effect("sort -o /data/local/tmp/x -T /system/tmp /data/local/tmp/f"),
+            Effect::SystemWrite,
+            "and the heavier of the two wins, so a light output cannot hide the partition"
+        );
+        assert_eq!(
+            effect("sort --temporary-directory=/system/tmp /data/local/tmp/f"),
+            Effect::SystemWrite,
+            "the `=` spelling is the same write"
+        );
+        assert_eq!(
+            effect("sort -o /data/local/tmp/x /data/local/tmp/f"),
+            Effect::FileWrite,
+            "a scratch destination stays the light tier"
+        );
+        // `--compress-program` names a program for sort to run. This toybox rejects the option
+        // outright (measured: "Unknown option compress=gzip"), so refusing costs nothing here
+        // and covers the GNU sort a Termux host installs.
+        for script in [
+            "sort --compress-program=gzip /data/local/tmp/f",
+            "sort --compress=gzip /data/local/tmp/f",
+            "sort -Zgzip /data/local/tmp/f",
+        ] {
+            assert_eq!(effect(script), Effect::Opaque, "{script}");
+        }
+        // `uniq --output=` is not an option this uniq has (measured: "Unknown option
+        // output=..."), so the token is a flag the command rejects, not a destination — the
+        // read answer is correct here and is pinned so a future general `--flag=` rule does not
+        // silently start tiering it.
+        assert_eq!(
+            effect("uniq /data/local/tmp/f --output=/system/x"),
+            Effect::ReadOnly
+        );
+    }
+
+    #[test]
+    fn braces_are_only_reserved_when_they_stand_alone() {
+        // `find -exec rm {} +` names no group: `{}` is a literal argument. Refusing it as a brace
+        // group gave the right tier with a sentence that was wrong, and the audit log is where a
+        // human reads that sentence.
+        let report = classify("find /data/local/tmp -exec rm {} +");
+        assert_eq!(report.strongest(), Effect::Opaque);
+        assert!(
+            !report.findings[0].detail.contains("brace"),
+            "not a brace group: {}",
+            report.findings[0].detail
+        );
+        // A real group is still refused, and still says why.
+        let grouped = classify("{ cat /data/local/tmp/x; }");
+        assert_eq!(grouped.strongest(), Effect::Opaque);
+        assert!(
+            grouped.findings[0].detail.contains("brace group"),
+            "{}",
+            grouped.findings[0].detail
+        );
+        assert_eq!(
+            classify("(cat /data/local/tmp/x)").strongest(),
+            Effect::Opaque
+        );
+        // `xargs -I{}` is the other literal shape.
+        assert_eq!(
+            classify("echo x | xargs -I{} rm {}").strongest(),
+            Effect::Opaque,
+            "still refused — xargs runs a command the classifier cannot see"
+        );
+    }
+
+    #[test]
+    fn a_bit_bucket_is_a_bit_bucket_whatever_command_names_it() {
+        // The redirection reader has always dropped the bit bucket; `dd of=` did not, so
+        // `dd of=/dev/null` cost `fs:system` (all of `/dev` is a partition root) while
+        // `echo x > /dev/null` cost nothing. Same file, one answer.
+        assert_eq!(
+            effect("dd if=/data/local/tmp/a of=/dev/null"),
+            Effect::ReadOnly
+        );
+        assert_eq!(effect("echo hi > /dev/null"), Effect::ReadOnly);
+        assert_eq!(
+            effect("dd if=/data/local/tmp/a of=/dev/zero"),
+            Effect::ReadOnly
+        );
+        // A real device under the same prefix is still the hard-banned thing.
+        assert_eq!(
+            effect("dd if=/dev/null of=/dev/block/mmcblk0"),
+            Effect::Banned
+        );
+        // And the ledger asks the same question: a bit bucket has no previous state to put back,
+        // so a snapshot of the node would be a phantom in the undo list.
+        let words: Vec<String> = "dd if=/data/local/tmp/a of=/dev/null"
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        assert!(
+            file_writes(&words).is_none(),
+            "the planner must not be asked to snapshot `{}`",
+            file_writes(&words)
+                .map(|w| w[0].path.clone())
+                .unwrap_or_default()
+        );
     }
 
     #[test]
@@ -2926,6 +3216,13 @@ mod tests {
             "sort -o /data/local/tmp/x /data/local/tmp/f",
             "uniq /data/local/tmp/f /system/out",
             "logcat -f/system/log",
+            // The same destination grammar behind a `key=` prefix, which every root predicate
+            // used to miss because the token does not start with a separator. `sort -T` is
+            // deliberately not here: the scratch directory sets the tier but is not a file the
+            // ledger can restore, so the planner is right not to be asked for it.
+            "dd if=/dev/block/mmcblk0 of=/data/local/tmp/out",
+            "dd if=/data/local/tmp/a of=/system/b",
+            "dd if=/data/data/com.foo/db of=/sdcard/out",
         ];
         for script in corpus {
             let verdict = classify(script);
@@ -3259,6 +3556,26 @@ mod tests {
             effect("setenforce 0").capability(),
             Some(Capability::SelinuxPermissive)
         );
+    }
+
+    #[test]
+    fn a_path_argument_to_dumpsys_is_a_destination_not_an_input() {
+        // Measured on the BLA-AL00: `dumpsys SurfaceFlinger --screenshot /data/local/tmp/ps.png`
+        // leaves no file, and neither do `--screen` nor `--screenshot=` — this build's service
+        // ignores the flag. The rule stays, because a path handed to `dumpsys` is never something
+        // the command reads, and the tier that answers for reads is the one §4.4 passes without
+        // asking. `screencap` is the same shape and was already modelled as a write.
+        assert_eq!(
+            effect("dumpsys SurfaceFlinger --screenshot /data/local/tmp/s.png"),
+            Effect::FileWrite
+        );
+        assert_eq!(
+            effect("dumpsys SurfaceFlinger --screenshot /system/s.png"),
+            Effect::SystemWrite
+        );
+        assert_eq!(effect("dumpsys battery"), Effect::ReadOnly);
+        assert_eq!(effect("dumpsys -l"), Effect::ReadOnly);
+        assert_eq!(effect("dumpsys window"), Effect::ReadOnly);
     }
 
     #[test]
