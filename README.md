@@ -21,7 +21,7 @@
 > Rust libraries: the platform-neutral contract layer (`acowork-platform-contract`) and the Android host
 > layer (`acowork-android`, the P0 slice — HostProfile probe, script assembly, process spawn and
 > `ExecutionBackend` implementations, the §4.4 read-tier guardrail, the §4.5 tool
-> descriptions, the §4.6.1 audit outlet, the measured evidence surface and the §4.6.4 rollback ledger). 595 tests pass, the contract layer also builds for a bare-metal RISC-V
+> descriptions, the §4.6.1 audit outlet, the measured evidence surface and the §4.6.4 rollback ledger). 598 tests pass, the contract layer also builds for a bare-metal RISC-V
 > target, and the chain has been run against a physical device — a Huawei BLA-AL00 over adb:
 > 20 read-only probes → `HostProfile` → real commands, exit 0 in ~120 ms, including `logcat`,
 > which only works because the probe spot-checks for it. **No node binary exists yet** (the
@@ -227,7 +227,7 @@ Both crates are plain Rust libraries with no platform-specific code, so they bui
 
 ```bash
 cargo build                                        # build
-cargo test                                         # 595 tests (Android unit 411 + contract 86 + contract integration 27 + rule conformance 43 + real-process 13 + device ground truth 15)
+cargo test                                         # 598 tests (Android unit 414 + contract 86 + contract integration 27 + rule conformance 43 + real-process 13 + device ground truth 15)
 cargo clippy --all-targets -- -D warnings          # upstream CI convention; must be warning-free
 cargo fmt --check
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps      # every doc link must resolve

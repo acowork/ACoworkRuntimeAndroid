@@ -69,7 +69,7 @@ use crate::host::{
     HostProfile, SNAPSHOT_STORE_BUDGET_BYTES, SnapshotStore, WRITE_LOCK_TTL, chain, derive_claims,
     evidence, lookup,
 };
-use acowork_platform_contract::{CapabilityClaim, HostCapability};
+use acowork_platform_contract::{Budget, CapabilityClaim, HostCapability};
 
 /// Where a bounded number stops being a preference.
 ///
@@ -608,6 +608,19 @@ impl HostConfig {
         self.budgets.output_cap_bytes as usize
     }
 
+    /// The budget to hand a backend as its default.
+    ///
+    /// This is what makes the two rows above real rather than decorative. A backend applies it
+    /// to any request whose author did not name a budget — which includes every command the port
+    /// builds for itself, the snapshot capture and the restore among them — so the operator's
+    /// number reaches the process that gets killed by it.
+    pub fn budget(&self) -> Budget {
+        Budget {
+            timeout: Some(self.command_timeout()),
+            output_cap: self.output_cap(),
+        }
+    }
+
     /// Create the runtime's own directories and build the objects the settings name.
     ///
     /// Directories are created now rather than lazily. A snapshot store whose directory is
@@ -630,6 +643,7 @@ impl HostConfig {
             audit,
             snapshots,
             evidence_dir,
+            default_budget: self.budget(),
         })
     }
 
@@ -648,12 +662,16 @@ impl HostConfig {
     ///
     /// ```ignore
     /// let prepared = config.prepare(&root)?;
-    /// let chain = prepared.chain(Arc::new(RootShellBackend::new(profile)?));
+    /// let backend = RootShellBackend::new(profile)?
+    ///     .with_default_budget(prepared.default_budget);
+    /// let chain = prepared.chain(Arc::new(backend));
     /// ```
     pub fn assemble(&self, profile: HostProfile, root: &Path) -> Result<Assembly, AssemblyError> {
         let prepared = self.prepare(root)?;
-        let backend: Arc<dyn ExecutionBackend> =
-            Arc::new(crate::host::backends::ShellBackend::new(profile)?);
+        let backend: Arc<dyn ExecutionBackend> = Arc::new(
+            crate::host::backends::ShellBackend::new(profile)?
+                .with_default_budget(prepared.default_budget),
+        );
         let reversible = prepared.chain(backend);
         Ok(Assembly {
             reversible,
@@ -750,6 +768,12 @@ pub struct PreparedHost {
     pub snapshots: SnapshotStore,
     /// Where evidence captures land.
     pub evidence_dir: PathBuf,
+    /// The default command budget, for the backend the caller builds.
+    ///
+    /// Carried here rather than read off the config at the call site so that a node which
+    /// chooses its own inner backend — the privileged tier, or an adb-driven harness — cannot
+    /// assemble a chain that ignores the operator's timeout.
+    pub default_budget: Budget,
 }
 
 impl PreparedHost {
@@ -787,6 +811,8 @@ impl fmt::Debug for Assembly {
             .field("audit", &self.prepared.audit.path())
             .field("audit_cap", &self.prepared.audit.max_bytes())
             .field("evidence", &self.prepared.evidence_dir)
+            .field("command_timeout", &self.prepared.default_budget.timeout)
+            .field("output_cap", &self.prepared.default_budget.output_cap)
             .finish()
     }
 }
@@ -807,6 +833,8 @@ mod tests {
         ApprovalToken, Capability, ExecRecord, ExecRequest, HostProfile, HostProfileName,
         ShellDialect,
     };
+    use crate::host::{PLATFORM, android_vocabulary};
+    use acowork_platform_contract::CapabilityTable;
     use acowork_platform_contract::HostCapability;
 
     /// A directory per test, removed first: `prepare` creates, and a leftover file from a
@@ -828,6 +856,22 @@ mod tests {
         SEQ.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Re-derive the declared table after mutating the facts.
+    ///
+    /// `HostProfile::assemble` does this itself; a fixture that changes the facts afterwards has
+    /// to, or the profile would declare nothing and every backend built from it would refuse at
+    /// `check_declared` — which is the behaviour, not a quirk to design around.
+    fn declare_from_facts(profile: &mut HostProfile) {
+        let mut table = CapabilityTable::new(PLATFORM, android_vocabulary()).unwrap();
+        let claims = derive_claims(profile);
+        let _ = acowork_platform_contract::audit_claims(
+            &mut table,
+            &claims,
+            Duration::from_secs(u64::MAX / 2),
+        );
+        profile.caps = table;
+    }
+
     /// A device with a working shell and one writable root that is not our own package.
     ///
     /// Built by mutating the empty probe rather than writing a twenty-field literal: the point
@@ -844,6 +888,7 @@ mod tests {
             writable: true,
             own_package: false,
         });
+        declare_from_facts(&mut profile);
         profile
     }
 
@@ -862,6 +907,7 @@ mod tests {
         // enforcing, and an unknown verity state counts as enforcing (§2 item 10).
         profile.device.verity = VerityState::NotEnforcing;
         profile.selinux = SelinuxState::Enforcing;
+        declare_from_facts(&mut profile);
         profile
     }
 
@@ -1316,6 +1362,45 @@ mod tests {
         assert!(HostConfig::from_json(r#"{ "evidence": { "logcat_tail_lines": 0 } }"#).is_ok());
     }
 
+    /// A runner that answers like a shell and keeps every invocation it was handed.
+    #[derive(Clone)]
+    struct Recorder(Arc<std::sync::Mutex<Vec<crate::host::SpawnInvocation>>>);
+
+    impl Recorder {
+        fn new() -> Recorder {
+            Recorder(Arc::new(std::sync::Mutex::new(Vec::new())))
+        }
+        fn last(&self) -> crate::host::SpawnInvocation {
+            self.0
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .expect("one invocation")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::host::SpawnRunner for Recorder {
+        async fn spawn(
+            &self,
+            invocation: crate::host::SpawnInvocation,
+        ) -> Result<crate::host::RawOutput, crate::host::SpawnError> {
+            let nonce = crate::host::script::nonce_of(&invocation.script)
+                .unwrap_or_default()
+                .to_string();
+            self.0.lock().unwrap().push(invocation);
+            Ok(crate::host::RawOutput {
+                exit_code: Some(0),
+                stdout: format!("{nonce}\t2000\tu:r:shell:s0\t{nonce}\n").into_bytes(),
+                stderr: Vec::new(),
+                truncated: false,
+                timed_out: false,
+                duration: Duration::from_millis(1),
+            })
+        }
+    }
+
     // ── assembly ─────────────────────────────────────────────────────────────
 
     #[test]
@@ -1473,6 +1558,74 @@ mod tests {
             config.assemble(shell_profile(), &root),
             Err(AssemblyError::Config(_))
         ));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn the_command_timeout_in_the_settings_is_the_one_that_kills_the_child() {
+        // Without this, "命令超时 30 s" is a row on a screen and nothing else. The value has to
+        // reach the process that gets killed — including for the commands the port builds for
+        // itself, which is why the substitution happens in the backend and not at a call site.
+        let mut config = HostConfig::defaults();
+        config.timing.command_timeout_secs = 120;
+        config.budgets.output_cap_bytes = 3 * MIB;
+
+        let seen = Recorder::new();
+        let backend =
+            crate::host::backends::ShellBackend::with_runner(shell_profile(), seen.clone())
+                .unwrap()
+                .with_default_budget(config.budget());
+        backend
+            .exec(ExecRequest::read("getprop ro.build.type", "s-1"))
+            .await
+            .unwrap();
+
+        let invocation = seen.last();
+        assert_eq!(invocation.timeout, Some(Duration::from_secs(120)));
+        assert_eq!(invocation.output_cap, 3 * MIB as usize);
+    }
+
+    #[tokio::test]
+    async fn a_caller_that_named_a_budget_is_not_overruled_by_the_screen() {
+        // `evidence::capture` asks for 300 s for a measured reason. Capping it back to the
+        // operator's default would turn a settings value into a silent refusal to collect the
+        // thing the settings were opened to allow.
+        let mut config = HostConfig::defaults();
+        config.timing.command_timeout_secs = 5;
+        config.budgets.output_cap_bytes = 4 * KIB;
+
+        let seen = Recorder::new();
+        let backend =
+            crate::host::backends::ShellBackend::with_runner(shell_profile(), seen.clone())
+                .unwrap()
+                .with_default_budget(config.budget());
+        let mut request = ExecRequest::read("logcat -d", "s-1");
+        request.budget = Budget {
+            timeout: Some(Duration::from_secs(300)),
+            output_cap: 4 * MIB as usize,
+        };
+        backend.exec(request).await.unwrap();
+
+        let invocation = seen.last();
+        assert_eq!(invocation.timeout, Some(Duration::from_secs(300)));
+        assert_eq!(invocation.output_cap, 4 * MIB as usize);
+    }
+
+    #[test]
+    fn prepare_carries_the_budget_for_a_backend_the_caller_builds() {
+        // The privileged tier is not assembled here (rule 1), so the number has to travel with
+        // the prepared host — otherwise the documented root path quietly runs on the port default.
+        let root = tempdir("budget-prepare");
+        let mut config = HostConfig::defaults();
+        config.timing.lock_ttl_secs = 90;
+        let prepared = config.prepare(&root).unwrap();
+        assert_eq!(
+            prepared.default_budget.timeout,
+            Some(DEFAULT_READ_TIMEOUT),
+            "the command timeout, not the lock TTL, is what bounds a command"
+        );
+        assert_eq!(prepared.default_budget.output_cap, DEFAULT_OUTPUT_CAP);
+        assert_eq!(config.lock_ttl(), Duration::from_secs(90));
         std::fs::remove_dir_all(&root).ok();
     }
 

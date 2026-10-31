@@ -54,6 +54,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use acowork_platform_contract::Budget;
 use async_trait::async_trait;
 
 use super::backend::{BackendError, ExecRecord, ExecRequest, ExecutionBackend};
@@ -234,53 +235,91 @@ fn check_declared(profile: &HostProfile, request: &ExecRequest) -> Result<(), Ba
     })
 }
 
-/// Assemble, run, and record — the part every shell backend does identically.
+/// Everything about the *backend* that running one script needs.
 ///
-/// `helper` names the privileged program when the invocation goes through one (`Some("su")`),
-/// which changes only how a failure to *start* is classified: "no `su` here" is a fact about
-/// the device's privilege model, while "no `bash` here" is this backend being broken. The
-/// caller must be able to tell them apart, because the first is answered by installing a
-/// superuser app and the second by fixing the profile.
-async fn run_script<R: SpawnRunner>(
-    runner: &R,
-    profile: &HostProfile,
-    request: &ExecRequest,
+/// These were positional arguments until the operator's budget joined them, at which point
+/// `run_script` took eight and clippy was right that the list had stopped describing a call and
+/// started describing a struct. The split is not cosmetic: every field here is fixed by the
+/// backend for the life of the call, and the one thing that varies per command is the
+/// [`ExecRequest`]. Naming that pair is what makes the choke point readable.
+struct DeviceRun<'a, R: SpawnRunner> {
+    runner: &'a R,
+    profile: &'a HostProfile,
+    base_env: &'a BTreeMap<String, String>,
+    /// The budget a request gets when its author did not name one — the operator's, once a
+    /// settings document is in play. See [`effective_budget`].
+    default_budget: Budget,
+    /// The program to exec. Always an absolute path: the child's environment is cleared, so a
+    /// bare name may not resolve at all.
     file: PathBuf,
-    args: &[&str],
-    base_env: &BTreeMap<String, String>,
-    helper: Option<&str>,
-) -> Result<ExecRecord, BackendError> {
-    // Content before mechanism: the script is checked against the capability it claims
-    // *before* anything is assembled or spawned, so a mislabelled request never reaches the
-    // device. This is the one choke point every shell backend goes through.
-    if let Err(refusal) = commands::check(&request.script, request.android_capability()) {
-        return Err(BackendError::Refused {
-            reason: refusal.to_string(),
-            kind: refusal.kind(),
-        });
+    /// argv. Never contains the script, which goes to stdin.
+    args: Vec<String>,
+    /// Names the privileged program when the invocation goes through one (`Some("su")`), which
+    /// changes only how a failure to *start* is classified: "no `su` here" is a fact about the
+    /// device's privilege model, while "no `bash` here" is this backend being broken. The caller
+    /// must be able to tell them apart, because the first is answered by installing a superuser
+    /// app and the second by fixing the profile.
+    helper: Option<&'a str>,
+}
+
+impl<R: SpawnRunner> DeviceRun<'_, R> {
+    /// Assemble, run, and record.
+    async fn exec(&self, request: &ExecRequest) -> Result<ExecRecord, BackendError> {
+        // Content before mechanism: the script is checked against the capability it claims
+        // *before* anything is assembled or spawned, so a mislabelled request never reaches the
+        // device. This is the one choke point every shell backend goes through.
+        if let Err(refusal) = commands::check(&request.script, request.android_capability()) {
+            return Err(BackendError::Refused {
+                reason: refusal.to_string(),
+                kind: refusal.kind(),
+            });
+        }
+
+        // Then the device. Order matters for the log rather than for safety: a hard-banned script
+        // stays classified as banned even on a tier that would never have run it, because
+        // "someone reached for a partition-destroying command" and "someone reached for a write
+        // tier this phone does not have" are different things to be counting.
+        check_declared(self.profile, request)?;
+
+        let prepared = script::prepare(&request.script, request.cwd.as_deref(), &request.env)
+            .map_err(|e| BackendError::Backend(e.to_string()))?;
+
+        let mut invocation = SpawnInvocation::new(self.file.clone(), prepared.text);
+        invocation.args = self.args.clone();
+        invocation.env = self.base_env.clone();
+        // The budget the *device* sees. A request that still carries the port's default means its
+        // author did not choose — which is the case for every command the port builds for itself,
+        // including a snapshot capture and a restore — and those are exactly the ones an
+        // operator's settings have to reach. A caller that named numbers keeps them:
+        // `evidence::capture` asks for 300 s for a measured reason, and quietly capping it back
+        // to the screen's 30 s would be a setting overriding an intention.
+        let budget = effective_budget(&request.budget, &self.default_budget);
+        invocation.output_cap = budget.output_cap;
+        invocation.timeout = budget.timeout;
+
+        let raw = self
+            .runner
+            .spawn(invocation)
+            .await
+            .map_err(|e| classify_spawn_failure(e, self.helper))?;
+
+        Ok(to_record(raw, &prepared.nonce))
     }
+}
 
-    // Then the device. Order matters for the log rather than for safety: a hard-banned script
-    // stays classified as banned even on a tier that would never have run it, because
-    // "someone reached for a partition-destroying command" and "someone reached for a write
-    // tier this phone does not have" are different things to be counting.
-    check_declared(profile, request)?;
-
-    let prepared = script::prepare(&request.script, request.cwd.as_deref(), &request.env)
-        .map_err(|e| BackendError::Backend(e.to_string()))?;
-
-    let mut invocation = SpawnInvocation::new(file, prepared.text);
-    invocation.args = args.iter().map(|a| (*a).to_string()).collect();
-    invocation.env = base_env.clone();
-    invocation.output_cap = request.budget.output_cap;
-    invocation.timeout = request.budget.timeout;
-
-    let raw = runner
-        .spawn(invocation)
-        .await
-        .map_err(|e| classify_spawn_failure(e, helper))?;
-
-    Ok(to_record(raw, &prepared.nonce))
+/// Which budget actually runs: the caller's, or the operator's when the caller took the default.
+///
+/// Equality against [`default_budget`] is the test for "nobody chose", and the collision it
+/// allows is deliberate and harmless: a caller who explicitly asks for exactly the port default
+/// on a device whose operator changed it gets the operator's number. The reverse — a request
+/// carrying a chosen budget being overwritten — is the failure mode that would silently truncate
+/// an evidence dump, so it is the direction this refuses.
+fn effective_budget(requested: &Budget, default_budget: &Budget) -> Budget {
+    if requested == &crate::host::backend::default_budget() {
+        *default_budget
+    } else {
+        *requested
+    }
 }
 
 fn classify_spawn_failure(error: SpawnError, helper: Option<&str>) -> BackendError {
@@ -338,6 +377,7 @@ pub struct ShellBackend<R = ProcessSpawnRunner> {
     runner: R,
     shell: ShellChoice,
     base_env: BTreeMap<String, String>,
+    default_budget: Budget,
 }
 
 impl ShellBackend<ProcessSpawnRunner> {
@@ -371,7 +411,19 @@ impl<R: SpawnRunner> ShellBackend<R> {
             runner,
             shell,
             base_env,
+            default_budget: crate::host::backend::default_budget(),
         })
+    }
+
+    /// The budget a request gets when it did not name one.
+    ///
+    /// Set this from the operator's settings
+    /// ([`HostConfig::budget`](crate::host::config::HostConfig::budget)) rather than leaving the
+    /// port default: a screen that offers "command timeout" and is not wired to the value the
+    /// child is killed by is a screen with a dead control on it.
+    pub fn with_default_budget(mut self, budget: Budget) -> Self {
+        self.default_budget = budget;
+        self
     }
 
     /// The absolute path this backend execs.
@@ -406,15 +458,16 @@ impl<R: SpawnRunner> ExecutionBackend for ShellBackend<R> {
     async fn exec(&self, request: ExecRequest) -> Result<ExecRecord, BackendError> {
         // `-s`: read the script from stdin. It also makes the body unambiguous — without it a
         // script whose first line begins with `-` would be parsed as an option.
-        run_script(
-            &self.runner,
-            &self.profile,
-            &request,
-            self.shell.path.clone(),
-            &["-s"],
-            &self.base_env,
-            None,
-        )
+        DeviceRun {
+            runner: &self.runner,
+            profile: &self.profile,
+            base_env: &self.base_env,
+            default_budget: self.default_budget,
+            file: self.shell.path.clone(),
+            args: vec!["-s".to_string()],
+            helper: None,
+        }
+        .exec(&request)
         .await
     }
 }
@@ -450,6 +503,7 @@ pub struct RootShellBackend<R = ProcessSpawnRunner> {
     /// is overridable rather than hardcoded, and why confirming it is a device-harness item.
     su_args: Vec<String>,
     base_env: BTreeMap<String, String>,
+    default_budget: Budget,
 }
 
 impl RootShellBackend<ProcessSpawnRunner> {
@@ -497,12 +551,22 @@ impl<R: SpawnRunner> RootShellBackend<R> {
 
         Ok(RootShellBackend {
             shell: profile.paths.system_sh.clone(),
+            default_budget: crate::host::backend::default_budget(),
             profile,
             runner,
             su,
             su_args: Vec::new(),
             base_env: root_base_env(),
         })
+    }
+
+    /// The budget a request gets when it did not name one.
+    ///
+    /// Same contract as [`ShellBackend::with_default_budget`], and the same reason: a restore
+    /// that runs as root is the command least able to fail for a reason nobody configured.
+    pub fn with_default_budget(mut self, budget: Budget) -> Self {
+        self.default_budget = budget;
+        self
     }
 
     /// Override the `su` argument vector, for an implementation that does not speak `-c`.
@@ -565,15 +629,16 @@ impl<R: SpawnRunner> ExecutionBackend for RootShellBackend<R> {
         let argv = self.su_argv();
         let args: Vec<&str> = argv.iter().map(String::as_str).collect();
 
-        let record = run_script(
-            &self.runner,
-            &self.profile,
-            &request,
-            self.su.clone(),
-            &args,
-            &self.base_env,
-            Some("su"),
-        )
+        let record = DeviceRun {
+            runner: &self.runner,
+            profile: &self.profile,
+            base_env: &self.base_env,
+            default_budget: self.default_budget,
+            file: self.su.clone(),
+            args: args.iter().map(|a| (*a).to_string()).collect(),
+            helper: Some("su"),
+        }
+        .exec(&request)
         .await?;
 
         if record.uid == Some(0) {

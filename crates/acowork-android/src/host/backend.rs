@@ -94,6 +94,22 @@ pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// a backend that streams through it cannot forget.
 pub const DEFAULT_OUTPUT_CAP: usize = 1 << 20;
 
+/// The budget a request carries when its creator did not choose one.
+///
+/// A function with two consumers rather than two literals in two places: [`ExecRequest::new`]
+/// stamps it, and a backend compares against it to tell "nobody thought about this" apart from
+/// "the caller named these numbers". That distinction is what lets an operator's settings
+/// ([`HostConfig::budget`](crate::host::config::HostConfig::budget)) apply to the port's own
+/// internal requests — the capture and the restore built inside
+/// [`ReversibleBackend`](crate::host::rollback::ReversibleBackend) — without overruling a
+/// caller that deliberately asked for something else, which is what an evidence capture does.
+pub fn default_budget() -> Budget {
+    Budget {
+        timeout: Some(DEFAULT_READ_TIMEOUT),
+        output_cap: DEFAULT_OUTPUT_CAP,
+    }
+}
+
 /// Opaque proof that a human approved one specific action this session.
 ///
 /// Carries no payload the backend interprets: the gate checks presence and the approval
@@ -161,10 +177,7 @@ impl ExecRequest {
             script: script.into(),
             cwd: None,
             env: BTreeMap::new(),
-            budget: Budget {
-                timeout: Some(DEFAULT_READ_TIMEOUT),
-                output_cap: DEFAULT_OUTPUT_CAP,
-            },
+            budget: default_budget(),
             capability: capability.id(),
             approval_token: None,
             rollback_plan: None,

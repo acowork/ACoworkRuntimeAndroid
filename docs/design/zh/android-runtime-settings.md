@@ -177,6 +177,27 @@
 | **`ReversibleBackend` 组装点**（P3 未决项之一） | ✅ `chain::wrap_with_store` + `PreparedHost::chain`；`assemble()` 给 shell 档 |
 | 档位不由配置决定 | ✅ `assemble()` 只建 shell backend；root 档需调用方显式经 `PreparedHost::chain` |
 | 设置文档不含 dangerous-mode 的结构性保证 | ✅ `the_document_has_no_way_to_persist_dangerous_mode` |
+| **超时与输出上限真正落到执行点** | ✅ `run_script` 的 `effective_budget()`：请求仍带端口默认值时替换为操作者的值，调用方明确写过的不动 |
+
+**最后一行是本轮踩到的坑，值得单独记。** `HostConfig` 刚写完时，`command_timeout_secs` 与
+`output_cap_bytes` 有默认值、有边界、有测试——但没有任何地方读它们：`ExecRequest::new` 在
+`backend.rs:164` 自己塞了 `DEFAULT_READ_TIMEOUT`/`DEFAULT_OUTPUT_CAP`，而**端口自己生成的请求**
+（快照捕获、会话结束的 restore，见 `rollback.rs:1825`/`:1886`）全都走这条默认路径。
+也就是说界面上那两行是死控件，而且是最坏的一种死法：看起来生效、测试全绿、真机上 30 秒就把
+restore 杀了。
+
+修法不是"让调用方记得传"。调用方包括端口自己，而端口内部的请求不可能每一处都改成读配置——
+那正是"策略没人咨询就是撒谎的设置项"的成因。落点选在 `run_script`（每个 shell backend 唯一的
+必经路径），判据是"请求带的还是不是端口默认预算"：
+
+- 是 → 用操作者的值。覆盖端口内部所有请求，包括捕获与恢复。
+- 不是 → 保留调用方的值。`evidence::capture` 明确要 300 s（实测 bugreport 1 m 44 s），
+  把它压回界面里的 30 s 等于让一个设置静默拒绝它本来被打开来允许的事。
+
+两个方向各有一个测试钉住：`the_command_timeout_in_the_settings_is_the_one_that_kills_the_child`
+（断言的是 `SpawnInvocation.timeout`——真到孩子身上的那个数）与
+`a_caller_that_named_a_budget_is_not_overruled_by_the_screen`。
+已知可接受的碰撞：调用方显式选了恰好等于端口默认的值、而操作者改过它时，操作者的值生效。
 | CLI flag 接线（`--host-config <file>`） | ⬜ 属上游 node crate，与 `NodeConfig` 一并做 |
 | APK 设置界面本体 | ⬜ 需 B4 产品对齐（与 `apps/acowork-mobile` 的形态关系） |
 
