@@ -56,6 +56,7 @@ pub mod audit;
 pub mod backend;
 pub mod backends;
 pub mod capability;
+pub mod catalog;
 pub mod chain;
 pub mod commands;
 pub mod config;
@@ -86,6 +87,10 @@ pub use backend::{
 pub use backends::{AppSandboxBackend, RootShellBackend, ShellBackend};
 pub use capability::{
     Capability, PLATFORM, android_vocabulary, derive_claims, explain_absence, lookup,
+};
+pub use catalog::{
+    CapabilityOption, SettingGroup, SettingKind, SettingSpec, capability_options,
+    capability_options_for, catalog, catalog_in,
 };
 pub use chain::{root_shell, shell, shell_with_runner, wrap, wrap_with_store};
 pub use commands::{

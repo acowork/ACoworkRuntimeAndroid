@@ -27,6 +27,10 @@
 
 ## 2. 现状盘点
 
+> **本节是实现前的盘点，保留的是判定理由，不是当前的行清单。** 权威清单由代码生成，见
+> §3.1；两处若不一致，以 §3.1 为准——它不可能和 `HostConfig` 的字段集合不一致，因为
+> `catalog.rs::the_document_and_the_screen_have_the_same_rows` 会失败。
+
 "性质"一列区分**测量值**（数字来自某台真机的某个观察）与**口味值**（没人测量过它）。
 测量值可以被调小（用户有权少留），但把它调大往往意味着"这台设备给不了"，所以要有上界。
 
@@ -103,7 +107,7 @@
 
 ## 3. 设置界面草图
 
-四组，一共 13 行可编辑 + 一段只读的设备事实。没有"高级设置"折叠层——上面盘点的
+五组，一共 17 行可编辑 + 一段只读的设备事实。没有"高级设置"折叠层——上面盘点的
 不可开放项，界面上根本不出现，而不是灰掉（灰掉会引发"怎么开"的追问，而答案是不该开）。
 
 ```
@@ -131,6 +135,45 @@
 
 远程驱动（默认折叠）    adb 路径  ______            设备序列号  ______
 ```
+
+### 3.1 行清单（生成，权威）
+
+下面这张表不是手写的，是 `cargo run -q -p acowork-android --example settings_catalog` 的输出。
+它存在的理由很具体：本文件的 §2 与 §3 都是手抄的，而手抄会烂——草图里"一共 13 行"写下时是 13 行，
+实现把 `logcat_tail_lines`、`device_files` 各自成为一行后就是 17 行，没有任何测试会因为这句话过时而失败。
+
+行清单本身是被测试钉住的：`HostConfig` 新增一个字段而 `catalog.rs` 没加行，
+`the_document_and_the_screen_have_the_same_rows` 失败；反过来加一行而文档里没有对应字段，同一条测试也失败。
+每行的可设范围取自 `HostConfig::validate` 用的同一组常量，所以滑条不会给出保存按钮随后拒绝的值
+（`a_row_never_offers_a_value_the_validator_would_reject`）。默认值是从活的默认文档里读回来的，
+不是第二次抄写。
+
+| 设置项 | 默认 | 可设范围 | 说明 |
+|---|---|---|---|
+| **运行时自己的文件** | | | |
+| `storage.snapshot_subdir` | snapshots | a directory name | Where pre-write backups of files live. Needs room for the store budget below; a device out of space cannot undo its last write. |
+| `storage.audit_subdir` | audit | a directory name | Where the record of every command that ran is kept. This is the file that answers what the agent did after the fact. |
+| `storage.evidence_subdir` | evidence | a directory name | Where captured screenshots, logs and bugreports are written before they are collected. |
+| **容量上限** | | | |
+| `budgets.snapshot_store_bytes` | 8 MiB | 64 KiB – 1024 MiB | Total size of the backups kept for one session. Oldest entries are dropped when it fills, and a dropped backup means a write that can no longer be undone. |
+| `budgets.audit_file_bytes` | 1 MiB | 32 KiB – 256 MiB | How large the audit file grows before it rotates. Small enough to keep the phone usable, large enough that one day of commands is not lost. |
+| `budgets.evidence_budget_bytes` | 4 MiB | 256 KiB – 512 MiB | The largest single capture. A bugreport is tens of megabytes and leaves the phone; this is the number that decides how much of it is kept. |
+| `budgets.output_cap_bytes` | 1 MiB | 4 KiB – 64 MiB | How much of one command's output reaches the model. Raising it costs context; lowering it truncates what the agent can see. |
+| **时间上限** | | | |
+| `timing.command_timeout_secs` | 30 | 1 – 600 s | How long one command may run before the child is killed. Slow devices and long restores need more than the default; the undo at session end obeys this too. |
+| `timing.lock_ttl_secs` | 600 | 30 – 3600 s | How long a write session holds the device exclusive without renewing. Two agents writing at once is the failure this prevents. |
+| `timing.bugreport_timeout_secs` | 300 | 30 – 900 s | How long to wait for a full bugreport. It is measured in minutes on a real phone; below the device's own time the capture always fails. |
+| **可执行的证据采集** | | | |
+| `evidence.screenshot` | true | on / off | Capture what is on the display. Whatever is on screen — a message, a code, a face — is in the image. |
+| `evidence.logcat` | true | on / off | Capture the system log. Logs routinely contain other apps' data and tokens. |
+| `evidence.logcat_tail_lines` | 200 | 0 – 100000 | How much log to keep when the caller did not ask for a specific window. `0` means the whole buffer, which is the largest thing on this screen. |
+| `evidence.dumpsys` | true | on / off | Capture `dumpsys` output for one system service: window lists, package state, battery history. |
+| `evidence.device_files` | false | on / off | Bring back a file that already exists on the device. Off by default: those paths are other processes' crash stacks and other tools' scratch, and reading one is a privacy event even when nothing needs to be approved for it. |
+| `evidence.bugreport` | false | on / off | Off by default. This is the whole phone in one zip: every log, every dropped notification, the radio state, the account list. It is also the slowest thing on this screen. |
+| **允许被请求的能力** | | | |
+| `capability_ceiling` | android:shell:read,android:shell:write,android:fs:outside-app | a list of capability ids | What this runtime may be granted. The device decides what is *possible*; this list only ever narrows it, so unchecking a row can refuse work but never permit any more than an unmodified device would. |
+
+共 17 行。本表由 `cargo run -q -p acowork-android --example settings_catalog` 生成，「说明」列是代码里的原文，APK 按 `id` 本地化。行集合与 `HostConfig` 的字段集合由测试钉在一起（`catalog.rs::the_document_and_the_screen_have_the_same_rows`）；默认值是从活的文档里读回来的，可设范围与 `HostConfig::validate` 用的是同一组常量，所以这张表不可能和运行时的实际值不一致。
 
 **"设备（只读）"那一段是界面最重要的部分**：它把"设备不具备"和"你关掉了"分开说。
 `HostConfig::blocked_by_settings()` 就是为这一行存在的——它列出设备已挣到但被上限关掉的能力，
@@ -179,6 +222,9 @@
 | 设置文档不含 dangerous-mode 的结构性保证 | ✅ `the_document_has_no_way_to_persist_dangerous_mode` |
 | **超时与输出上限真正落到执行点** | ✅ `run_script` 的 `effective_budget()`：请求仍带端口默认值时替换为操作者的值，调用方明确写过的不动 |
 | 设置文档的读写闭环 | ✅ `HostConfig::load(root)` / `save(root)`，固定文件名 `settings.json`；`load` 返回 `LoadSource`（文件 or 默认），界面必须显示是哪一种 |
+| 证据预算 / bugreport 等待 / 来源开关落到采集点 | ✅ `EvidenceLimits` + `PreparedHost::capture()`：开关关掉的来源**一条命令都不发**，返回 `CaptureError::NotAllowed` 并指名是哪一行设置 |
+| 界面行清单由代码生成 | ✅ `host/catalog.rs` + `examples/settings_catalog.rs`；17 行，双向钉死（缺行、多行、范围漂移都会失败） |
+| 能力行带"设备不具备 / 你关掉了"两种缺席 | ✅ `capability_options_for(profile)`：`supported` 来自 `derive_claims`，缺席理由来自 `explain_absence`，与运行时拒绝请求时用的是同一个函数 |
 
 **`load` 的不对称是有意设计的**：文件不存在 → 默认值；文件存在但读不动 → **报错，绝不回落到默认值**。
 前者是首次开机，没人做过任何决定，默认值就是诚实答案。后者是操作者已经把快照预算调到 512 MiB，
@@ -232,7 +278,9 @@ gateway host/port、token、name、proxy/LSP 端口、日志轮转）。**本端
    **配置面**，不预设答案——`HostConfig` 是纯 Rust 类型，两种形态都能消费（JNI 侧一次
    `to_json`/`from_json` 即可）。
 2. **界面语言与文案**：`ConfigError.reason` 现在是英文（与端口其余诊断文本一致）。设置界面若做
-   中文，需要一份 reason → 文案的映射表，而不是把中文塞进库。
+   中文，需要一份 reason → 文案的映射表，而不是把中文塞进库。行清单同理：`SettingSpec.help` 是
+   代码原文，APK 按 `SettingSpec.id`（点号路径）做本地化键——`id` 就是两半之间的契约，
+   `the_catalog_is_serialisable_for_the_apk_to_render` 钉住了它的字段名。
 3. **预算的"当前用量"读数**：✅ 已有——`SnapshotStore::used_bytes()` 与
    `FileAuditSink::used_bytes()` 都是从文件系统读，不是内存计数；轮换丢行时二者才会不一致。
    界面可直接显示"快照已用 3.2 MiB / 8 MiB"。
