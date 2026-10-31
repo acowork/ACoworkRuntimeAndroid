@@ -1939,6 +1939,51 @@ fn effect_of(head: &str, args: &[String], expandable: bool) -> Finding {
         return Finding::new(head, Effect::ReadOnly, "lists mounts");
     }
 
+    // `ip` sits in the write vocabulary by name, and most of that is right — `ip link set eth0
+    // down` takes the interface away. But its report shapes were measured on the BLA-AL00 at uid
+    // 2000 as plain reads: `ip addr show`, `ip route show` and `ip link` each printed state and
+    // changed nothing. The word after the object decides which of the two this call is.
+    //
+    // Only the objects whose every listing form is a read are exempted, and everything else —
+    // `ip -4 route add`, `ip neigh replace`, an object this port does not know — keeps the tier
+    // the name already carries.
+    if head == "ip" {
+        const OBJECTS: &[&str] = &[
+            "addr", "address", "a", "route", "r", "link", "l", "neigh", "n", "rule",
+        ];
+        const REPORTS: &[&str] = &["show", "list", "get", "help"];
+        let words: Vec<&str> = args
+            .iter()
+            .map(|a| a.as_str())
+            .filter(|a| !a.starts_with('-'))
+            .collect();
+        if matches!(words.first().copied(), Some(object) if OBJECTS.contains(&object)) {
+            match words.get(1).copied() {
+                None => {
+                    return Finding::new(
+                        head,
+                        Effect::ReadOnly,
+                        "reports addresses, routes, links or neighbours",
+                    );
+                }
+                Some(word) if REPORTS.contains(&word) => {
+                    return Finding::new(
+                        head,
+                        Effect::ReadOnly,
+                        "reports addresses, routes, links or neighbours",
+                    );
+                }
+                Some(word) => {
+                    return Finding::new(
+                        format!("ip {} {word}", words[0]),
+                        Effect::ShellWrite,
+                        "changes network configuration — §4.4 puts this behind approval",
+                    );
+                }
+            }
+        }
+    }
+
     // The service dispatchers, where the first argument decides: `pm list packages` reads,
     // `pm install` does not.
     if DISPATCHERS.contains(&head) {
@@ -2513,6 +2558,48 @@ fn dispatcher(head: &str, args: &[String]) -> Finding {
             "read-only subcommand",
         );
     }
+    // `cmd` is a multiplexer, so the first word is a *service* and the verb belongs to the
+    // service: `cmd appops get com.android.shell` asks `get`, and `cmd package list packages`
+    // asks `list`. Both printed state on the BLA-AL00 at uid 2000 while the classifier refused
+    // them for the service's name — the same over-refusal `find` carried, one level up.
+    //
+    // Only `cmd` does this. `pm install` and `settings put` name their own verb first, and
+    // reading a second word there would let `pm install -f /data/x` be excused by an argument.
+    if head == "cmd" {
+        let mut rest = args
+            .iter()
+            .filter(|a| !a.starts_with('-'))
+            .skip(1)
+            .peekable();
+        let Some(verb) = rest.next() else {
+            // `cmd package` on its own prints that service's usage, which is what `pm` with no
+            // subcommand already answers: harmless, and refusing it punishes a caller for asking
+            // for help.
+            return Finding::new(
+                format!("{head} {sub}"),
+                Effect::ReadOnly,
+                "names a service and no verb, which prints that service's usage",
+            );
+        };
+        let verb = verb.to_ascii_lowercase();
+        if READ_SUBCOMMANDS
+            .iter()
+            .any(|prefix| verb.starts_with(prefix))
+        {
+            return Finding::new(
+                format!("{head} {sub} {verb}"),
+                Effect::ReadOnly,
+                "read-only subcommand",
+            );
+        }
+        // A second word that is not a verb either (`cmd appops com.android.shell`) is the
+        // service's own argument, and the service was not a read: it stays where it was.
+        return Finding::new(
+            format!("{head} {sub} {verb}"),
+            Effect::ShellWrite,
+            "is a mutating subcommand — §4.4 puts these behind approval",
+        );
+    }
     Finding::new(
         format!("{head} {sub}"),
         Effect::ShellWrite,
@@ -2607,7 +2694,26 @@ const BANNED_TEXT: &str =
     "it is on the hard-ban list (ADR-AND-001 §4.6 item 3), which no capability authorises";
 
 /// Service tools whose first non-flag argument decides whether anything changes.
-const DISPATCHERS: &[&str] = &["pm", "am", "settings", "cmd", "wm", "svc", "ime", "content"];
+/// The service dispatchers, where the first argument decides: `pm list packages` reads,
+/// `pm install` does not.
+///
+/// `appops` and `deviceidle` are here because both exist as their own binaries on the BLA-AL00
+/// (`/system/bin/appops`, and `cmd deviceidle` for the other) and both take a verb: `appops get
+/// com.android.shell` printed that uid's modes when asked, and `appops set` would have changed
+/// them. Naming the verb is the only difference between them, which is exactly what this list is
+/// for.
+const DISPATCHERS: &[&str] = &[
+    "pm",
+    "am",
+    "settings",
+    "cmd",
+    "wm",
+    "svc",
+    "ime",
+    "content",
+    "appops",
+    "deviceidle",
+];
 
 /// Subcommand prefixes that only report state.
 const READ_SUBCOMMANDS: &[&str] = &[
@@ -4723,6 +4829,72 @@ mod tests {
     fn a_delay_and_the_environment_are_reads() {
         assert_eq!(effect("sleep 2"), Effect::ReadOnly);
         assert_eq!(effect("printenv PATH"), Effect::ReadOnly);
+    }
+
+    /// `cmd` is a multiplexer, so the word after the service is the verb: the classifier used to
+    /// read the service's name as if it were one, which refused `cmd package list packages` and
+    /// `cmd appops get` — both of which printed state on the BLA-AL00 at uid 2000.
+    #[test]
+    fn the_dispatchers_are_read_by_the_verb_and_not_by_the_service_name() {
+        for script in [
+            "cmd appops get com.android.shell",
+            "cmd package list packages",
+            "cmd deviceidle get light",
+            "cmd package",
+            "appops get com.android.shell",
+            "appops query-wake",
+            "deviceidle get light",
+        ] {
+            assert_eq!(effect(script), Effect::ReadOnly, "{script}");
+        }
+        for script in [
+            "cmd appops set com.android.shell SYSTEM_ALERT_WINDOW allow",
+            "cmd package install /data/local/tmp/app.apk",
+            "cmd deviceidle whitelist +com.example",
+            "appops set com.android.shell BOOT_COMPLETED deny",
+            "deviceidle unset +com.example",
+            "pm install /data/local/tmp/app.apk",
+            "settings put system font_scale 1.1",
+        ] {
+            assert_eq!(effect(script), Effect::ShellWrite, "{script}");
+        }
+        // The verb rule is `cmd`'s only, because `cmd` is the one whose first word is a service.
+        // `pm install -f /data/x` must not be excused by a second word that is an argument.
+        assert_eq!(effect("pm list packages"), Effect::ReadOnly);
+        assert_eq!(effect("pm clear com.example"), Effect::ShellWrite);
+    }
+
+    /// `ip` is in the write vocabulary by name and mostly deserves it, but its report shapes were
+    /// measured as plain reads at uid 2000: `ip addr show`, `ip route show` and `ip link` each
+    /// printed state and changed nothing.
+    #[test]
+    fn ip_reports_state_and_ip_changes_it() {
+        for script in [
+            "ip addr show",
+            "ip -4 addr show",
+            "ip addr",
+            "ip route show",
+            "ip link",
+            "ip -s link",
+            "ip neigh",
+            "ip rule list",
+        ] {
+            assert_eq!(effect(script), Effect::ReadOnly, "{script}");
+        }
+        for script in [
+            "ip link set eth0 down",
+            "ip addr add 10.0.0.1/24 dev eth0",
+            "ip route add default via 10.0.0.254",
+            "ip addr flush dev lo",
+            "ip rule add from 10.0.0.0/8",
+            "ip neigh replace 10.0.0.1 lladdr 00:11:22:33:44:55 dev eth0",
+            "ip link add br0 type bridge",
+        ] {
+            assert_eq!(effect(script), Effect::ShellWrite, "{script}");
+        }
+        // An object this port does not model keeps the tier the name already carries — the
+        // exemption is for the four report shapes that were measured, not for `ip` in general.
+        assert_eq!(effect("ip xfrm state"), Effect::ShellWrite);
     }
 
     /// The narrowing that made `awk '{print $1}'` possible at all: a `$` in the middle of a word
