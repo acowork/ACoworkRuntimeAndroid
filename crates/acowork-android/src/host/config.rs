@@ -131,6 +131,31 @@ pub const SUBDIR_MAX: usize = 64;
 /// The name of the audit file inside [`StorageConfig::audit_subdir`].
 pub const AUDIT_FILE_NAME: &str = "audit.jsonl";
 
+/// The settings document's file name under the host's root.
+///
+/// One file, one location, derived the same way for both tiers: there is no "device settings"
+/// and "harness settings" distinction to remember, and therefore no way to edit the wrong one.
+pub const SETTINGS_FILE_NAME: &str = "settings.json";
+
+/// A settings document, and where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Loaded {
+    /// The configuration to run with.
+    pub config: HostConfig,
+    /// Whether it was read or defaulted — which the screen has to show, because "these are the
+    /// defaults, nothing has been saved yet" and "these are your settings" look identical.
+    pub source: LoadSource,
+}
+
+/// Why [`Loaded`] holds what it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadSource {
+    /// Read from this file.
+    File(PathBuf),
+    /// The file does not exist: nobody has chosen anything yet.
+    Defaults,
+}
+
 /// Everything a person may set about this runtime.
 ///
 /// Serialised as JSON so the settings screen and the CLI edit the same document; `deny_unknown_fields`
@@ -448,6 +473,73 @@ impl HostConfig {
     /// The default document, validated.
     pub fn defaults() -> HostConfig {
         HostConfig::default()
+    }
+
+    /// Where the settings document lives under the host's root.
+    pub fn settings_file(root: &Path) -> PathBuf {
+        root.join(SETTINGS_FILE_NAME)
+    }
+
+    /// Read the settings the runtime starts with.
+    ///
+    /// A missing file is defaults; a **broken** file is an error. That asymmetry is the whole
+    /// design of this function. Nobody has saved anything on a first boot, so defaults are the
+    /// honest answer and the screen says so. But an operator who set the snapshot budget to
+    /// 512 MiB and whose file then fails to parse — edited by hand, truncated by a crash,
+    /// written by a newer screen than this runtime — has made decisions this runtime would
+    /// otherwise discard while reporting that it was running their configuration. Starting on
+    /// defaults there is a silent policy change on a device somebody is trusting, which is the
+    /// one thing a settings loader must not do.
+    pub fn load(root: &Path) -> Result<Loaded, ConfigError> {
+        let path = HostConfig::settings_file(root);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match HostConfig::from_json(&text) {
+                Ok(config) => Ok(Loaded {
+                    source: LoadSource::File(path),
+                    config,
+                }),
+                Err(mut err) => {
+                    // A field-level error already names the row the screen has to highlight, so
+                    // it travels as-is. A document-level one ("this is not JSON") is useless
+                    // without saying *which file* the runtime tried to read.
+                    if err.field.is_empty() {
+                        err.reason = format!("`{}`: {}", path.display(), err.reason);
+                    }
+                    Err(err)
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Loaded {
+                source: LoadSource::Defaults,
+                config: HostConfig::default(),
+            }),
+            Err(err) => Err(ConfigError::new(
+                "",
+                format!("`{}` could not be read: {err}", path.display()),
+            )),
+        }
+    }
+
+    /// Write the document under the host's root, creating it if needed.
+    ///
+    /// Validated before writing, because the screen's save button is where an impossible number
+    /// is most likely to be typed and least likely to be noticed: a document that saves today and
+    /// refuses to load tomorrow is a device that comes back on defaults after the next reboot.
+    pub fn save(&self, root: &Path) -> Result<PathBuf, ConfigError> {
+        self.validate()?;
+        let path = HostConfig::settings_file(root);
+        let text = self.to_json()?;
+        std::fs::create_dir_all(root)
+            .and_then(|()| std::fs::write(&path, text))
+            .map_err(|err| {
+                ConfigError::new(
+                    "",
+                    format!(
+                        "the settings could not be written to `{}`: {err}",
+                        path.display()
+                    ),
+                )
+            })?;
+        Ok(path)
     }
 
     /// Reject out-of-bounds settings, path-shaped directory names and unknown capability ids.
@@ -1399,6 +1491,119 @@ mod tests {
                 duration: Duration::from_millis(1),
             })
         }
+    }
+
+    // ── the document on disk ────────────────────────────────────────────────
+
+    #[test]
+    fn a_first_boot_loads_the_defaults_and_says_so() {
+        let root = tempdir("load-empty");
+        let loaded = HostConfig::load(&root).unwrap();
+        assert_eq!(loaded.config, HostConfig::defaults());
+        assert_eq!(loaded.source, LoadSource::Defaults);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_saved_document_comes_back_as_a_file_and_unchanged() {
+        let root = tempdir("load-roundtrip");
+        let mut config = HostConfig::defaults();
+        config.budgets.snapshot_store_bytes = 512 * MIB;
+        config
+            .capability_ceiling
+            .push("android:fs:system".to_string());
+        config.evidence.bugreport = true;
+
+        let written = config.save(&root).unwrap();
+        assert_eq!(written, HostConfig::settings_file(&root));
+        let loaded = HostConfig::load(&root).unwrap();
+        assert_eq!(loaded.config, config);
+        assert_eq!(loaded.source, LoadSource::File(written));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_broken_document_is_an_error_rather_than_a_quiet_return_to_defaults() {
+        // The asymmetry that matters. A device whose operator raised the snapshot budget and
+        // whose file then fails to parse must not boot on 8 MiB while reporting their settings:
+        // that is a silent policy change on a machine somebody is trusting.
+        let root = tempdir("load-broken");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(HostConfig::settings_file(&root), "snapshots = 512MB").unwrap();
+        let err = HostConfig::load(&root).unwrap_err();
+        assert_eq!(err.field, "", "a parse failure is not one row's fault");
+        assert!(
+            err.reason.contains(SETTINGS_FILE_NAME),
+            "a document-level failure has to name the file it tried to read: {}",
+            err.reason
+        );
+
+        // Truncation is the crash shape, and it gets the same treatment.
+        std::fs::write(
+            HostConfig::settings_file(&root),
+            r#"{ "budgets": { "snapshot_store_bytes": "#,
+        )
+        .unwrap();
+        assert!(HostConfig::load(&root).is_err());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_document_that_parses_but_cannot_run_is_refused_on_load() {
+        // Hand-edited, valid JSON, impossible number: the parse is not the check.
+        let root = tempdir("load-invalid");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            HostConfig::settings_file(&root),
+            r#"{ "storage": { "snapshot_subdir": "/data/local/tmp" } }"#,
+        )
+        .unwrap();
+        let err = HostConfig::load(&root).unwrap_err();
+        assert_eq!(err.field, "storage.snapshot_subdir");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_path_that_is_not_a_readable_file_is_not_treated_as_first_boot() {
+        // `NotFound` means nobody saved anything. Anything else — a directory wearing the file's
+        // name, a permission refusal — is a device that has settings it cannot show.
+        let root = tempdir("load-unreadable");
+        std::fs::create_dir_all(HostConfig::settings_file(&root)).unwrap();
+        let err = HostConfig::load(&root).unwrap_err();
+        assert!(err.reason.contains("could not be read"), "{}", err.reason);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn save_refuses_an_impossible_document_before_it_reaches_the_disk() {
+        // The save button is where an impossible number gets typed. Writing it would produce a
+        // file this same runtime refuses to load — a device that comes back on defaults after
+        // the next reboot, which is the failure this function exists to prevent.
+        let root = tempdir("save-invalid");
+        let config = HostConfig {
+            timing: TimingConfig {
+                command_timeout_secs: 0,
+                ..TimingConfig::default()
+            },
+            ..HostConfig::defaults()
+        };
+        let err = config.save(&root).unwrap_err();
+        assert_eq!(err.field, "timing.command_timeout_secs");
+        assert!(
+            !HostConfig::settings_file(&root).exists(),
+            "a refused save must leave no trace"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_save_creates_the_root_it_needs() {
+        // First run on a device where the node's data directory does not exist yet: refusing
+        // here would mean the screen's save button fails before anything has been configured.
+        let root = tempdir("save-creates").join("nested").join("data");
+        HostConfig::defaults().save(&root).unwrap();
+        assert!(HostConfig::settings_file(&root).is_file());
+        std::fs::remove_dir_all(root.parent().unwrap()).ok();
     }
 
     // ── assembly ─────────────────────────────────────────────────────────────

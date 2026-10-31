@@ -178,6 +178,17 @@
 | 档位不由配置决定 | ✅ `assemble()` 只建 shell backend；root 档需调用方显式经 `PreparedHost::chain` |
 | 设置文档不含 dangerous-mode 的结构性保证 | ✅ `the_document_has_no_way_to_persist_dangerous_mode` |
 | **超时与输出上限真正落到执行点** | ✅ `run_script` 的 `effective_budget()`：请求仍带端口默认值时替换为操作者的值，调用方明确写过的不动 |
+| 设置文档的读写闭环 | ✅ `HostConfig::load(root)` / `save(root)`，固定文件名 `settings.json`；`load` 返回 `LoadSource`（文件 or 默认），界面必须显示是哪一种 |
+
+**`load` 的不对称是有意设计的**：文件不存在 → 默认值；文件存在但读不动 → **报错，绝不回落到默认值**。
+前者是首次开机，没人做过任何决定，默认值就是诚实答案。后者是操作者已经把快照预算调到 512 MiB，
+而文件被手工改坏 / 被崩溃截断 / 由更新版本的界面写下——这时若静默回到 8 MiB，
+设备就在"报告正在使用你的配置"的同时悄悄换了策略。**在一个人正信任的设备上静默改策略，
+是配置加载器唯一不能做的事**。同理 `save` 先 `validate()` 再落盘：保存按钮是最可能输入非法值的地方，
+写下去就等于制造一个"本次运行没问题、下次重启后加载失败退回默认值"的设备。
+`a_broken_document_is_an_error_rather_than_a_quiet_return_to_defaults`、
+`a_path_that_is_not_a_readable_file_is_not_treated_as_first_boot`、
+`save_refuses_an_impossible_document_before_it_reaches_the_disk` 分别钉住这三条。
 
 **最后一行是本轮踩到的坑，值得单独记。** `HostConfig` 刚写完时，`command_timeout_secs` 与
 `output_cap_bytes` 有默认值、有边界、有测试——但没有任何地方读它们：`ExecRequest::new` 在
