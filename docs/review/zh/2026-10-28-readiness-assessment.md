@@ -239,8 +239,18 @@ ADR §7.4 只裁定了 `fs:system` 与 `selinux:permissive` 两条需要 owner �
 | 11 | 目的地藏在 flag 里（`cp -t DIR x`），操作数列表只剩源 | 「最后一个操作数是目的地」会把改分区的请求读成写临时文件；`-t` 支持与否是没量过的事实，而拒绝不该等测量 |
 | 12a | `dd` 只认第一个 `of=` | 脚本里写了两个目的地，审批只看见轻的那个 |
 | 12 | 重定向**顶掉**命令自身的写效果 | `sed -i 's/a/b/' /system/build.prop > /data/local/tmp/log` 只按重定向定档，就地改写分区那一半从审批里消失 |
+| 13 | `key=value` / `--flag=value` / 粘连短 flag 里的路径对路径谓词**不可见** | `dd if=/dev/block/mmcblk0`、`grep --file=/proc/1/environ` 判只读免审批——token 不以分隔符开头，三个前缀谓词全部落空；真机验证 `dd if=<文件> of=<文件>` 真的在拷（"4 bytes copied"），是可用路径不是拼写 |
+| 14 | 只认「输出目的地」这一个 flag | `sort -T /system/tmp` 判只读（真机验证 toybox 接受 `-T`，临时文件就写在那儿）；`sort --compress=PROG` 是**第二条命令**，NESTED 表只看命令词所以看不见 |
+| 15 | 命令词之外的执行面没有规则 | `dumpsys SurfaceFlinger --screenshot FILE` 判只读，而 `screencap FILE` 判写——同一个文件两套答案。本机实测该 flag 被忽略（三种拼写都不落文件），规则是为会写的那版建的 |
+| 16 | **读**侧隐私名单是五个家的穷举 | `/data/anr` 在名单外且真机可读（`drwxrwx--x system`，里面一个 root 属 0666 的 trace，`head -c 24` 直接读出别的进程的栈）；名单改成「`/data` 减去本 uid 唯一的 `/data/local/tmp`」 |
+| 17 | 携带敏感内容的操作数**不是路径** | `content query --uri content://sms/` 在本机以 uid 2000 跑出真实短信正文、`content://contacts/people` 跑出真实联系人姓名，分类器答 ReadOnly、§4.4 免审批并记成「读」。前面 16 条规则全都建立在「操作数长得像路径」上，URI 不是路径 |
+| 18 | 用户自己的文件与别的 app 的文件混用一条规则 | `/sdcard`、`/sdcard/DCIM` 以 uid 2000 可列（实测），相册免审批；而 `cp 报告 /sdcard/报告` 是 `fs:outside-app` 这个名字承诺过的写——所以媒体树只进**读**侧名单，且命令自己已定档的目的地不再被当作一次读 |
+| 19 | harness 先跑探针、后跑命令 | §14 每一行都打印 NO-SUCH-FILE，无论设备做了什么——`sort -o` 因此只能靠人手在手机上量，地面实况段落在自己手里变成假测量 |
+| 20 | 端口自己生成的脚本被端口自己的门拒绝 | 包存在性探针写成 `pm path X \| grep -q .`，`.` 是相对路径 → 分类器拒绝 → 每个 `pm install` 的 undo 前置状态都是「未观测」，而那条 undo 是存在的 |
 
 7–12a 是同一个错误的七个面：**分类器把「脚本里出现了一个路径」当成「我知道文件会落到哪」**。源不是目的地，写法不是落点，而设备在内核里替它解析的东西（`..`、变量展开、glob、家目录）端口若不自已解析，就是在让请求的措辞决定它被允许要求什么。四条都是先把断言写出来、看它失败才成立的——读代码只会同意它，不会推翻它。
+
+13–18 是同一个错误的另一面：**把「有一个路径操作数」当成「我知道在读谁的数据」**。前一条的病在写侧，这一条的病在读侧，而读侧更贵——§4.4 免审批，所以错的分类不会变成一次拒绝，只会变成一条写着「read」的日志。17 尤其要记住：它连路径都不是，所以任何按前缀写的规则都不可能命中它。19–20 是同一个纪律的反向用法——测量装置和被测量的门，两者都得被人怀疑一次才可信。
 
 缺陷 2 值得单独记：`fs_roots` 探测的是**非特权**可达范围（probe §2 item 12 只探 `$PREFIX` / `/sdcard` / 自身包目录），**不是** root 可达范围的穷举（README 矩阵写的是「`/data` 大范围」）。因此「路径在 fs_roots 之外」只在**无法提权**的宿主上才等价于「路径错了」。修正后该分支以 `can_escalate` 为前置守卫。
 
@@ -256,7 +266,7 @@ ADR §7.4 只裁定了 `fs:system` 与 `selinux:permissive` 两条需要 owner �
 | P0 | 修正 ADR 日期、把 §7.1/§7.4 标注为待对齐 | 本仓库 | ✅ 已完成 |
 | P1 | 与 mobile app 负责人对齐 B4 的 APK 形态归属 | 需产品 | ⬜ 未开始 |
 | P1 | 回写 probe §3（B8 `dialects`、B12 shell 前置条件）与 §4（B10 ledger） | 本仓库 | ✅ 已完成（2026-10-29） |
-| — | 抽出平台中立契约层，使规则不绑在 Android 上（规避 B3、为第二个端口打样） | 本仓库 | ✅ 已完成 —— [ADR-AND-002](../../adr/zh/ADR-AND-002-platform-contract-layer.md)，完成时 476 测试（现 559） |
+| — | 抽出平台中立契约层，使规则不绑在 Android 上（规避 B3、为第二个端口打样） | 本仓库 | ✅ 已完成 —— [ADR-AND-002](../../adr/zh/ADR-AND-002-platform-contract-layer.md)，完成时 476 测试（现 565） |
 | — | 在真实嵌入式 target 上验证 R12（ESP32-C3 `riscv32imac-unknown-none-elf` 或 `riscv32imac-esp-espidf`） | 本仓库 | ⚠️ 部分 —— 已在更严格的 `riscv32imc`（无原子）上编译通过；`imac` 与 ESP-IDF 的 rust-std 组件下载被网络策略阻断 |
 | P2 | 实现只读档 backend（`ShellBackend` / `RootShellBackend` / `AppSandboxBackend`）+ adb 传输层 + 真机 harness | 本仓库，不被阻塞 | ✅ 已完成（2026-10-30）—— 20 条只读探测（原 18，后加 13 / 13b 两项证据面探测）+ `assemble` + 真实命令在 BLA-AL00 上跑通，~120ms / exit 0 / uid 2000。**getprop 与 mount 已实测**；`logcat` / `dumpsys` 此前是**手工**实测可读、不属于探测集——现已由探测项 6c 收进集合（真机 10 项抽查中 8 项不在任何 `--list` 输出里，含 §4.4 点名却谁都看不见的 `settings`） |
 | P2 | §4.4 只读白名单按**脚本内容**判定（自称 read 的写命令在执行前被拒），§4.6.3 硬禁列表任何档位拒绝 | 本仓库，不被阻塞 | ✅ 已完成（2026-10-31）—— [`host/commands.rs`](../../../crates/acowork-android/src/host/commands.rs)，29 个新测试；BLA-AL00 实测 `settings put` 挂 read 标签被拒并指名 `android:shell:write`，`toybox rm -rf` 设备根在任何档位被拒 |
