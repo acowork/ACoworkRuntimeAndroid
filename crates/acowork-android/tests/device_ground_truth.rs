@@ -396,16 +396,50 @@ fn the_props_the_device_printed_are_the_props_the_parsers_read() {
     assert!(parse_bool_prop(&text(&probe.prop_adb_secure)));
 }
 
+/// A run of ten or more capitals/digits containing at least one digit — the shape of an adb
+/// serial, a build fingerprint component or a device ID. Used by R13 so the check does not have
+/// to know the real value to prove the value is absent.
+fn serial_shaped_token(text: &str) -> Option<String> {
+    let mut run = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_uppercase() || ch.is_ascii_digit() {
+            run.push(ch);
+        } else {
+            if run.len() >= 10 && run.chars().any(|c| c.is_ascii_digit()) {
+                return Some(run);
+            }
+            run.clear();
+        }
+    }
+    if run.len() >= 10 && run.chars().any(|c| c.is_ascii_digit()) {
+        return Some(run);
+    }
+    None
+}
+
 #[test]
 fn the_summary_reported_upward_names_the_tier_the_device_actually_is() {
     let profile = HostProfile::assemble(&ground_truth(), OWN_PACKAGE);
     let summary = HostDescription::summary(&profile);
     assert_eq!(summary.platform, "android");
     // R13: no serial, no model, no build fingerprint.
+    //
+    // The serial is not written down here any more. It used to sit in the very list whose purpose
+    // is to prove the summary does not leak it, which made this test file the one place in the
+    // repository still carrying a specific handset's unique identifier — the guard was the leak.
+    // A shape check is both quieter and wider: a serial is a long run of capitals and digits, and
+    // a sentence describing a privilege tier has no reason to contain one, whatever device it was
+    // assembled from. The vendor and model strings stay, because they are public product names
+    // that the fixture's own filename already carries.
     let blob = format!("{summary:?}");
-    for secret in ["BLA", "emulator-5554", "HUAWEI", "harmony"] {
+    for secret in ["BLA", "HUAWEI", "harmony"] {
         assert!(!blob.contains(secret), "summary leaks {secret}: {blob}");
     }
+    assert!(
+        serial_shaped_token(&blob).is_none(),
+        "summary carries a serial-shaped token {:?}: {blob}",
+        serial_shaped_token(&blob),
+    );
     assert!(HostDescription::is_r3_conformant(&profile));
 }
 

@@ -2,7 +2,7 @@
 // against a physical device, and print what the port actually concluded.
 //
 //     ACOWORK_ADB=/tmp/platform-tools/adb \
-//     ACOWORK_ADB_SERIAL=emulator-5554 \
+//     ACOWORK_ADB_SERIAL=<serial> \
 //         cargo run -p acowork-android --example device_probe -- --out /tmp/probe.json
 //
 // Three things happen here, in order, and each answers a separate question:
