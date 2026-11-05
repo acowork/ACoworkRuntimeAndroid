@@ -111,6 +111,7 @@ user 版上 `/system` 依然有 verity 保护且只读；`/system/bin/sh` 是 mk
 设计取舍：[ADR-AND-001](docs/adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md) ·
 探测规格：[android-host-probe.md](docs/design/zh/android-host-probe.md) ·
 设置面盘点：[android-runtime-settings.md](docs/design/zh/android-runtime-settings.md)
+真机测试手册：[android-device-test.md](docs/design/zh/android-device-test.md)（接上手机之后跑什么、什么算通过）
 
 ## 为什么独立建仓？
 

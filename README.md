@@ -116,6 +116,7 @@ and `/system/bin/sh` is mksh, not bash. The probe measures all of this rather th
 Design rationale: [ADR-AND-001](docs/adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md) ·
 Probe specification: [android-host-probe.md](docs/design/zh/android-host-probe.md) ·
 Settings surface: [android-runtime-settings.md](docs/design/zh/android-runtime-settings.md)
+Device test manual: [android-device-test.md](docs/design/zh/android-device-test.md) (what to run when a handset is plugged in, and what counts as passing)
 
 
 ## Why a separate repository?
