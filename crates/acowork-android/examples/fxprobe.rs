@@ -24,8 +24,8 @@ fn main() {
             .first()
             .map(|f| f.detail.as_str())
             .unwrap_or("");
-        let detail = if detail.len() > 96 {
-            let cut = detail.floor_char_boundary(96);
+        let detail = if detail.len() > 240 {
+            let cut = detail.floor_char_boundary(240);
             format!("{}…", &detail[..cut])
         } else {
             detail.to_string()

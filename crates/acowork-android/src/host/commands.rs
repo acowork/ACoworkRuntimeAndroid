@@ -45,7 +45,7 @@
 //! | `sed`/`awk`/`grep` where the script interpolates | `'{print $1}'` and `'{print $1}'$SUF` are the same word once the quotes are off | ask the raw text whether anything expands `has_unquoted_expansion` and withdraw the program-slot exemption if it does |
 //! | `sqlite3` | SQL is a second language, and even a `SELECT` can write a `-wal`/`-journal` file next to the database | refused on purpose, not overlooked |
 //! | `cd`, `export`, `alias`, `set`, `unset` | they change what the *later* words in the same script mean: `cd /data/data/com.x; cat db` reads a file whose path never appears, `export LD_PRELOAD` changes which binary a classified head is, `alias ls='rm -rf …'` runs something other than what was approved | refused; the read tier is a promise about this text, not about the shell's state |
-//! | `ping`, `nslookup`, `getent` | no device state changes, but the script reaches the network, and this vocabulary has no capability for egress | refused until the capability exists — the upstream B2 registry question, not a classifier bug |
+//! | `ping`, `nslookup`, `getent`, `curl`, `wget` | no device state changes, but the script reaches the network, and this vocabulary has no capability for egress | refused by name, with the missing capability named in the reason — not swallowed by the unknown-command fallback, because "a better classifier would resolve this" and "no approval will" are different answers to a caller that is about to ask a human |
 //! | `ifconfig wlan0` | measured: `ioctl 8927: Permission denied` at uid 2000 | left at the write tier its name carries; the device is the one refusing, so the classifier has no read shape to exempt |
 //! | `zip`, `screenrecord`, `media`, bare `deviceidle`, `sqlite3` | absent from the one device this port has ground truth for (BLA-AL00, Android 10) | not tiered at all. A flag surface guessed from another vendor's build is how a classifier starts lying |
 //!
@@ -100,10 +100,12 @@ pub enum Effect {
     /// the session" for a command that changed nothing teaches the operator to ignore the report.
     ///
     /// It is authorised by `android:fs:system` because this port's vocabulary has no app-data
-    /// capability yet — that is question B2 of the upstream review. Borrowing the heaviest
-    /// filesystem tier is the conservative direction: the cost is one approval the caller may not
-    /// have needed, the alternative is a permission nobody asked for. It also means a disclosure
-    /// read takes the device write lock, since the capability that covers it is a mutating one.
+    /// capability yet — that is question B2 of the upstream review, and the row that says so is
+    /// [`Borrowed::AppDataRead`] in [`PROVISIONAL_BORROWS`], which [`Effect::capability`] reads
+    /// rather than an arm that would look like a design. Borrowing the heaviest filesystem tier is
+    /// the conservative direction: the cost is one approval the caller may not have needed, the
+    /// alternative is a permission nobody asked for. It also means a disclosure read takes the
+    /// device write lock, since the capability that covers it is a mutating one.
     ForeignRead,
     /// Touches a mounted partition or a block device: `mount -o remount`, writes under
     /// `/system`.
@@ -114,6 +116,91 @@ pub enum Effect {
     Opaque,
     /// Refused outright by §4.6.3 item 3, regardless of tier or dangerous mode.
     Banned,
+}
+
+/// Which thing the port has no capability for.
+///
+/// An enum rather than indices into a table: the call sites name what they are borrowing *for*,
+/// and a row that moves position in the table cannot then silently authorise something else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Borrowed {
+    /// Taking another uid's contents out of the device.
+    AppDataRead,
+    /// Changing state inside another uid's containment.
+    AppDataWrite,
+    /// Reaching the network.
+    NetworkEgress,
+}
+
+/// A classification the port makes correctly against a vocabulary that cannot authorise it.
+///
+/// ADR-AND-001 §4.4 hands this port five capabilities, and three of the things the classifier
+/// distinguishes have no home among them: reading another uid's files, writing inside another
+/// uid's home, and leaving the device altogether. Upstream review 37 question B2 is the registry
+/// that would name them; nothing here can, because design doc 30 §6.2 forbids an engine minting
+/// capability ids.
+///
+/// The rows are consulted by code, not by readers: [`Effect::capability`] takes its
+/// `ForeignRead` arm from [`Borrowed::AppDataRead`], the two app-data write sites append
+/// [`Borrowed::AppDataWrite`]'s [`mark`](ProvisionalBorrow::mark) to the reason a human is asked
+/// to approve, and the egress commands are refused with [`Borrowed::NetworkEgress`]'s text. A
+/// ruling against one borrowing therefore edits a row. The alternative — a comment in the arm
+/// that happens to be right today — is how a temporary decision outlives itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProvisionalBorrow {
+    /// Which gap this row is standing in for.
+    pub of: Borrowed,
+    /// What the script does, in the port's own words.
+    pub shape: &'static str,
+    /// Where the classifier files it today. [`Effect::Opaque`] means the port refuses it.
+    pub effect: Effect,
+    /// The capability authorising it meanwhile. `None` means nothing authorises it, so no
+    /// approval will unblock it — which is a different answer from "needs approval" and has to
+    /// be said, because an agent told to ask will ask and be refused again.
+    pub borrowed: Option<Capability>,
+    /// The capability B2 would add. Phrased as the missing thing, not as an id: this port is
+    /// asking for one, not declaring it.
+    pub missing: &'static str,
+    /// The sentence that reaches the human approving the command.
+    pub mark: &'static str,
+}
+
+/// The three gaps, as data.
+pub const PROVISIONAL_BORROWS: &[ProvisionalBorrow] = &[
+    ProvisionalBorrow {
+        of: Borrowed::AppDataRead,
+        shape: "reads the contents of another uid's files, or a personal provider's rows",
+        effect: Effect::ForeignRead,
+        borrowed: Some(Capability::FsSystem),
+        missing: "an app-data read capability",
+        mark: "no app-data capability exists in this vocabulary yet (upstream review 37, B2), so \
+               a read that changes nothing on the device is authorised by the heaviest filesystem \
+               tier",
+    },
+    ProvisionalBorrow {
+        of: Borrowed::AppDataWrite,
+        shape: "writes inside another uid's containment: a provider row, a file under /data/data",
+        effect: Effect::SystemWrite,
+        borrowed: Some(Capability::FsSystem),
+        missing: "an app-data write capability",
+        mark: "no app-data capability exists in this vocabulary yet (upstream review 37, B2), so \
+               a write into somebody else's home borrows the tier that also covers remounting \
+               partitions",
+    },
+    ProvisionalBorrow {
+        of: Borrowed::NetworkEgress,
+        shape: "reaches the network",
+        effect: Effect::Opaque,
+        borrowed: None,
+        missing: "a network-egress capability",
+        mark: "no egress capability exists in this vocabulary (upstream review 37, B2) and no \
+               tier authorises leaving the device, so asking for approval will not unblock this",
+    },
+];
+
+/// The row standing in for one gap, or `None` while the vocabulary covers it natively.
+pub fn borrow(of: Borrowed) -> Option<&'static ProvisionalBorrow> {
+    PROVISIONAL_BORROWS.iter().find(|b| b.of == of)
 }
 
 impl Effect {
@@ -128,9 +215,14 @@ impl Effect {
             Effect::ReadOnly => Some(Capability::ShellRead),
             Effect::ShellWrite => Some(Capability::ShellWrite),
             Effect::FileWrite => Some(Capability::FsOutsideApp),
-            // The heaviest filesystem tier the port has, for a read: see the variant. When B2
-            // gives this vocabulary an app-data capability, this arm is the one that changes.
-            Effect::ForeignRead => Some(Capability::FsSystem),
+            // No capability of its own. This effect exists because the classifier can tell a
+            // disclosure apart and the vocabulary cannot yet authorise one, so the answer comes
+            // from the table below rather than from an arm that would read as designed.
+            //
+            // Deleting the row makes this `None`, which is the same answer as `Opaque`: refused.
+            // A borrow that silently stopped applying fails closed, which is the only direction
+            // worth having it fail in.
+            Effect::ForeignRead => borrow(Borrowed::AppDataRead).and_then(|b| b.borrowed),
             Effect::SystemWrite => Some(Capability::FsSystem),
             Effect::SelinuxChange => Some(Capability::SelinuxPermissive),
             Effect::Opaque | Effect::Banned => None,
@@ -2518,7 +2610,16 @@ fn effect_of(head: &str, args: &[String], expandable: bool) -> Finding {
             .map(|t| file_effect(t))
             .max()
             .unwrap_or(Effect::Opaque);
-        return Finding::new(head, effect, format!("modifies `{}`", targets.join("`, `")));
+        let mut detail = format!("modifies `{}`", targets.join("`, `"));
+        if effect == Effect::SystemWrite && targets.iter().any(|t| is_private_data_path(t)) {
+            // Two different reasons land in this tier and only one of them is borrowed: `mount`
+            // earned `fs:system`, a write under `/data/data` is standing in for a capability that
+            // does not exist yet. The person approving gets told which one they are approving.
+            if let Some(b) = borrow(Borrowed::AppDataWrite) {
+                detail = format!("{detail}; {}", b.mark);
+            }
+        }
+        return Finding::new(head, effect, detail);
     }
 
     // Relabelling is a metadata write *to a file*, so it is tiered by that file rather than by
@@ -2549,6 +2650,15 @@ fn effect_of(head: &str, args: &[String], expandable: bool) -> Finding {
 
     if SHELL_WRITE.contains(&head) {
         return Finding::new(head, Effect::ShellWrite, "changes device state");
+    }
+
+    if EGRESS.contains(&head) {
+        // Analysed, not unknown: the port knows exactly what `ping` does and has nothing to
+        // authorise it with. That distinction has to reach the caller, because `Opaque` elsewhere
+        // means "a better classifier would resolve this" while this one means "no approval will".
+        let why = borrow(Borrowed::NetworkEgress)
+            .map_or("no capability covers reaching the network", |b| b.mark);
+        return Finding::opaque(head, format!("reaches the network, and {why}"));
     }
 
     Finding::opaque(
@@ -2688,6 +2798,21 @@ fn content_provider(args: &[String]) -> Finding {
             },
         );
     }
+    let mut detail = format!(
+        "reaches the `{authority}` provider, which is not the caller's own data — the URI, \
+         not a path, is what names the person's messages, contacts or files here"
+    );
+    // Say which row authorises this, in both directions. The write branch is the one that shows
+    // it loudest: filed under `SystemWrite`, it would otherwise be approved as "a system write"
+    // by a person who is really approving an insert into the machine owner's text messages.
+    let of = if reads {
+        Borrowed::AppDataRead
+    } else {
+        Borrowed::AppDataWrite
+    };
+    if let Some(b) = borrow(of) {
+        detail = format!("{detail}; {}", b.mark);
+    }
     Finding::new(
         named,
         if reads {
@@ -2695,10 +2820,7 @@ fn content_provider(args: &[String]) -> Finding {
         } else {
             Effect::SystemWrite
         },
-        format!(
-            "reaches the `{authority}` provider, which is not the caller's own data — the URI, \
-             not a path, is what names the person's messages, contacts or files here"
-        ),
+        detail,
     )
 }
 
@@ -2727,6 +2849,14 @@ const BANNED_TEXT: &str =
 /// com.android.shell` printed that uid's modes when asked, and `appops set` would have changed
 /// them. Naming the verb is the only difference between them, which is exactly what this list is
 /// for.
+/// Names whose entire effect is leaving the device.
+///
+/// Only `ping` is confirmed installed on the one device this port has ground truth for
+/// (BLA-AL00, Android 10); the rest are here because a name that is absent simply never fires,
+/// while a name that is present and missing from this list would be refused for the wrong reason
+/// ("unknown command") instead of the right one.
+const EGRESS: &[&str] = &["ping", "nslookup", "getent", "curl", "wget"];
+
 const DISPATCHERS: &[&str] = &[
     "pm",
     "am",
@@ -2988,6 +3118,121 @@ mod tests {
             .into_iter()
             .next()
             .unwrap_or_else(|| panic!("no finding for {script:?}"))
+    }
+
+    #[test]
+    fn the_borrow_table_is_consulted_and_not_merely_read() {
+        // The row decides what authorises a disclosure read, not the arm that used to say so.
+        // Delete the row and this becomes `None` — refused, like an unknown command — which is the
+        // only direction worth having it fail in.
+        let row = borrow(Borrowed::AppDataRead).expect("the app-data read row exists");
+        assert_eq!(
+            Effect::ForeignRead.capability(),
+            row.borrowed,
+            "ForeignRead is authorised by the table"
+        );
+        assert_eq!(row.effect, Effect::ForeignRead);
+    }
+
+    #[test]
+    fn the_port_asks_for_capabilities_without_minting_ids() {
+        // Design doc 30 §6.2: capability ids enter by registry PR and an engine may not invent
+        // one. A row that named `android:fs:app-data` as though it existed would be that mistake
+        // written into data, where a reader would trust it more than they trust prose.
+        for row in PROVISIONAL_BORROWS {
+            assert!(
+                !row.missing.contains(':'),
+                "{:?} reads like a capability id, and this port cannot mint one: {}",
+                row.of,
+                row.missing
+            );
+            if let Some(cap) = row.borrowed {
+                assert!(
+                    Capability::all().contains(&cap),
+                    "{:?} borrows a capability outside this platform's five",
+                    row.of
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_gap_the_classifier_names_has_a_row() {
+        for of in [
+            Borrowed::AppDataRead,
+            Borrowed::AppDataWrite,
+            Borrowed::NetworkEgress,
+        ] {
+            let row = borrow(of).unwrap_or_else(|| panic!("no row for {of:?}"));
+            assert!(!row.shape.is_empty() && !row.missing.is_empty());
+            assert!(
+                row.mark.len() > 40,
+                "{of:?} mark is too short to tell an approver anything: {}",
+                row.mark
+            );
+        }
+    }
+
+    #[test]
+    fn an_app_data_write_says_which_tier_it_is_borrowing() {
+        let mark = borrow(Borrowed::AppDataWrite).unwrap().mark;
+        for script in [
+            "content insert --uri content://sms/ --bind body:s:hi",
+            "toybox rm -fr /data/data/com.foo",
+        ] {
+            let f = first_finding(script);
+            assert_eq!(f.effect, Effect::SystemWrite, "{script}");
+            assert!(
+                f.detail.contains(mark),
+                "{script:?} would be approved as a bare system write: {}",
+                f.detail
+            );
+        }
+    }
+
+    #[test]
+    fn a_partition_write_does_not_claim_the_app_data_borrow() {
+        // The other half of the test above. If every `SystemWrite` said "app data", the mark would
+        // be noise and the person approving would learn nothing from seeing it.
+        let mark = borrow(Borrowed::AppDataWrite).unwrap().mark;
+        for script in [
+            "mount -o remount /system",
+            "sort -T /system/tmp /data/local/tmp/f",
+            "getprop > /system/x",
+        ] {
+            let f = first_finding(script);
+            assert_eq!(f.effect, Effect::SystemWrite, "{script}");
+            assert!(
+                !f.detail.contains(mark),
+                "{script} is not app data: {}",
+                f.detail
+            );
+        }
+    }
+
+    #[test]
+    fn egress_is_refused_for_the_missing_capability_not_for_being_unknown() {
+        // Before this row existed, `ping` shared a bucket with `sh -c` and was explained as a
+        // command the port could not analyse. It is fully analysed; nothing authorises it.
+        let row = borrow(Borrowed::NetworkEgress).unwrap();
+        assert_eq!(row.borrowed, None, "no tier authorises leaving the device");
+        for script in [
+            "ping -c 1 8.8.8.8",
+            "nslookup example.com",
+            "getent hosts example.com",
+        ] {
+            let v = classify(script);
+            assert_eq!(v.strongest(), Effect::Opaque, "{script}");
+            let why = &v.findings[0].detail;
+            assert!(
+                why.contains("network") && why.contains("approval will not unblock"),
+                "{script}: {why}"
+            );
+            assert!(
+                v.refusal_for(Some(Capability::FsSystem)).is_some(),
+                "{script} must still be refused at the heaviest tier"
+            );
+        }
     }
 
     #[test]
