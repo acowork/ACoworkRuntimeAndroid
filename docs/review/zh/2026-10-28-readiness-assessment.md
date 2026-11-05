@@ -4,9 +4,11 @@
 - **范围**：[README.zh.md](../../../README.zh.md)、[ADR-AND-001](../../adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md)、[ADR-AND-002](../../adr/zh/ADR-AND-002-platform-contract-layer.md)（2026-10-29 新增）、[android-host-probe.md](../../design/zh/android-host-probe.md)
 - **核对基准**：上游 `AgentCowork` @ `0b5e8f14`（2026-10-28）
 - **结论**：**文档质量高，但有 3 条硬阻塞（B1/B2/B3）需上游裁定。** P0 只读切片不被阻塞，已交付并通过验收判据。
-  > **已提交上游评审（2026-10-29）**：B1 + B2 已整理成请求裁定文档，提交至 `AgentCowork/docs/review/zh/37-android-write-tier-attribution-and-capability-registry-review.md`（2026-11-02 补：该文件此前只存在于工作树、从未进入上游版本控制，现已提交为上游 `e1cc9aab`，未 push）（B1 含三个必答问题 Q1 执行点 / Q2 契约归属 / Q3 无主节点；B2 给出 a/b/c/d 四个选项，推荐 a「新增 Node/设备安全域表」）。**等待裁定，未获结论前 P3 生产接线不落地。**
+  > **已提交上游评审（2026-10-29）**：B1 + B2 已整理成请求裁定文档，提交至 `AgentCowork/docs/review/zh/37-android-write-tier-attribution-and-capability-registry-review.md`（2026-11-02 补：该文件此前**只存在于本地工作树，从未进入上游版本控制**——所谓「已提交上游评审」并不成立，投递失败是提出方的责任。现已作为上游分支 `docs/android-b1-b2-adjudication` 推送至 `acowork/ACowork`（原文 + §10 默认值与截止日期 + §11 接口核查），PR 待开）（B1 含三个必答问题 Q1 执行点 / Q2 契约归属 / Q3 无主节点；B2 给出 a/b/c/d 四个选项，推荐 a「新增 Node/设备安全域表」）。**等待裁定，未获结论前 P3 生产接线不落地。** 为免无主请求永远悬置，§10 给每条问题写明「移植侧当前按哪个选项在跑」与截止日期 2026-11-16：到期无答复即按现状继续并标注待追认。B2 那行**不给默认值**——缺的是一张表，截止日期造不出一张表。
   > **B3 的影响面已收窄，但未消除。** 规则层抽成只依赖 `serde` 的独立 crate 后，「引擎归属形态二义」无论上游怎么裁定都**不波及规则层**，且这是结构保证（裸机 target 编译 + lib 依赖图无 std 边）而非约定。但 B3 二义的本来就是*引擎*（node + runtime）的归属，README 路线图 #2 的引擎抽取**仍然阻塞**——契约层解决的是宿主规则，不是引擎归属。
   > **三条阻塞的当前形状**：B1 解法已在契约层落地为规则 R7 并有三个测试钉住，**等的是上游对 §7.1 字面修订的确认**（Q1/Q2/Q3）；B2 **无解法可落地**——它缺的是一张上游表，本地领域类型 + 待建适配层只能把改动面积压到一个文件，不能替代裁定；B3 只阻塞引擎抽取，不阻塞 Android 移植。
+
+> **第四条（2026-11-02 核查，见上游 doc37 §11）**：本仓库待办里「node 侧 `ReversibleBackend` 组装点」隐含假设上游有一个等着被实现的执行后端接口。核查结果：`ExecutionBackend` 定义在**本仓库自己的** `crates/acowork-platform-contract/src/exec.rs`，上游 `core/` 对该名、对该契约 crate、对本仓库的引用数均为 **0**；上游执行抽象是 `core/acowork-core/src/tools/traits.rs` 的 `Tool`，而 `tools/wasm/wasi_mapper.rs` 把 `shell` 明确列为 "No WASI mapping (host-controlled)"。因此这不是可以单方面完成的编码任务：**要么上游采纳这份契约，要么本移植实现 `Tool`**。默认动作是继续按自己的契约跑（`acowork-host` 已证明它不依赖任何上游接口即可端到端验证），两种收敛方向的成本都只是一个 adapter。
 
 ---
 
@@ -262,7 +264,7 @@ ADR §7.4 只裁定了 `fs:system` 与 `selinux:permissive` 两条需要 owner �
 
 | 优先级 | 动作 | 归属 | 状态 |
 |---|---|---|---|
-| P0 | 把 B1 的「两权威」方案与 B2 的注册表提案提交上游评审 | 需上游 | ✅ 已提交（2026-10-29）——`AgentCowork/docs/review/zh/37-android-write-tier-attribution-and-capability-registry-review.md`，B1 含三个必答问题 Q1 执行点 / Q2 契约归属 / Q3 无主节点，B2 给出 a/b/c/d 四个选项；B1 方案在契约层已落地为 R7，文档直接附 `r7_*` 测试作为可执行说明。**状态：等待裁定** |
+| P0 | 把 B1 的「两权威」方案与 B2 的注册表提案提交上游评审 | 需上游 | ✅ 已提交（2026-10-29）——`AgentCowork/docs/review/zh/37-android-write-tier-attribution-and-capability-registry-review.md`，B1 含三个必答问题 Q1 执行点 / Q2 契约归属 / Q3 无主节点，B2 给出 a/b/c/d 四个选项；B1 方案在契约层已落地为 R7，文档直接附 `r7_*` 测试作为可执行说明。**状态：已送达上游分支，含默认值与截止日期（2026-11-16），等待裁定** |
 | P0 | 修正 ADR 日期、把 §7.1/§7.4 标注为待对齐 | 本仓库 | ✅ 已完成 |
 | P1 | 与 mobile app 负责人对齐 B4 的 APK 形态归属 | 需产品 | 🚧 配置面已定（2026-11-02）—— [android-runtime-settings.md](../../design/zh/android-runtime-settings.md) 盘点了全部散落参数，并给出 13 行可编辑 + 一段只读设备事实的界面草图；`HostConfig` 是纯 Rust 类型，mobile 长出 host mode 或独立 APK 两种形态都能直接消费（JNI 侧一次 `to_json`/`from_json`）。**仍待产品回答的是形态本身**：装两个 APK 还是合并、包名/签名/前台服务/电池白名单如何共存 |
 | P1 | 回写 probe §3（B8 `dialects`、B12 shell 前置条件）与 §4（B10 ledger） | 本仓库 | ✅ 已完成（2026-10-29） |
