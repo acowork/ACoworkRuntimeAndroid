@@ -1,0 +1,66 @@
+[package]
+name = "acowork-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+description = "Shared types, protocols, and traits for ACowork.AI"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+# ADR-091: the LSP registry keeps insertion order (`lsp` module) — the harness
+# list shuffled on every restart while it was a `HashMap`.
+indexmap.workspace = true
+bincode.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+futures-core.workspace = true
+toml.workspace = true
+directories.workspace = true
+prost.workspace = true
+tracing.workspace = true
+# Raises the `log` facade gate for `log`-only dependencies (yamux, rumqttc).
+log.workspace = true
+tracing-subscriber.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "io-util", "sync", "process", "time"] }
+signal-hook.workspace = true
+libc.workspace = true
+# ADR-084 §决策 3: the shared login-token contract signs with Ed25519
+# (acowork-user) and verifies with the public key (Gateway).
+ed25519-dalek.workspace = true
+base64.workspace = true
+rand.workspace = true
+# Design doc 24 (cloud relay): the WSS ↔ byte-stream adapter and tunnel
+# control protocol shared by acowork-relay and the Gateway relay-client.
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+# Shared single-task yamux driver used by BOTH tunnel sides (relay server
+# + Gateway client) — one implementation of the tricky poll_fn pumping.
+yamux.workspace = true
+anyhow.workspace = true
+# tokio ↔ futures IO bridging (driver tests use duplex pipes).
+tokio-util.workspace = true
+
+[build-dependencies]
+prost-build = { workspace = true }
+protoc-bin-vendored.workspace = true
+
+[dev-dependencies]
+# SKILL.md frontmatter parsing for the participation-contract tests
+# (`tests/agent_participation_contract.rs`) — test-only, the crate itself
+# stays frontmatter-free by design (manifest.rs: the SKILL.md parser lives in
+# the Runtime, which core must not depend on).
+serde_yaml = { workspace = true }
+
+# Process-tree containment for the idle-timeout kill path (process/tree.rs):
+# Job Object APIs on Windows; Unix uses the already-present `libc`.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }

@@ -199,8 +199,12 @@ impl ProbeCommand {
             //
             // Both dialects are echoed because exactly one will be non-empty, and an empty
             // answer is itself the evidence that the shell is neither mksh nor bash.
+            // Run in whatever shell LocalHost already selected (may be the
+            // APK-packaged ash). Do NOT nest `/system/bin/sh` — untrusted_app
+            // cannot execute shell_exec, so the nested call always failed and
+            // collapsed the profile to apk-sandbox.
             ProbeCommand::SystemShVersion => Cow::Borrowed(
-                "/system/bin/sh -c 'echo \"KSH=$KSH_VERSION\"; echo \"BASH=$BASH_VERSION\"'",
+                "echo \"KSH=$KSH_VERSION\"; echo \"BASH=$BASH_VERSION\"",
             ),
             ProbeCommand::ToyboxList => Cow::Borrowed("toybox"),
             ProbeCommand::BusyboxList => Cow::Borrowed("busybox --list"),

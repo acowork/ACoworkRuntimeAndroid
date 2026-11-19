@@ -1,0 +1,25 @@
+[package]
+name = "acowork-android-ffi"
+description = "JNI bridge for the ACowork Android host APK (ADR-AND-004)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+name = "acowork_android_ffi"
+
+[dependencies]
+acowork-android = { path = "../acowork-android", default-features = false }
+acowork-platform-contract = { workspace = true, features = ["std"] }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+jni = "0.21"
+once_cell = "1"
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[features]
+default = []

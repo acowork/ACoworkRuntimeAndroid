@@ -3,7 +3,7 @@
 > 状态：设计已定，落地点已实现（[`host/config.rs`](../../crates/acowork-android/src/host/config.rs)）。
 > 关联：[ADR-AND-001](../adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md) §4.4 / §4.6 / §7.3 / §7.4、
 > [android-host-probe.md](android-host-probe.md)、
-> [readiness 评估](../review/zh/2026-10-28-readiness-assessment.md) B4。
+> [readiness 评估](../review/zh/2026-10-28-readiness-assessment.md) B4（已关，见 ADR-AND-004）。
 > 日期：2026-11-02
 
 ## 0. 为什么要先盘点，再画界面
@@ -256,7 +256,7 @@ restore 杀了。
 `a_caller_that_named_a_budget_is_not_overruled_by_the_screen`。
 已知可接受的碰撞：调用方显式选了恰好等于端口默认的值、而操作者改过它时，操作者的值生效。
 | CLI flag 接线（`--host-config <file>`） | ⬜ 属上游 node crate，与 `NodeConfig` 一并做 |
-| APK 设置界面本体 | ⬜ 需 B4 产品对齐（与 `apps/acowork-mobile` 的形态关系） |
+| APK 设置界面本体 | ⬜ 本仓独立宿主 APK（B4 已关，见 ADR-AND-004）；工程未开工 |
 
 ## 6. 与上游 `NodeConfig` 的边界
 
@@ -274,9 +274,8 @@ gateway host/port、token、name、proxy/LSP 端口、日志轮转）。**本端
 
 ## 7. 未决
 
-1. **B4 形态归属**：APK 是 `apps/acowork-mobile` 长出 host mode，还是独立包。本文件只定义
-   **配置面**，不预设答案——`HostConfig` 是纯 Rust 类型，两种形态都能消费（JNI 侧一次
-   `to_json`/`from_json` 即可）。
+1. **B4 形态归属**：✅ 已关（ADR-AND-004）——主仓 mobile 是客户端；本仓做独立宿主 APK。
+   `HostConfig` 仍由本仓 APK / CLI 消费（JNI 侧 `to_json`/`from_json`）。
 2. **界面语言与文案**：`ConfigError.reason` 现在是英文（与端口其余诊断文本一致）。设置界面若做
    中文，需要一份 reason → 文案的映射表，而不是把中文塞进库。行清单同理：`SettingSpec.help` 是
    代码原文，APK 按 `SettingSpec.id`（点号路径）做本地化键——`id` 就是两半之间的契约，

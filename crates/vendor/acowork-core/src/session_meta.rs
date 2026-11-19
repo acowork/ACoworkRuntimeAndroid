@@ -1,0 +1,1855 @@
+//! Session metadata storage: trait + types (ADR-082 §4 step 3).
+//!
+//! The session list is the metadata side of `conversations/`: titles, model
+//! choice, token totals, todo snapshots. Each implementation is responsible for
+//! the storage and retrieval of the row keyed by `session_id`; the JSONL
+//! conversation log itself is not in scope.
+//!
+//! `SqliteSessionMetaStore` (in `acowork-sqlite`) is the only implementation.
+//! The runtime holds an `Arc<dyn SessionMetaStore>` the same way it holds any
+//! other late-bound store, so the storage backend and the call sites stay apart.
+//!
+//! **ADR-101 note**: these types live in `acowork-core` rather than the memory
+//! crate. Session metadata never was memory business — it only shared the
+//! SQLite file — and the Runtime must be able to name the trait without
+//! depending on `acowork-memory`, which is now a standalone service.
+//!
+//! # Atomicity
+//!
+//! `upsert` replaces the whole row. Callers in this codebase already mutate
+//! the in-memory `SessionMeta` and `write_meta` it whole — the trait matches
+//! that unit of work rather than threading individual setters through every
+//! column.
+//!
+//! # Pruning
+//!
+//! `prune_to` deletes sessions whose `last_active_at` is older than the
+//! (n+1)-th most-recent **of that session's owner**, and returns the deleted
+//! ids. Bucketing by owner is deliberate (ADR-076 §决策 4): a single global cap
+//! lets one account's busy week evict another account's history. The matching
+//! JSONL files are not this backend's concern — the caller cleans them up.
+//! Keeping the side-effect split lets the trait stay pure on the storage axis.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+use crate::error::{AcoworkError, Result};
+use crate::providers::traits::UsageInfo;
+
+/// Default maximum pruned-after-pick when pruning is disabled.
+pub const PRUNE_DISABLED: usize = 0;
+
+/// `(input, output, cache_read, cache_write)` token totals across every
+/// session a caller may read. Aliased so the tuple returned by the runtime's
+/// session listing (`scan_sessions_async`) stays readable.
+pub type SessionTotals = (u64, u64, u64, u64);
+
+/// Sentinel segment for an unattributable provider/model in a
+/// [`ModelUsageEntry`] map key (legacy rows backfilled by the v6 migration,
+/// or a call site whose session never stamped a provider id).
+pub const UNKNOWN_USAGE_SEGMENT: &str = "unknown";
+
+/// Build a [`ModelUsageEntry`] map key: `"{provider}|{model}"`, with
+/// [`UNKNOWN_USAGE_SEGMENT`] standing in for a missing segment.
+///
+/// A `|` inside a provider or model id would corrupt the split; provider
+/// ids and model ids are config-declared identifiers that do not contain
+/// one, and [`split_model_usage_key`] splits on the FIRST `|` so a stray
+/// separator lands in the model half rather than misattributing the
+/// provider.
+pub fn model_usage_key(provider: Option<&str>, model: Option<&str>) -> String {
+    format!(
+        "{}|{}",
+        provider.unwrap_or(UNKNOWN_USAGE_SEGMENT),
+        model.unwrap_or(UNKNOWN_USAGE_SEGMENT)
+    )
+}
+
+/// Inverse of [`model_usage_key`]: split on the first `|`. A key without a
+/// separator reads as `(key, "unknown")` rather than failing.
+pub fn split_model_usage_key(key: &str) -> (&str, &str) {
+    match key.split_once('|') {
+        Some((p, m)) => (p, m),
+        None => (key, UNKNOWN_USAGE_SEGMENT),
+    }
+}
+
+
+
+/// Per-provider/model token breakdown of one session (token statistics
+/// feature). The map key is `"{provider_id}|{model_id}"`; either segment
+/// falls back to the literal `"unknown"` when the call site could not
+/// attribute it (pre-upgrade data, or a session whose provider id was
+/// never stamped).
+///
+/// Persisted as the `sessions.model_usage` JSON column. This breakdown is
+/// the **source of truth** for the agent-scoped `token_stats` aggregate
+/// table: the aggregate is maintained as a same-transaction diff of these
+/// maps (see `SqliteSessionMetaStore`) and can be rebuilt from them at any
+/// time — the disposable-derived-index pattern of ADR-082.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelUsageEntry {
+    /// Cumulative prompt tokens attributed to this provider/model.
+    pub input: u64,
+    /// Cumulative completion tokens attributed to this provider/model.
+    pub output: u64,
+    /// Cumulative cache-read tokens attributed to this provider/model.
+    pub cache_read: u64,
+    /// Cumulative cache-write tokens attributed to this provider/model.
+    pub cache_write: u64,
+    /// Cumulative estimated cost in USD. `None` = "no price known" — the
+    /// "宁可 miss 也不估计" policy: a fabricated 0 would read as "free".
+    pub cost: Option<f64>,
+}
+
+/// Per-session token counters (ADR-027 snapshot + cumulative).
+///
+/// Persisted as seven flattened integer columns in SQLite (see
+/// `SqliteSessionMetaStore`).
+///
+/// `#[serde(default)]` keeps a row written before ADR-066 — which omits the
+/// four cache fields — deserialisable; the defaults are all zero, matching the
+/// "宁可 miss 也不估计" policy.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionTokens {
+    pub last_input: u64,
+    pub last_output: u64,
+    pub total_input: u64,
+    pub total_output: u64,
+    pub last_cache_read: u64,
+    pub last_cache_write: u64,
+    pub total_cache_read: u64,
+    pub total_cache_write: u64,
+}
+
+// ── Fold primitives (ADR-027 / ADR-066) ─────────────────────────────────
+//
+// The single owner of the rules that fold one LLM call's provider-reported
+// `usage` into cumulative counters. The session totals (`SessionTokens`),
+// the per-model breakdown (`ModelUsageEntry` map), and the Chat usage
+// ledger (`chat_token_usage`) all fold through these functions — the
+// "Σ detail == totals" invariant holds because there is exactly one gate
+// implementation, not three copies that can drift apart.
+
+/// Gated deltas of one call: `(input, output, cache_read, cache_write)`.
+///
+/// ADR-027 zero-skip: `prompt_tokens == 0` means the provider did not
+/// report a reliable input count (fallback path); the input side then
+/// contributes 0 instead of polluting the running total. ADR-066:
+/// `cache_read` shares that gate (when input is unreliable the cache
+/// breakdown is unreliable too); `output` and `cache_write` always
+/// accumulate — a zero completion is usually a true zero (aborted
+/// stream), and an Anthropic cache write with zero regular input is
+/// still a real, billable event.
+pub fn gated_call_deltas(usage: &UsageInfo) -> (u64, u64, u64, u64) {
+    let (d_in, d_cr) = if usage.prompt_tokens > 0 {
+        (usage.prompt_tokens, usage.cache_read_tokens)
+    } else {
+        (0, 0)
+    };
+    (d_in, usage.completion_tokens, d_cr, usage.cache_write_tokens)
+}
+
+impl SessionTokens {
+    /// Fold one call into the running totals and overwrite the `last_*`
+    /// snapshot with the raw Provider values, including zeros — the
+    /// snapshot honestly reflects what the Provider returned (ADR-027).
+    pub fn folded_with_call(&self, usage: &UsageInfo) -> SessionTokens {
+        let (d_in, d_out, d_cr, d_cw) = gated_call_deltas(usage);
+        SessionTokens {
+            last_input: usage.prompt_tokens,
+            last_output: usage.completion_tokens,
+            total_input: self.total_input.saturating_add(d_in),
+            total_output: self.total_output.saturating_add(d_out),
+            last_cache_read: usage.cache_read_tokens,
+            last_cache_write: usage.cache_write_tokens,
+            total_cache_read: self.total_cache_read.saturating_add(d_cr),
+            total_cache_write: self.total_cache_write.saturating_add(d_cw),
+        }
+    }
+
+    /// Fold the totals only, preserving the `last_*` snapshot. For meta
+    /// calls (compaction, title generation): their prompt size is
+    /// unrepresentative of the session's next turn, so overwriting
+    /// `last_input` would inflate the displayed context usage until the
+    /// next dialog call recalibrates it.
+    pub fn folded_totals_preserving_last(&self, usage: &UsageInfo) -> SessionTokens {
+        let mut next = self.folded_with_call(usage);
+        next.last_input = self.last_input;
+        next.last_output = self.last_output;
+        next.last_cache_read = self.last_cache_read;
+        next.last_cache_write = self.last_cache_write;
+        next
+    }
+}
+
+/// Fold one call into the per-model detail map under `key` (built by
+/// [`model_usage_key`]).
+///
+/// Mirrors [`gated_call_deltas`] exactly, so Σ detail entries == the
+/// cumulative totals at every persist point — the store's upsert diff
+/// maintains the agent-level `token_stats` aggregate against that
+/// invariant. Cost folds poison-on-unknown: a fresh bucket takes the
+/// call's `cost_delta` (which may be `None`), an existing bucket only
+/// keeps a running cost while both sides are known; the first `None`
+/// contribution flips the bucket's cost to `None` permanently (until
+/// `rebuild_token_stats` or a corrected attribution — "宁可 miss 也不估计").
+pub fn fold_model_usage_entry(
+    map: &mut std::collections::BTreeMap<String, ModelUsageEntry>,
+    key: &str,
+    usage: &UsageInfo,
+    cost_delta: Option<f64>,
+) {
+    let (d_in, d_out, d_cr, d_cw) = gated_call_deltas(usage);
+    if d_in == 0 && d_out == 0 && d_cr == 0 && d_cw == 0 && cost_delta.is_none() {
+        return;
+    }
+    use std::collections::btree_map::Entry;
+    match map.entry(key.to_string()) {
+        Entry::Vacant(v) => {
+            v.insert(ModelUsageEntry {
+                input: d_in,
+                output: d_out,
+                cache_read: d_cr,
+                cache_write: d_cw,
+                cost: cost_delta,
+            });
+        }
+        Entry::Occupied(mut o) => {
+            let e = o.get_mut();
+            e.input = e.input.saturating_add(d_in);
+            e.output = e.output.saturating_add(d_out);
+            e.cache_read = e.cache_read.saturating_add(d_cr);
+            e.cache_write = e.cache_write.saturating_add(d_cw);
+            e.cost = match (e.cost, cost_delta) {
+                (Some(prev), Some(delta)) => Some(prev + delta),
+                _ => None,
+            };
+        }
+    }
+}
+
+/// Per-session LLM performance accumulator (speed / responsiveness).
+///
+/// Two independent sample means, each stored as a running **sum plus
+/// count**:
+///
+///   - [`Self::avg_tps`] — mean output tokens per second. Per call it is
+///     `completion_tokens / stream_seconds`, timed from the **first**
+///     output token, so the pre-token wait is not counted as generation.
+///   - [`Self::avg_ttft_ms`] — mean time to first token: the wait from
+///     "LLM call started" to the first output event.
+///
+/// Sum + count is the storage form, not the display form — the means are
+/// derived on read. A folded running mean cannot carry two *independent*
+/// denominators: a call that measured TTFT but not speed (a Provider that
+/// reported no completion count) would either pollute the speed mean's
+/// denominator or drop a real responsiveness sample. Keeping the counts
+/// apart makes each mean exact, and it stays exact rather than drifting
+/// with rounding as a session accumulates hundreds of calls.
+///
+/// `None` from either accessor means "no measurement yet" — the frontend
+/// renders "—" rather than a fake 0, matching the `total_input_tokens`
+/// convention.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionPerf {
+    /// Sum of per-call output speeds, in tokens/second.
+    pub tps_sum: f64,
+    /// How many calls contributed to [`Self::tps_sum`].
+    pub tps_samples: u32,
+    /// Sum of per-call time-to-first-token, in milliseconds.
+    pub ttft_ms_sum: f64,
+    /// How many calls contributed to [`Self::ttft_ms_sum`].
+    pub ttft_ms_samples: u32,
+}
+
+impl SessionPerf {
+    /// Mean output tokens/second, or `None` when nothing has been measured.
+    pub fn avg_tps(&self) -> Option<f64> {
+        mean(self.tps_sum, self.tps_samples)
+    }
+
+    /// Mean time-to-first-token in milliseconds, or `None`.
+    pub fn avg_ttft_ms(&self) -> Option<f64> {
+        mean(self.ttft_ms_sum, self.ttft_ms_samples)
+    }
+
+    /// `true` when no call has produced a measurement for either field.
+    /// Lets a caller avoid persisting an accumulator that carries no
+    /// information (the "absent, not zero" rule the meta fields follow).
+    pub fn is_empty(&self) -> bool {
+        self.tps_samples == 0 && self.ttft_ms_samples == 0
+    }
+
+    /// Fold one call's measurements in, returning the updated snapshot.
+    ///
+    /// Each field advances against its OWN count, so a call that measured
+    /// only TTFT moves the latency mean and leaves the speed mean exactly
+    /// where it was — and vice versa.
+    ///
+    /// A call with neither measurement (cancelled before its first token,
+    /// or a Provider that reported no usage) is ignored entirely: it cannot
+    /// drag either mean and bumps neither count.
+    pub fn merged(&self, tps: Option<f64>, ttft_ms: Option<f64>) -> Self {
+        let mut out = self.clone();
+        if let Some(v) = tps.filter(|v| v.is_finite() && *v > 0.0) {
+            out.tps_sum += v;
+            out.tps_samples = out.tps_samples.saturating_add(1);
+        }
+        if let Some(v) = ttft_ms.filter(|v| v.is_finite() && *v >= 0.0) {
+            out.ttft_ms_sum += v;
+            out.ttft_ms_samples = out.ttft_ms_samples.saturating_add(1);
+        }
+        out
+    }
+}
+
+/// Derive a mean from a running sum, `None` when nothing was sampled or the
+/// accumulation is not a usable number.
+fn mean(sum: f64, samples: u32) -> Option<f64> {
+    if samples == 0 || !sum.is_finite() {
+        return None;
+    }
+    let m = sum / samples as f64;
+    m.is_finite().then_some(m)
+}
+
+/// One row of the agent-scoped `token_stats` aggregate table.
+///
+/// Derived state: the aggregate of every session's [`SessionMeta::model_usage`]
+/// breakdown for one (provider, model) pair. Reads of the model-share panel
+/// go through this; a drifted or corrupted aggregate is repairable from the
+/// breakdowns via [`SessionMetaStore::rebuild_token_stats`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TokenStatsRow {
+    pub provider: String,
+    pub model: String,
+    pub total_input: u64,
+    pub total_output: u64,
+    pub total_cache_read: u64,
+    pub total_cache_write: u64,
+    /// Cumulative estimated cost in USD. `None` = at least one contributing
+    /// call had no known price — never a fabricated 0.
+    pub total_cost: Option<f64>,
+}
+
+/// One todo entry (ADR-060). Lives inside `SessionMeta.todos`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoItem {
+    pub id: String,
+    pub content: String,
+    pub status: TodoStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+/// Per-session **narrowing** of the agent-level tool configuration.
+///
+/// The agent layer (`agent_tools.json` / `agent_mcp.json` /
+/// `agent_mcp_tools.json`) owns which tools exist for the agent; this type
+/// owns which of them a *single session* keeps. Absent (`None` on
+/// [`SessionMeta::tool_policy`]) means "inherit the agent layer verbatim",
+/// which is the state every session starts in — the row is written **only**
+/// when the user flips a switch for one session.
+///
+/// # Why a deny-list and not a tri-state map
+///
+/// The session layer can only ever *remove* tools, never add them back:
+///
+/// - MCP tool wrappers are materialised per-agent at connect time
+///   (`connect_mcp_with_reconcile_and_filter`), so a tool the agent layer
+///   did not expose has no wrapper in memory for a session to re-enable.
+///   Re-enabling would need a reconnect or a second, permanently-resident
+///   wrapper set.
+/// - A uniform "on for this session" switch over all four groups keeps one
+///   mental model. A tri-state map would let the UI show a token as on in a
+///   session while the agent panel shows it off, which reads as a bug.
+///
+/// Deny-lists also mean a tool added to the agent later is automatically
+/// available in every existing session (no row to migrate), and an empty
+/// policy is byte-identical to "never toggled" — see [`Self::is_empty`].
+///
+/// Identities: builtin entries are tool names; MCP servers are their
+/// `agent_mcp.json` names; MCP tools are keyed by server, then by the
+/// **unprefixed** tool name as the server's own `tools/list` spells it
+/// (the `mcp_<server>__<tool>` prefix is a runtime rendering detail, not
+/// persisted state).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionToolPolicy {
+    /// Builtin tool names switched off for this session.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub disabled_builtin_tools: BTreeSet<String>,
+    /// MCP server names switched off for this session. Disabling a server
+    /// disables every tool it contributes, whatever `disabled_mcp_tools`
+    /// says (the narrower list is kept so toggling the server back on
+    /// restores the per-tool choices instead of resetting them).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub disabled_mcp_servers: BTreeSet<String>,
+    /// Per-server tool names switched off for this session.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub disabled_mcp_tools: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl SessionToolPolicy {
+    /// `true` when the policy removes nothing — i.e. "inherit the agent
+    /// layer". Persisted as `NULL` by the store (see `upsert_row`), so this
+    /// is the single test every write path uses to decide "store the
+    /// override" vs "go back to inheriting".
+    pub fn is_empty(&self) -> bool {
+        self.disabled_builtin_tools.is_empty()
+            && self.disabled_mcp_servers.is_empty()
+            && self.disabled_mcp_tools.is_empty()
+    }
+
+    /// May this session use the builtin tool `name`?
+    pub fn builtin_allowed(&self, name: &str) -> bool {
+        !self.disabled_builtin_tools.contains(name)
+    }
+
+    /// May this session use MCP server `server` at all?
+    ///
+    /// Only the server list is consulted — per-tool rows are irrelevant
+    /// while the whole server is off.
+    pub fn mcp_server_allowed(&self, server: &str) -> bool {
+        !self.disabled_mcp_servers.contains(server)
+    }
+
+    /// May this session use `tool` from MCP `server`?
+    ///
+    /// Both levels are ANDed: a disabled server wins over an enabled tool.
+    /// Callers pass the server name and the server's own tool name, which
+    /// is what `split_prefixed_tool` yields — the policy never parses the
+    /// prefixed wire name itself.
+    pub fn mcp_tool_allowed(&self, server: &str, tool: &str) -> bool {
+        if !self.mcp_server_allowed(server) {
+            return false;
+        }
+        !self
+            .disabled_mcp_tools
+            .get(server)
+            .is_some_and(|tools| tools.contains(tool))
+    }
+}
+
+/// Who may read a session (ADR-076 §决策 4).
+///
+/// The field exists so a session can be *shared* rather than owned
+/// exclusively: a [`Public`](Self::Public) session is readable by every
+/// authenticated user, a [`Private`](Self::Private) one only by its owner
+/// (or an administrator).
+///
+/// **Absent means public** — but only absent *and* ownerless.
+///
+/// `SessionMeta.visibility` is `Option<SessionVisibility>` with
+/// `skip_serializing_if = "Option::is_none"`, so an unset visibility is
+/// byte-identical on disk to a pre-ADR-076 row. That is the whole point:
+/// upgrading must not retroactively hide every existing session from its
+/// user, and those sessions have no owner to restrict them to anyway
+/// (`is_readable_by` ignores the flag when `initiator` is absent).
+///
+/// A session created by an identified account is **not** left absent: the
+/// creation path stamps `Private` (ADR-076 §决策 4). `None` therefore
+/// means "predates accounts, or local mode" — never "a new session whose
+/// creator nobody bothered to ask" — which is why this value stopped
+/// being the multi-user default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionVisibility {
+    /// Readable by any authenticated user.
+    ///
+    /// The default only where no owner exists to restrict it to; an owned
+    /// session is created `Private` and must be shared deliberately.
+    Public,
+    /// Readable only by the owning account (and administrators).
+    Private,
+    /// Readable by the **participants of the Chat session this execution
+    /// session belongs to** (design 27 §8.2), plus its owner. The binding
+    /// is [`SessionMeta::chat_session_id`]; the caller's Chat membership
+    /// arrives as a Gateway-injected scope token, so no ACL table exists
+    /// (the participant relation *is* the permission).
+    ///
+    /// Deliberately **not** `Public`: `Public` is platform-wide and would
+    /// leak group execution history to any signed-in account (§8.2).
+    Members,
+}
+
+impl SessionVisibility {
+    /// Whether a session with this setting is restricted to its owner.
+    pub fn is_private(self) -> bool {
+        matches!(self, Self::Private)
+    }
+
+    /// Stable `TEXT` encoding, used by the SQLite `sessions.visibility` column.
+    ///
+    /// Deliberately hand-written instead of going through `serde_json`: the
+    /// column is plain `TEXT`, and `serde_json` would store the quotes too.
+    /// A test pins this in lockstep with the `#[serde(rename_all = "lowercase")]`
+    /// representation, so a JSON-sidecar row and a SQLite row agree.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Private => "private",
+            Self::Members => "members",
+        }
+    }
+
+    /// Inverse of [`Self::as_str`].
+    ///
+    /// Unrecognised text returns `None`, i.e. "absent" → public. A column
+    /// value this code does not know (hand-edited database, a future variant
+    /// read by an older binary) must not fail the whole listing, and it must
+    /// not silently mean "private" either.
+    pub fn from_db_str(value: &str) -> Option<Self> {
+        match value {
+            "public" => Some(Self::Public),
+            "private" => Some(Self::Private),
+            "members" => Some(Self::Members),
+            _ => None,
+        }
+    }
+}
+
+/// Who is asking for a session (ADR-076 §决策 4).
+///
+/// Produced by the HTTP layer from the Gateway-injected `x-user-id` +
+/// `x-acowork-scope-admin` headers (see `acowork-gateway`'s auth
+/// middleware) and consumed by the session read/write paths.
+///
+/// **Read and write are not the same axis.** An administrator reads
+/// everything (support inspection, `as_user`), but an execution session has
+/// exactly one initiator and only that initiator may write it — an admin
+/// overriding that would defeat the rule the field exists to enforce
+/// (ADR-076 §决策 4). Local mode has no accounts at all, so there is nobody
+/// to exclude: it stays fully unfiltered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionScope {
+    /// No restriction at all. ADR-114 keeps the account system always on;
+    /// this variant now means "no chat-scope header was supplied" — an
+    /// internal/trusted caller or the wildcard admin scope — never a
+    /// deployment mode with accounts switched off.
+    Unfiltered,
+    /// An administrator: may **read** every session (`as_user` inspection
+    /// included), may **write** only what it initiated itself.
+    Admin {
+        uid: String,
+        chats: Vec<String>,
+    },
+    /// A signed-in account, plus the ids of the Chat sessions it currently
+    /// participates in (design 27 §8.2). `chats` is empty unless the
+    /// Gateway injected the `x-acowork-chat-scope` header; an empty set
+    /// simply means no `Members`-visible session is readable through the
+    /// chat path — fail closed, never fail open.
+    User {
+        uid: String,
+        chats: Vec<String>,
+    },
+}
+
+impl SessionScope {
+    /// Construct a plain user scope with no Chat membership.
+    pub fn user(uid: impl Into<String>) -> Self {
+        Self::User {
+            uid: uid.into(),
+            chats: Vec::new(),
+        }
+    }
+
+    /// Construct an administrator scope with no Chat membership.
+    pub fn admin(uid: impl Into<String>) -> Self {
+        Self::Admin {
+            uid: uid.into(),
+            chats: Vec::new(),
+        }
+    }
+
+    /// Parse the `x-user-id` + `x-acowork-scope-admin` +
+    /// `x-acowork-chat-scope` headers.
+    ///
+    /// `user` absent (header missing) means local mode — the Gateway never
+    /// strips or injects in that mode, so an absent header is the normal
+    /// local case and must NOT be treated as "anonymous, deny everything".
+    /// The all-axes sentinel `*` in `user` is the administrator's unfiltered
+    /// view; `admin` then carries the administrator's own uid, because "may
+    /// read everything" no longer implies "may write everything". An
+    /// `as_user` request is a plain [`Self::User`] (the impersonated
+    /// identity is the whole point).
+    /// `chats` is the comma-separated Chat session id list; empty/absent
+    /// yields an empty membership set.
+    pub fn from_headers(user: Option<&str>, admin: Option<&str>, chats: Option<&str>) -> Self {
+        let chats: Vec<String> = chats
+            .map(|v| {
+                v.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let admin_uid = admin.map(str::trim).filter(|s| !s.is_empty());
+        match Self::from_header_value_with_admin(user, admin_uid) {
+            Self::Unfiltered => Self::Unfiltered,
+            Self::Admin { uid, .. } => Self::Admin { uid, chats },
+            Self::User { uid, .. } => Self::User { uid, chats },
+        }
+    }
+
+    /// Parse the `x-user-id` header value alone (no Chat membership).
+    pub fn from_header_value(value: Option<&str>) -> Self {
+        Self::from_header_value_with_admin(value, None)
+    }
+
+    fn from_header_value_with_admin(value: Option<&str>, admin: Option<&str>) -> Self {
+        match (value.map(str::trim), admin) {
+            (Some("*"), Some(uid)) => Self::admin(uid),
+            (None | Some("") | Some("*"), _) => Self::Unfiltered,
+            (Some(uid), _) => Self::user(uid),
+        }
+    }
+
+    /// The caller's own account id, or `None` for a local-mode scope (no
+    /// accounts exist to attribute anything to).
+    pub fn caller_uid(&self) -> Option<&str> {
+        match self {
+            Self::Unfiltered => None,
+            Self::Admin { uid, .. } | Self::User { uid, .. } => Some(uid.as_str()),
+        }
+    }
+
+    /// The Chat-session membership set (empty for local mode).
+    pub fn chats(&self) -> &[String] {
+        match self {
+            Self::Unfiltered => &[],
+            Self::Admin { chats, .. } | Self::User { chats, .. } => chats,
+        }
+    }
+
+    /// May this caller act **inside** `chat_session_id`?
+    ///
+    /// ADR-106 D7's first wall: a Chat-scoped read must not be served to
+    /// somebody who is not a participant of that Chat, even when the ADR-076
+    /// row-level rules (`is_readable_by`) would let them read the sessions it
+    /// binds. Local mode has no membership table — one human owns everything
+    /// there, so it sees every chat; an account sees only the chats the
+    /// Gateway injected for it. A missing header therefore yields an empty
+    /// membership and denies: fail closed, never fail open.
+    pub fn sees_chat(&self, chat_session_id: &str) -> bool {
+        match self {
+            Self::Unfiltered => true,
+            Self::Admin { chats, .. } | Self::User { chats, .. } => {
+                chats.iter().any(|c| c == chat_session_id)
+            }
+        }
+    }
+}
+
+/// What a caller may **do** to one session, as opposed to what it may read.
+///
+/// ADR-076 §决策 4 gave an execution session exactly one writer (its
+/// `initiator`), which is right for the machine-to-machine case and wrong for
+/// the one that motivated this type: an agent-to-agent run has no human in it,
+/// so when its launch parameters turn out to be unusable the run has no
+/// recovery path at all. The ladder below adds a tier — a human who may steer
+/// the run without owning it — and keeps the owner tier exactly where it was.
+///
+/// **Read stays a separate axis** ([`SessionMeta::is_readable_by`]): an
+/// administrator reads everything and an `aware_users` account reads a session
+/// it cannot write, so a single ladder covering both would have to widen one
+/// of them. Ordered so `>=` is "at least as powerful".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionAuthority {
+    /// May not write. Whether it may *read* is
+    /// [`SessionMeta::is_readable_by`]'s answer, not this one.
+    ReadOnly,
+    /// May append turns and change the run's launch parameters — the
+    /// intervention tier ([`ConfigField::min_authority`] is the table).
+    Intervener,
+    /// The session's initiator (or local mode): everything, including the
+    /// structure that defines the task (workspace, tool policy, deletion).
+    Owner,
+}
+
+impl SessionAuthority {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::Intervener => "intervener",
+            Self::Owner => "owner",
+        }
+    }
+
+    /// May append a turn to the session (a message, a retry, a stop/continue,
+    /// a card answer, an approval)? Every transcript-visible write asks this —
+    /// one predicate, so a new interactive affordance cannot be forgotten the
+    /// way `PUT …/config` and the composer were.
+    pub fn may_turn(self) -> bool {
+        self >= Self::Intervener
+    }
+
+    /// May change `field` through `PUT /sessions/{sid}/config` (or the
+    /// dedicated endpoint for the non-config fields)?
+    pub fn may(self, field: ConfigField) -> bool {
+        self >= field.min_authority()
+    }
+}
+
+/// One field a session's configuration can be changed through, and the
+/// authority that field requires.
+///
+/// A table rather than ad-hoc checks in the handler for the same reason
+/// [`acowork_core::intent::TurnOrigin`] is a table: the failure mode is a
+/// *future* field nobody remembered to gate. Adding a field to
+/// `SessionConfigDelta` without adding a row here does not compile the
+/// validation — so the handler matches on this enum exhaustively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigField {
+    /// Which model the run uses. The whole point of the intervention tier:
+    /// the reported failure is a run parked on a model with no quota.
+    Model,
+    Provider,
+    /// Which key/account the provider is called with. Part of the intervention
+    /// tier because it is the first rung of the degradation ladder: the same
+    /// model under another account is the cheapest way past a spent balance,
+    /// and it changes no premise of the task.
+    ///
+    /// Renamed explicitly: the serde default would spell it `account`, while
+    /// the body field a client actually sends is `account_id`. The two names
+    /// must be the same string or a surface would enable the wrong key.
+    #[serde(rename = "account_id")]
+    Account,
+    ReasoningEffort,
+    Temperature,
+    ContextWindow,
+    /// The directory the agent works in — part of the task's own premise, so
+    /// it stays the owner's.
+    ///
+    /// Renamed explicitly for the same reason as [`Self::Account`]: the request
+    /// field is `workspace_id`, and a surface that reads `workspace` from
+    /// `config_fields` would enable a key the handler never sees.
+    #[serde(rename = "workspace_id")]
+    Workspace,
+    /// Which tools the agent may reach. Same rule as `Workspace`.
+    ToolPolicy,
+    Title,
+    /// Who else may read the session.
+    Visibility,
+    /// Deleting the session.
+    Delete,
+}
+
+impl ConfigField {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Provider => "provider",
+            Self::Account => "account_id",
+            Self::ReasoningEffort => "reasoning_effort",
+            Self::Temperature => "temperature",
+            Self::ContextWindow => "context_window",
+            Self::Workspace => "workspace_id",
+            Self::ToolPolicy => "tool_policy",
+            Self::Title => "title",
+            Self::Visibility => "visibility",
+            Self::Delete => "delete",
+        }
+    }
+
+    /// Every field, in the order a refusal lists them.
+    pub const ALL: &'static [ConfigField] = &[
+        Self::Model,
+        Self::Provider,
+        Self::Account,
+        Self::ReasoningEffort,
+        Self::Temperature,
+        Self::ContextWindow,
+        Self::Workspace,
+        Self::ToolPolicy,
+        Self::Title,
+        Self::Visibility,
+        Self::Delete,
+    ];
+
+    /// The tier this field needs. `Intervener` for everything that only
+    /// changes *how* the run is executed; `Owner` for everything that
+    /// changes *what* the run is — the premise the requesting agent assumed
+    /// when it dispatched the work.
+    pub fn min_authority(self) -> SessionAuthority {
+        match self {
+            Self::Model
+            | Self::Provider
+            | Self::Account
+            | Self::ReasoningEffort
+            | Self::Temperature
+            | Self::ContextWindow => SessionAuthority::Intervener,
+            Self::Workspace | Self::ToolPolicy | Self::Title | Self::Visibility | Self::Delete => {
+                SessionAuthority::Owner
+            }
+        }
+    }
+}
+
+/// The answer the Runtime serves so no surface has to re-derive it
+/// (`SessionInfo.authority` + `config_fields`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCapabilities {
+    pub authority: SessionAuthority,
+    /// May append turns (message / retry / stop / continue / card answer /
+    /// approval / cancel-tool). Equal to `authority.may_turn()`, sent as its
+    /// own field so a client never has to know the ladder.
+    pub may_turn: bool,
+    /// The config fields this caller may write, in [`ConfigField::ALL`] order.
+    pub config_fields: Vec<ConfigField>,
+}
+
+impl SessionCapabilities {
+    /// The one place capabilities are computed.
+    pub fn of(authority: SessionAuthority) -> Self {
+        Self {
+            authority,
+            may_turn: authority.may_turn(),
+            config_fields: ConfigField::ALL
+                .iter()
+                .copied()
+                .filter(|f| authority.may(*f))
+                .collect(),
+        }
+    }
+}
+
+
+/// One persisted session, mapped 1:1 onto the `sessions` row.
+///
+/// `version` is the `conversations/{id}.jsonl` format version the row was
+/// written by (the runtime's `CONVERSATION_FORMAT_VERSION`), `corrupted` is set
+/// when the JSONL had to be salvaged. Both round-trip through
+/// `SqliteSessionMetaStore` and are served verbatim by the `/sessions` API.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionMeta {
+    pub version: u32,
+    pub session_id: String,
+    pub agent_id: String,
+    pub created_at: String,
+
+    /// ADR-076 §决策 4: **who initiated this session** — an account UUID, or
+    /// an agent instance UUID when the session came from an agent-initiated
+    /// intent. One initiator, written once, never re-assigned.
+    ///
+    /// This is the single identity the session has, and it is also the
+    /// permission: only the initiator may write (see [`SessionMeta::is_writable_by`]).
+    /// Deliberately **not** called `user_id` — that name belongs to the
+    /// account system (directory rows, Chat participants, PM `created_by`),
+    /// and reusing it here is what made "the session owner", "the logged-in
+    /// user" and "the message sender" look interchangeable.
+    ///
+    /// `None` = a legacy session written before `initiator` was recorded,
+    /// or one created by an internal caller with no account identity —
+    /// only an unfiltered reader sees those.
+    #[serde(default, alias = "user_id", skip_serializing_if = "Option::is_none")]
+    pub initiator: Option<String>,
+    /// ADR-076 §决策 4: who may read this session. **Absent = public**
+    /// (see [`SessionVisibility`]). Mutable — the owner can flip it at
+    /// any time via `ConversationSession::set_visibility`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<SessionVisibility>,
+    /// Design 27 §8.2: the Chat session this execution session belongs to,
+    /// stamped when the session is created from a `chat:{chat_session_id}`
+    /// routing key. Meaningful only with `visibility = Members`; the read
+    /// check matches it against the caller's Chat membership set injected
+    /// by the Gateway (`x-acowork-chat-scope`), so no ACL table is needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_session_id: Option<String>,
+
+    /// ADR-076 §决策 4 (rev.): the human accounts granted **read-only
+    /// awareness** of this session — the right to know it exists and to
+    /// read its history, without owning it and without writing into it.
+    ///
+    /// This is a deliberate third axis, orthogonal to `initiator` and
+    /// `chat_session_id`, and it exists so `initiator` can keep its true
+    /// meaning ("who started this session" — an agent for an agent-to-agent
+    /// intent, a person for a human turn) instead of being overloaded with
+    /// a human just so that human can see the run. Conflating the two is
+    /// what erased the agent-to-agent vs user-to-agent distinction.
+    ///
+    /// The list is a **creation-time snapshot**, resolved by the Gateway
+    /// (the only party that holds the agent ownership table, ADR-087 D1)
+    /// and carried on the Intent wire to the receiving Runtime, which
+    /// stamps it verbatim. The Runtime never queries an ACL table to
+    /// compute or refresh it — that keeps `is_readable_by` a pure
+    /// membership test with no new dependency. A guest added to an agent
+    /// after a session was created does not retroactively enter this list;
+    /// reconciling the two is a separate concern, not this field's job.
+    ///
+    /// It is seeded **only for agent-to-agent origins** (`AgentRequest` /
+    /// `AgentResponse`), where there is no human privacy subject to protect:
+    /// the owner and guests of both participating agents, plus the nearest
+    /// human in the chain. It is left empty for human origins (`Chat` /
+    /// `PmTask`), because widening those by agent ACL would let one user of
+    /// a shared agent read another user's private conversation — the ACL
+    /// rule must never override a human's privacy subject.
+    ///
+    /// Read-only by construction: `is_writable_by` does not consult this
+    /// field. An empty list is the default and means "no extra readers", so
+    /// pre-existing rows deserialise to unchanged behaviour.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aware_users: Vec<String>,
+
+    /// The human accounts allowed to **intervene** in this session: append
+    /// turns into it and change the run's launch parameters (model /
+    /// provider / reasoning effort), as opposed to merely reading it.
+    ///
+    /// A deliberate second axis beside [`Self::aware_users`], even though
+    /// both are seeded from the same roster today (the owner and guests of
+    /// both participating agents, for agent-to-agent origins only). The two
+    /// capabilities are orthogonal — "may know this run exists" and "may
+    /// steer it" — and collapsing them into one list is the same mistake
+    /// ADR-076 revision fixed for `initiator`; a future origin (a PM task
+    /// session, a cross-tenant shared agent) will need one without the
+    /// other.
+    ///
+    /// Two writers, both single-purpose:
+    ///
+    /// * the Gateway seeds it at creation from the same roster it seeds
+    ///   `aware_users` with (plan §D2), for agent-to-agent origins;
+    /// * the human-join route appends one account when a person is added to
+    ///   the bound Chat as a participant (plan M8) — which is why this list
+    ///   is *not* write-once, unlike `aware_users`.
+    ///
+    /// An empty list (every session created before this field existed)
+    /// grants nothing, so pre-existing rows keep their exact behaviour.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interveners: Vec<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub todos: Option<Vec<TodoItem>>,
+    /// Per-session tool narrowing (see [`SessionToolPolicy`]). `None` = the
+    /// session uses the agent-level tool configuration verbatim, which is
+    /// the state every session starts in; the JSON column is written only
+    /// after the user flips a switch for this one session.
+    ///
+    /// Deliberately an *override*, never a copy: copying the agent list at
+    /// creation would freeze that session against later agent changes,
+    /// which is the opposite of the intended "inherit until touched"
+    /// semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_policy: Option<SessionToolPolicy>,
+
+    pub message_count: u64,
+    pub last_active_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<SessionTokens>,
+    /// Per-provider/model breakdown of the session's cumulative tokens —
+    /// the source of truth behind the agent-scoped `token_stats` aggregate.
+    /// `None` on rows written before the column existed; the v6 migration
+    /// seeds those with a single `"unknown|unknown"` entry carrying the
+    /// historical totals (old usage is deliberately NOT attributed to
+    /// `SessionMeta.model` — a model switch mid-session would misbill it).
+    /// `BTreeMap` so a serialised map is byte-stable across writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_usage: Option<std::collections::BTreeMap<String, ModelUsageEntry>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_call_counter: Option<u32>,
+    /// Session-level LLM speed / responsiveness averages. `None` until the
+    /// first LLM call has produced a measurement; absent on sessions created
+    /// before this field existed, which deserialise via the `Option` default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub perf: Option<SessionPerf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_compaction_offset: Option<u64>,
+
+    #[serde(default)]
+    pub corrupted: bool,
+}
+
+impl SessionMeta {
+    /// The session's tool narrowing, materialised for callers that only
+    /// need the deny-lists. `None` (never toggled) reads as the empty
+    /// policy = "inherit the agent layer", so no call site has to spell
+    /// out the `Option` dance and risk treating "absent" as "deny all".
+    pub fn tool_policy_or_default(&self) -> SessionToolPolicy {
+        self.tool_policy.clone().unwrap_or_default()
+    }
+
+    /// May `scope` **read** this session (ADR-076 §决策 4)?
+    ///
+    /// An unset (`None`) visibility is public: every signed-in account
+    /// may read it. Only an explicit `private` restricts reading to the
+    /// owning account.
+    ///
+    /// In practice `None` now shows up only on sessions with no owner
+    /// (pre-ADR-076 data, or local mode): the creation path stamps
+    /// `Private` on anything it can attribute to an account.
+    pub fn is_readable_by(&self, scope: &SessionScope) -> bool {
+        match scope {
+            // An administrator reads everything: support inspection and
+            // `as_user` are the whole point of the role. Reading is not
+            // writing — see `is_writable_by`.
+            SessionScope::Unfiltered | SessionScope::Admin { .. } => true,
+            SessionScope::User { uid, chats } => {
+                // ADR-076 §决策 4 (rev.): read-only awareness. The Gateway
+                // seeds this list when it delivers an agent-to-agent intent
+                // — the owner and permission guests of both agents see the
+                // session the two agents started between themselves, which
+                // has no human initiator to otherwise grant them. It grants
+                // reading only: `is_writable_by` deliberately never consults
+                // it, so an aware account cannot type into an execution it
+                // did not start. For a human-initiated session the list is
+                // empty and this is inert.
+                if self.aware_users.iter().any(|u| u == uid) {
+                    return true;
+                }
+                // Plan D2: the intervention roster reads what it may steer.
+                // The two lists are seeded from one Gateway fact today, so this
+                // is usually redundant — and it must not stay *implicitly*
+                // redundant: an intervener who cannot read the session is a
+                // grant that cannot be used, since the model it has to change is
+                // reached through this session's own surface.
+                if self.is_intervener(uid) {
+                    return true;
+                }
+                if self.visibility == Some(SessionVisibility::Members) {
+                    // Design 27 §8.2: a group execution session is readable
+                    // by its owner and by any current participant of the
+                    // bound Chat session. Membership is the Gateway-injected
+                    // set — removed participants lose access immediately
+                    // (§8.3), no stale grant exists.
+                    let member = self
+                        .chat_session_id
+                        .as_deref()
+                        .is_some_and(|c| chats.iter().any(|x| x == c));
+                    return member || self.initiator.as_deref() == Some(uid.as_str());
+                }
+                match self.initiator.as_deref() {
+                // Ownerless sessions are a two-way split, and the split is
+                // the whole reason `None` and `Some(Private)` must not be
+                // collapsed:
+                //
+                //   `None` / `Public` → readable by every account.
+                //     This is pre-ADR-076 data (no owner to restrict it to)
+                //     and local-mode sessions. Hiding them on upgrade would
+                //     strand users outside their own history.
+                //
+                //   `Private` → readable by nobody but an administrator.
+                //     An *unclaimed* session. The agent creates one at cold
+                //     start, before any account has touched the process;
+                //     handing that to every account as a shared session is
+                //     how two users end up typing into the same
+                //     conversation. "Private with no owner" honestly means
+                //     "belongs to no one", so no account gets it.
+                //
+                // Note this is the *explicit* flag, set by the creation
+                // path or an administrator — not something a user can
+                // reach (see `is_writable_by` and `put_session_visibility`).
+                None => !self.visibility.is_some_and(SessionVisibility::is_private),
+                Some(owner) => {
+                    !self.visibility.is_some_and(SessionVisibility::is_private)
+                        || owner == uid.as_str()
+                }
+                }
+            }
+        }
+    }
+
+    /// May `scope` **modify** this session (open / close / delete /
+    /// retitle / re-share)?
+    ///
+    /// Deliberately stricter than [`Self::is_readable_by`]: a public
+    /// session is *visible* to every account but *owned* by exactly one,
+    /// so sharing is not the same as handing over the delete button.
+    ///
+    /// Ownerless sessions keep the pre-ADR-076 rule — modifiable by any
+    /// signed-in account — for the same reason [`Self::is_readable_by`]
+    /// keeps them readable: that is the behaviour data predating accounts
+    /// (and local mode) depends on, and locking them to admins would
+    /// strand users outside their own history.
+    ///
+    /// Two ownerless cases are exceptions, and they pull in opposite
+    /// directions:
+    ///
+    /// * `Private` — **nobody** writes it, admin included: an unclaimed
+    ///   session nobody may read is also one nobody may write, or the
+    ///   first user to touch it could flip the flag back and re-share it
+    ///   with everyone.
+    /// * `Members` — **only an administrator** writes it. On a *claimed*
+    ///   session `Members` is a pure read grant (see below), but with no
+    ///   initiator that rule protects nobody and merely strands the row:
+    ///   readable by the chat's participants, writable by no one, which the
+    ///   ChatPanel renders as a permanently locked composer. Admin adoption
+    ///   is such a session's only exit — rows created before an admin scope
+    ///   carried a uid look exactly like this (ADR-076 §决策 4).
+    ///
+    /// Otherwise an **administrator is held to the same rule as anyone
+    /// else**: a claimed execution session has exactly one initiator, so
+    /// letting an admin type into someone else's would put a second person
+    /// into a conversation that is defined as single-initiator (ADR-076
+    /// §决策 4). Reading is what the role buys, and `as_user` covers the
+    /// "look at it as them" case without a write. Local mode keeps full
+    /// access — there is no second account to protect a session from.
+    pub fn is_writable_by(&self, scope: &SessionScope) -> bool {
+        self.authority_for(scope).may_turn()
+    }
+
+    /// The one place a caller's write **tier** over this session is computed
+    /// (plan §D1). [`Self::is_writable_by`] is its `may_turn()` shorthand; the
+    /// per-field table lives on [`ConfigField::min_authority`].
+    ///
+    /// The `initiator` rule is unchanged (ADR-076 §决策 4): a claimed session
+    /// has exactly one owner, admin included. What is new is the tier below
+    /// it — an `interveners` account may append turns and re-point the run at
+    /// a usable model, and nothing else. Without that tier an agent-to-agent
+    /// run whose launch parameters are unusable is unrecoverable by
+    /// construction: the only writer is the agent that dispatched it, and it
+    /// has already been told the request failed.
+    pub fn authority_for(&self, scope: &SessionScope) -> SessionAuthority {
+        match scope {
+            SessionScope::Unfiltered => SessionAuthority::Owner,
+            SessionScope::Admin { uid, .. } | SessionScope::User { uid, .. } => {
+                match self.initiator.as_deref() {
+                // Nobody recorded a claim, so there is nobody to protect:
+                // the pre-account rule above stands — whoever may read it
+                // may write it, `Private` stays the one exception (an
+                // unclaimed private session belongs to no one, and the
+                // first writer could re-share it with everyone), and
+                // `Members` stays a read grant (§8.2 — a member never owns
+                // the group's execution session).
+                //
+                // An administrator is the exception to that last one, and
+                // only here: with no initiator there is no single-initiator
+                // rule to defeat, but an *unclaimed* chat-bound session is
+                // unreachable from every other surface. Sessions created
+                // before an admin scope carried a uid are exactly that: read
+                // through the chat binding, locked as "shared by another
+                // account" for everyone, admin included, with no way back.
+                None => match self.visibility {
+                    Some(SessionVisibility::Private) => SessionAuthority::ReadOnly,
+                    Some(SessionVisibility::Members) => {
+                        if matches!(scope, SessionScope::Admin { .. }) {
+                            SessionAuthority::Owner
+                        } else {
+                            SessionAuthority::ReadOnly
+                        }
+                    }
+                    _ => SessionAuthority::Owner,
+                },
+                // A claimed session has exactly one owner — admin included.
+                // `Members` never transfers ownership: chat participants read
+                // the group execution history, their messages enter through
+                // the agent's delivery path, not a direct session write
+                // (design 27 §8.2).
+                Some(initiator) => {
+                    if initiator == uid.as_str() {
+                        SessionAuthority::Owner
+                    } else if self.is_intervener(uid) {
+                        SessionAuthority::Intervener
+                    } else {
+                        SessionAuthority::ReadOnly
+                    }
+                }
+                }
+            }
+        }
+    }
+
+    /// Is `uid` one of this session's human interveners (plan §D2)?
+    ///
+    /// Kept as its own predicate because two call sites need the *fact* rather
+    /// than the tier: the provenance stamp on an intervention turn (who is
+    /// speaking on the initiator's behalf) and the system-block decision that
+    /// tells the responder a human is present.
+    pub fn is_intervener(&self, uid: &str) -> bool {
+        !uid.is_empty() && self.interveners.iter().any(|u| u == uid)
+    }
+
+    /// What `scope` may do to this session, as served on `SessionInfo`.
+    pub fn capabilities_for(&self, scope: &SessionScope) -> SessionCapabilities {
+        SessionCapabilities::of(self.authority_for(scope))
+    }
+}
+
+/// Trait every session-meta backend implements.
+///
+/// Method semantics:
+/// - `get`: `Ok(None)` when the row is missing, `Err` only for backend failure.
+/// - `upsert`: replaces the entire row. No `insert_or_update` distinction.
+/// - `delete`: removes one session row (and any derived index entry). No-op
+///   when the session is absent, so callers do not need a pre-check.
+/// - `list_recent`: cap `limit`. Order is `last_active_at` descending, read off
+///   the `last_active_at` index.
+/// - `find_latest`: zero-cost shortcut for `list_recent(1).into_iter().next()`.
+/// - `search`: substring query against `title` first, falling back to
+///   `agent_id` / `workspace_id` (FTS5 trigram). Empty `query` returns the same
+///   as `list_recent`.
+/// - `prune_to`: leaves the first `max_sessions` newest rows **per owner** and
+///   removes the rest, returning the deleted ids. Bucketing by owner is what
+///   keeps one account's busy week from evicting another account's history
+///   (ADR-076 §决策 4).
+pub trait SessionMetaStore: Send + Sync {
+    fn get(&self, session_id: &str) -> Result<Option<SessionMeta>>;
+    fn upsert(&self, meta: &SessionMeta) -> Result<()>;
+    /// Remove a single session row. No-op when the session is absent.
+    fn delete(&self, session_id: &str) -> Result<()>;
+    fn list_recent(&self, limit: usize) -> Result<Vec<SessionMeta>>;
+    fn find_latest(&self) -> Result<Option<SessionMeta>>;
+    fn search(&self, query: &str, limit: usize) -> Result<Vec<SessionMeta>>;
+    /// Returns the deleted session_ids so the caller can clean up JSONL.
+    fn prune_to(&self, max_sessions: usize) -> Result<Vec<String>>;
+    /// Agent-scoped per-(provider, model) token aggregate (`token_stats`).
+    /// Backends without a statistics table return `Err`.
+    fn token_stats(&self) -> Result<Vec<TokenStatsRow>> {
+        Err(AcoworkError::Memory(
+            "token_stats not supported by this backend".to_string(),
+        ))
+    }
+    /// Drop the aggregate table and re-derive it from every row's
+    /// `model_usage` breakdown (disposable-derived-index repair path). Not a
+    /// request-path call — invoked manually when the aggregate is suspected
+    /// to have drifted from the breakdowns.
+    fn rebuild_token_stats(&self) -> Result<()> {
+        Err(AcoworkError::Memory(
+            "token_stats not supported by this backend".to_string(),
+        ))
+    }
+    /// Cheap consistency verdict for the `token_stats` aggregate: does
+    /// Σ(aggregate rows) still equal Σ(per-session `model_usage`
+    /// breakdowns)? Backends without the aggregate table return `Err`.
+    ///
+    /// Token dimensions compare exactly. The cost dimension follows the
+    /// aggregate's poison-to-NULL rule: a NULL aggregate cost counts as
+    /// consistent (unpriced contributions permanently poison the row
+    /// until [`SessionMetaStore::rebuild_token_stats`]), a priced
+    /// aggregate must match Σ detail costs.
+    fn token_stats_consistent(&self) -> Result<bool> {
+        Err(AcoworkError::Memory(
+            "token_stats not supported by this backend".to_string(),
+        ))
+    }
+
+    // ── intent routing (ADR-106 D11) ──────────────────────────────────
+    //
+    // Which execution session owns which intent context, and which of those
+    // contexts have ended. This used to live in `intent-sessions.json` and
+    // `terminal-sessions.json` inside the agent's work dir — a second durable
+    // statement of facts the session row already carries, which could (and
+    // did) disagree with the binding after a half-completed routing. The row is
+    // the truth; these are the only writes that touch `intent_key` /
+    // `intent_closed`, and the session's own meta upsert never lists those two
+    // columns, so a `write_meta()` can not erase a routing decision and a
+    // routing decision can not erase a title.
+
+    /// The **open** session owning this intent context, newest first. `None`
+    /// means nothing owns it (never bound, or every holder closed).
+    fn intent_lookup(&self, key: &str) -> Result<Option<String>>;
+
+    /// Bind a session to an intent context. Writing-once-by-convention: a
+    /// session's context is decided when it is created, and rebinding one that
+    /// already answers another context is the bug D11 exists to kill.
+    fn intent_bind(&self, session_id: &str, key: &str) -> Result<()>;
+
+    /// Mark every open binding of `key` closed, returning the session ids it
+    /// changed so the caller can end their execution contexts. Idempotent: a
+    /// second close changes nothing and reports nothing.
+    fn intent_close(&self, key: &str) -> Result<Vec<String>>;
+
+    /// Re-open a session's context mark after its task was reopened: the
+    /// session is live again, so it is routable again.
+    fn intent_reopen(&self, session_id: &str) -> Result<()>;
+
+    /// Every binding, for the Chat Router's candidate filter (the derived index
+    /// D11 replaces the mapping file with). Metadata only, never a transcript.
+    fn intent_bindings(&self) -> Result<Vec<IntentBinding>>;
+}
+
+/// One session's intent-routing binding (ADR-106 D11).
+///
+/// The routing facts a session must state about itself: which intent context it
+/// owns (`conv:task:{project}:{task}` for a PM task, `conv:{conversation_id}`
+/// for an agent-to-agent conversation), and whether that context has ended. A
+/// closed binding is never offered as a routing candidate — routing a follow-up
+/// into a finished task answers into a conversation nobody reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntentBinding {
+    pub session_id: String,
+    pub intent_key: String,
+    pub closed: bool,
+}
+
+/// Converts `last_active_at` (RFC3339 string) to the epoch-ms `i64` the
+/// `last_active_at` column indexes. Returns 0 for unparseable input, which
+/// sorts the row to the bottom (SQLite compares `INTEGER` numerically).
+pub fn last_active_at_ms(meta: &SessionMeta) -> i64 {
+    DateTime::parse_from_rfc3339(&meta.last_active_at)
+        .map(|dt| dt.with_timezone(&Utc).timestamp_millis())
+        .unwrap_or(0)
+}
+
+// `Send + Sync` sanity: the trait is used behind `Arc<dyn _>` across threads.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Box<dyn SessionMetaStore>>();
+};
+
+#[cfg(test)]
+mod perf_tests {
+    use super::SessionPerf;
+
+    fn approx(a: f64, b: f64) {
+        assert!((a - b).abs() < 1e-6, "expected {b}, got {a}");
+    }
+
+    #[test]
+    fn merged_averages_each_call_in() {
+        let mut perf = SessionPerf::default();
+
+        // Call 1: 900 tokens over 3.0s = 300 t/s, TTFT 500ms.
+        perf = perf.merged(Some(300.0), Some(500.0));
+        approx(perf.avg_tps().unwrap(), 300.0);
+        approx(perf.avg_ttft_ms().unwrap(), 500.0);
+        assert_eq!(perf.tps_samples, 1);
+        assert_eq!(perf.ttft_ms_samples, 1);
+
+        // Call 2: 100 t/s, TTFT 100ms → sample mean of both.
+        perf = perf.merged(Some(100.0), Some(100.0));
+        approx(perf.avg_tps().unwrap(), 200.0);
+        approx(perf.avg_ttft_ms().unwrap(), 300.0);
+        assert_eq!(perf.tps_samples, 2);
+
+        // Call 3: 200 t/s, TTFT 300ms → mean of three.
+        perf = perf.merged(Some(200.0), Some(300.0));
+        approx(perf.avg_tps().unwrap(), 200.0);
+        approx(perf.avg_ttft_ms().unwrap(), 300.0);
+        assert_eq!(perf.tps_samples, 3);
+        assert_eq!(perf.ttft_ms_samples, 3);
+    }
+
+    /// The two means count DIFFERENT sets of calls, so each must divide by
+    /// its own sample count.
+    ///
+    /// Regression: the first implementation folded a running mean under a
+    /// single shared `samples` counter, so a call that measured TTFT but not
+    /// speed (a Provider reporting no completion count — the common
+    /// `usage == None` / `completion_tokens == 0` case) still advanced the
+    /// denominator of the speed mean. `{300 t/s}, {no speed}, {100 t/s}`
+    /// then reported 233.3 t/s instead of the true 200: a silently inflated
+    /// figure shown to the user.
+    #[test]
+    fn partial_samples_do_not_inflate_the_other_mean() {
+        let mut perf = SessionPerf::default();
+        perf = perf.merged(Some(300.0), Some(500.0));
+        // Speed unmeasurable, TTFT measurable.
+        perf = perf.merged(None, Some(100.0));
+        // Speed measurable again.
+        perf = perf.merged(Some(100.0), Some(300.0));
+
+        assert_eq!(perf.tps_samples, 2, "two speed samples");
+        assert_eq!(perf.ttft_ms_samples, 3, "three latency samples");
+        approx(perf.avg_tps().unwrap(), 200.0);
+        approx(perf.avg_ttft_ms().unwrap(), 300.0);
+    }
+
+    #[test]
+    fn unmeasurable_call_does_not_move_the_average() {
+        let mut perf = SessionPerf::default();
+        perf = perf.merged(Some(300.0), Some(500.0));
+
+        // A cancelled stream: no TTFT, no completion count, no duration.
+        // Folding in a 0 here would report "the model stopped generating".
+        let after = perf.merged(None, None);
+        assert_eq!(after, perf);
+        assert_eq!(after.tps_samples, 1);
+        assert_eq!(after.ttft_ms_samples, 1);
+    }
+
+    #[test]
+    fn first_call_seeds_each_field_independently() {
+        // A provider that reports no completion count still yields a TTFT —
+        // the user cares about responsiveness even when the speed is unknown.
+        let perf = SessionPerf::default().merged(None, Some(250.0));
+        assert_eq!(perf.avg_tps(), None);
+        approx(perf.avg_ttft_ms().unwrap(), 250.0);
+        assert_eq!(perf.ttft_ms_samples, 1);
+        assert_eq!(perf.tps_samples, 0);
+    }
+
+    #[test]
+    fn non_positive_and_non_finite_samples_are_rejected() {
+        let perf = SessionPerf::default()
+            // A 0 t/s would mean "generated nothing"; a NaN/inf from a
+            // degenerate duration must not poison a running sum.
+            .merged(Some(0.0), None)
+            .merged(Some(f64::NAN), None)
+            .merged(Some(-12.0), None)
+            .merged(None, Some(f64::INFINITY))
+            .merged(None, Some(-1.0));
+        assert!(perf.is_empty());
+        assert_eq!(perf.avg_tps(), None);
+        assert_eq!(perf.avg_ttft_ms(), None);
+
+        // TTFT of exactly 0ms is a legitimate measurement (sub-ms first
+        // token), unlike a 0 speed.
+        let perf = SessionPerf::default().merged(None, Some(0.0));
+        assert_eq!(perf.avg_ttft_ms(), Some(0.0));
+        assert_eq!(perf.ttft_ms_samples, 1);
+        assert!(!perf.is_empty());
+    }
+
+    #[test]
+    fn empty_accumulator_reads_as_none_not_zero() {
+        let perf = SessionPerf::default();
+        assert!(perf.is_empty());
+        assert_eq!(perf.avg_tps(), None);
+        assert_eq!(perf.avg_ttft_ms(), None);
+    }
+}
+
+#[cfg(test)]
+mod chat_scope_tests {
+    use super::SessionScope;
+
+    /// ADR-106 D7's first wall. Local mode has no membership table, so one
+    /// human owns every chat; an account is limited to what the Gateway
+    /// injected — and an absent header means nothing is injected, which must
+    /// deny rather than admit everything.
+    #[test]
+    fn chat_membership_is_fail_closed() {
+        assert!(SessionScope::Unfiltered.sees_chat("chat-1"));
+
+        let member = SessionScope::from_headers(Some("alice"), None, Some("chat-1, chat-2"));
+        assert!(member.sees_chat("chat-1"));
+        assert!(member.sees_chat("chat-2"));
+        assert!(!member.sees_chat("chat-3"));
+
+        let no_header = SessionScope::from_headers(Some("alice"), None, None);
+        assert!(!no_header.sees_chat("chat-1"));
+
+        // An administrator may read every *session*, which is a different
+        // question from being a participant of a *chat*.
+        let admin = SessionScope::from_headers(Some("*"), Some("root"), Some("chat-1"));
+        assert!(admin.sees_chat("chat-1"));
+        assert!(!admin.sees_chat("chat-2"));
+    }
+}
+
+
+#[cfg(test)]
+mod aware_users_tests {
+    use super::{SessionMeta, SessionScope, SessionVisibility};
+
+    /// Build a session meta from a minimal JSON body. The fields that carry
+    /// no serde default (`version`/`session_id`/`agent_id`/`created_at`/
+    /// `message_count`/`last_active_at`) are supplied; everything else —
+    /// including `aware_users` — takes its default, so a test names only
+    /// what it is about.
+    fn meta(initiator: Option<&str>, visibility: Option<&str>, aware: &[&str]) -> SessionMeta {
+        let mut obj = serde_json::Map::new();
+        obj.insert("version".into(), serde_json::json!(3));
+        obj.insert("session_id".into(), serde_json::json!("s-1"));
+        obj.insert("agent_id".into(), serde_json::json!("com.test.agent"));
+        obj.insert("created_at".into(), serde_json::json!("2026-01-01T00:00:00Z"));
+        obj.insert("message_count".into(), serde_json::json!(0));
+        obj.insert("last_active_at".into(), serde_json::json!("2026-01-01T00:00:00Z"));
+        if let Some(u) = initiator {
+            obj.insert("initiator".into(), serde_json::json!(u));
+        }
+        if let Some(v) = visibility {
+            obj.insert("visibility".into(), serde_json::json!(v));
+        }
+        if !aware.is_empty() {
+            obj.insert(
+                "aware_users".into(),
+                serde_json::json!(aware.iter().map(|s| s.to_string()).collect::<Vec<_>>()),
+            );
+        }
+        serde_json::from_value(serde_json::Value::Object(obj)).expect("valid meta")
+    }
+
+    /// ADR-076 §决策 4 (rev.) — the hard invariant. An agent-to-agent session
+    /// (initiator is an agent instance, Private) is readable by every human on
+    /// the awareness list, even though none of them is the initiator.
+    #[test]
+    fn aware_account_can_read_an_agent_initiated_session() {
+        let m = meta(
+            Some("8f7be9a6-agent-instance"),
+            Some("private"),
+            &["user-nicholas", "user-guest"],
+        );
+        assert!(m.is_readable_by(&SessionScope::user("user-nicholas")));
+        assert!(m.is_readable_by(&SessionScope::user("user-guest")));
+        // A human not on the list, not the initiator, still cannot read it.
+        assert!(!m.is_readable_by(&SessionScope::user("user-stranger")));
+    }
+
+    /// The awareness grant is read-only by construction: `is_writable_by`
+    /// never consults `aware_users`, so an aware account that is not on the
+    /// **intervention** roster cannot type into an execution it did not start.
+    /// The two lists grant two different things on purpose — see
+    /// [`super::SessionMeta::interveners`] — and this test pins the one that
+    /// must never widen by accident.
+    #[test]
+    fn aware_account_cannot_write() {
+        let m = meta(Some("8f7be9a6-agent-instance"), Some("private"), &["user-nicholas"]);
+        assert!(m.is_readable_by(&SessionScope::user("user-nicholas")));
+        assert!(!m.is_writable_by(&SessionScope::user("user-nicholas")));
+        // Only the initiating agent can write it.
+        assert!(m.is_writable_by(&SessionScope::user("8f7be9a6-agent-instance")));
+    }
+
+    /// A human-initiated session carries no awareness list (the initiator
+    /// already grants access, and seeding the ACL there would leak a private
+    /// request). An empty `aware_users` is inert: it neither widens nor
+    /// narrows the pre-feature behaviour.
+    #[test]
+    fn empty_awareness_is_inert_for_a_human_initiator() {
+        let m = meta(Some("user-nicholas"), Some("private"), &[]);
+        assert!(m.is_readable_by(&SessionScope::user("user-nicholas")));
+        assert!(m.is_writable_by(&SessionScope::user("user-nicholas")));
+        assert!(!m.is_readable_by(&SessionScope::user("user-stranger")));
+    }
+
+    /// Awareness does not override an explicit `Members` chat grant's rules —
+    /// it is purely additive. A `Members` session bound to a chat is readable
+    /// by that chat's members; an aware account outside the chat is *also*
+    /// readable, but a stranger in neither is not.
+    #[test]
+    fn awareness_adds_to_members_without_replacing_it() {
+        let m = meta(Some("8f7be9a6-agent-instance"), Some("members"), &["user-aware"]);
+        let mut bound = SessionScope::user("user-member");
+        if let SessionScope::User { chats, .. } = &mut bound {
+            chats.push("chat-group-1".to_string());
+        }
+        let mut meta_with_chat = m.clone();
+        meta_with_chat.chat_session_id = Some("chat-group-1".to_string());
+        assert!(meta_with_chat.is_readable_by(&bound)); // via chat membership
+        assert!(meta_with_chat.is_readable_by(&SessionScope::user("user-aware"))); // via awareness
+        assert!(!meta_with_chat.is_readable_by(&SessionScope::user("user-stranger")));
+    }
+
+    /// The visibility enum's `is_private` must not be confused with the
+    /// awareness path: an aware account reads a Private session even though
+    /// the Private branch would otherwise deny every non-initiator.
+    #[test]
+    fn awareness_overrides_private_denial() {
+        let m = meta(Some("8f7be9a6-agent-instance"), Some("private"), &["user-nicholas"]);
+        assert_eq!(m.visibility, Some(SessionVisibility::Private));
+        assert!(m.is_readable_by(&SessionScope::user("user-nicholas")));
+    }
+}
+
+#[cfg(test)]
+mod tool_policy_tests {
+    use super::SessionToolPolicy;
+
+    fn policy() -> SessionToolPolicy {
+        let mut p = SessionToolPolicy::default();
+        p.disabled_builtin_tools.insert("web_fetch".into());
+        p.disabled_mcp_servers.insert("playwright".into());
+        p.disabled_mcp_tools
+            .entry("pm".into())
+            .or_default()
+            .insert("pm_submit_task".into());
+        p
+    }
+
+    /// A never-toggled session carries the empty policy, which removes
+    /// nothing — the whole "inherit the agent layer" contract rests on this.
+    #[test]
+    fn default_policy_allows_everything() {
+        let p = SessionToolPolicy::default();
+        assert!(p.is_empty());
+        assert!(p.builtin_allowed("web_fetch"));
+        assert!(p.mcp_server_allowed("playwright"));
+        assert!(p.mcp_tool_allowed("pm", "pm_submit_task"));
+    }
+
+    #[test]
+    fn builtin_and_server_lists_narrow_independently() {
+        let p = policy();
+        assert!(!p.is_empty());
+        assert!(!p.builtin_allowed("web_fetch"));
+        assert!(p.builtin_allowed("read_file"));
+        assert!(!p.mcp_server_allowed("playwright"));
+        assert!(p.mcp_server_allowed("pm"));
+    }
+
+    /// A disabled server wins over an individually enabled tool — the server
+    /// toggle is the coarser switch and must never be bypassed by the finer
+    /// one. The per-tool row is deliberately NOT cleared when the server is
+    /// switched off, so switching the server back on restores the per-tool
+    /// choices instead of silently enabling everything.
+    #[test]
+    fn disabled_server_outranks_tool_level_state() {
+        let mut p = policy();
+        p.disabled_mcp_servers.insert("pm".into());
+        assert!(!p.mcp_tool_allowed("pm", "pm_claim_task"));
+        assert!(!p.mcp_tool_allowed("pm", "pm_submit_task"));
+
+        p.disabled_mcp_servers.remove("pm");
+        assert!(p.mcp_tool_allowed("pm", "pm_claim_task"));
+        assert!(!p.mcp_tool_allowed("pm", "pm_submit_task"));
+    }
+
+    /// An unknown server/tool is allowed: the deny-list only ever removes
+    /// identities it was told about, so a tool added to the agent after the
+    /// session was configured appears without a migration.
+    #[test]
+    fn unknown_identities_are_allowed() {
+        let p = policy();
+        assert!(p.mcp_server_allowed("docling"));
+        assert!(p.mcp_tool_allowed("docling", "convert"));
+        assert!(p.mcp_tool_allowed("pm", "pm_create_task"));
+    }
+
+    /// The per-tool denies are a **map of arrays** (`{"server": ["tool"]}`),
+    /// not a list of `{server, tool}` pairs. Pinned as a literal because the
+    /// Desktop's `fromWirePolicy` / `toWirePolicy`
+    /// (`apps/acowork-desktop/src/lib/toolInventory.ts`) assert the same
+    /// literal: the two sides are only kept honest by agreeing on this shape,
+    /// and neither mock-based suite can notice a drift on its own.
+    #[test]
+    fn mcp_tool_denies_serialise_as_a_map() {
+        let mut p = SessionToolPolicy::default();
+        p.disabled_builtin_tools.insert("web_fetch".into());
+        p.disabled_mcp_servers.insert("docling".into());
+        p.disabled_mcp_tools
+            .insert("pm".into(), ["pm_claim_task".to_string()].into());
+        p.disabled_mcp_tools
+            .insert("docling".into(), ["convert".to_string()].into());
+
+        let json = serde_json::to_value(&p).expect("serialise");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "disabled_builtin_tools": ["web_fetch"],
+                "disabled_mcp_servers": ["docling"],
+                "disabled_mcp_tools": { "pm": ["pm_claim_task"], "docling": ["convert"] },
+            })
+        );
+        let back: SessionToolPolicy = serde_json::from_value(json).expect("deserialise");
+        assert_eq!(back, p);
+    }
+
+    /// The wire shape is what the Desktop writes: stable key names, empty
+    /// groups omitted entirely (so an untouched group cannot be mistaken for
+    /// "explicitly empty" by a future reader).
+    #[test]
+    fn serialises_only_the_groups_in_use() {
+        let mut p = SessionToolPolicy::default();
+        p.disabled_builtin_tools.insert("web_fetch".into());
+        let json = serde_json::to_value(&p).expect("serialise");
+        assert_eq!(
+            json,
+            serde_json::json!({ "disabled_builtin_tools": ["web_fetch"] })
+        );
+
+        let back: SessionToolPolicy = serde_json::from_value(json).expect("deserialise");
+        assert_eq!(back, p);
+    }
+}
+
+#[cfg(test)]
+mod authority_tests {
+    use super::{
+        ConfigField, SessionAuthority, SessionCapabilities, SessionMeta, SessionScope,
+        SessionVisibility,
+    };
+
+    /// The name a client sees must be the name a client sends.
+    ///
+    /// `as_str` is what a refusal body and the log speak; the serde name is
+    /// what `SessionInfo.config_fields` carries. These drifted once already
+    /// (`Account` serialised as `account`, the request field is `account_id`),
+    /// which is exactly the "surface enables a key the server ignores" failure
+    /// the table exists to prevent — so the two are pinned against each other
+    /// for every field rather than for the one that broke.
+    #[test]
+    fn every_field_spells_the_same_name_on_the_wire_and_in_a_refusal() {
+        for field in ConfigField::ALL {
+            let serde_name = serde_json::to_value(field).unwrap();
+            assert_eq!(
+                serde_name.as_str(),
+                Some(field.as_str()),
+                "{field:?} is announced as {serde_name} but refused as {}",
+                field.as_str()
+            );
+        }
+    }
+
+    /// Minimal row from JSON, so a test names only the fields it is about —
+    /// every other column (including `interveners`) takes its serde default.
+    fn meta(initiator: Option<&str>, visibility: Option<&str>, interveners: &[&str]) -> SessionMeta {
+        let mut obj = serde_json::Map::new();
+        obj.insert("version".into(), serde_json::json!(3));
+        obj.insert("session_id".into(), serde_json::json!("s-1"));
+        obj.insert("agent_id".into(), serde_json::json!("com.test.agent"));
+        obj.insert("created_at".into(), serde_json::json!("2026-01-01T00:00:00Z"));
+        obj.insert("message_count".into(), serde_json::json!(0));
+        obj.insert("last_active_at".into(), serde_json::json!("2026-01-01T00:00:00Z"));
+        if let Some(u) = initiator {
+            obj.insert("initiator".into(), serde_json::json!(u));
+        }
+        if let Some(v) = visibility {
+            obj.insert("visibility".into(), serde_json::json!(v));
+        }
+        if !interveners.is_empty() {
+            obj.insert(
+                "interveners".into(),
+                serde_json::json!(interveners
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()),
+            );
+        }
+        serde_json::from_value(serde_json::Value::Object(obj)).expect("valid meta")
+    }
+
+    /// The reported defect: an agent-to-agent execution session (initiator is
+    /// an agent instance) has no human writer, so a human could not even change
+    /// the model that made the run fail. The intervention tier is exactly that
+    /// missing writer — and it is a tier, not ownership.
+    #[test]
+    fn intervener_can_steer_but_not_restructure_the_run() {
+        let m = meta(Some("8f7be9a6-agent-instance"), Some("private"), &["user-nicholas"]);
+        let scope = SessionScope::user("user-nicholas");
+        let authority = m.authority_for(&scope);
+        assert_eq!(authority, SessionAuthority::Intervener);
+        // The launch parameters that make the run work again.
+        assert!(m.is_writable_by(&scope));
+        assert!(authority.may(ConfigField::Model));
+        assert!(authority.may(ConfigField::Provider));
+        assert!(authority.may(ConfigField::ReasoningEffort));
+        assert!(authority.may(ConfigField::Temperature));
+        assert!(authority.may(ConfigField::ContextWindow));
+        // The task's own premise stays the owner's.
+        assert!(!authority.may(ConfigField::Workspace));
+        assert!(!authority.may(ConfigField::ToolPolicy));
+        assert!(!authority.may(ConfigField::Delete));
+        assert!(!authority.may(ConfigField::Visibility));
+    }
+
+    /// Reading is not steering: an `aware_users` account that is not on the
+    /// intervention roster keeps today's behaviour exactly.
+    #[test]
+    fn awareness_without_intervention_grants_nothing() {
+        let mut m = meta(Some("8f7be9a6-agent-instance"), Some("private"), &[]);
+        m.aware_users = vec!["user-onlooker".to_string()];
+        let scope = SessionScope::user("user-onlooker");
+        assert!(m.is_readable_by(&scope));
+        assert!(!m.is_writable_by(&scope));
+        assert_eq!(m.authority_for(&scope), SessionAuthority::ReadOnly);
+    }
+
+    /// The initiator keeps everything, including the structural fields — the
+    /// intervention tier must not have cost the owner a single capability.
+    #[test]
+    fn initiator_keeps_the_whole_table() {
+        let m = meta(Some("8f7be9a6-agent-instance"), Some("private"), &[]);
+        let scope = SessionScope::user("8f7be9a6-agent-instance");
+        assert_eq!(m.authority_for(&scope), SessionAuthority::Owner);
+        for field in ConfigField::ALL {
+            assert!(SessionAuthority::Owner.may(*field), "{field:?}");
+        }
+        assert_eq!(
+            SessionCapabilities::of(SessionAuthority::Owner).config_fields,
+            ConfigField::ALL.to_vec()
+        );
+    }
+
+    /// A stranger is not handed a tier by the new list being absent, and local
+    /// mode is unchanged (one implicit human owns everything).
+    #[test]
+    fn strangers_and_unfiltered_scope_are_unchanged() {
+        let m = meta(Some("8f7be9a6-agent-instance"), Some("private"), &["user-other"]);
+        assert_eq!(
+            m.authority_for(&SessionScope::user("user-stranger")),
+            SessionAuthority::ReadOnly
+        );
+        assert_eq!(
+            m.authority_for(&SessionScope::Unfiltered),
+            SessionAuthority::Owner
+        );
+    }
+
+    /// Ownerless rows keep the pre-account rule (ADR-076 §决策 4), including
+    /// both exceptions — the ladder must be a re-expression of that rule, not a
+    /// redefinition.
+    #[test]
+    fn ownerless_rows_keep_the_pre_account_rule() {
+        let public = meta(None, None, &[]);
+        assert_eq!(
+            public.authority_for(&SessionScope::user("anyone")),
+            SessionAuthority::Owner
+        );
+
+        let mut private = meta(None, Some("private"), &[]);
+        private.visibility = Some(SessionVisibility::Private);
+        assert_eq!(
+            private.authority_for(&SessionScope::user("anyone")),
+            SessionAuthority::ReadOnly
+        );
+
+        let mut members = meta(None, Some("members"), &[]);
+        members.visibility = Some(SessionVisibility::Members);
+        assert_eq!(
+            members.authority_for(&SessionScope::user("member")),
+            SessionAuthority::ReadOnly
+        );
+        assert_eq!(
+            members.authority_for(&SessionScope::admin("admin-1")),
+            SessionAuthority::Owner
+        );
+    }
+
+    /// The capability payload the Runtime serves is derived from the same
+    /// ladder, so a surface cannot disagree with the backend about which
+    /// config fields are editable.
+    #[test]
+    fn capabilities_list_only_what_the_tier_may_change() {
+        let caps = SessionCapabilities::of(SessionAuthority::Intervener);
+        assert!(caps.may_turn);
+        assert_eq!(
+            caps.config_fields,
+            vec![
+                ConfigField::Model,
+                ConfigField::Provider,
+                // The first rung of the degradation ladder: same model, another
+                // account's key. Adding it to the table is what makes "switch
+                // the account" an intervention rather than an owner action.
+                ConfigField::Account,
+                ConfigField::ReasoningEffort,
+                ConfigField::Temperature,
+                ConfigField::ContextWindow,
+            ]
+        );
+        let read_only = SessionCapabilities::of(SessionAuthority::ReadOnly);
+        assert!(!read_only.may_turn);
+        assert!(read_only.config_fields.is_empty());
+    }
+}

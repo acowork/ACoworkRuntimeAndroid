@@ -2,17 +2,20 @@
 //!
 //! # Scope of this crate today
 //!
-//! This crate currently contains **one** subsystem: [`host`], the Android host
-//! profile probe, capability model and execution-backend contract. That is the P0
-//! slice of ADR-AND-001 §6.
+//! Two subsystems:
 //!
-//! The scope is deliberately this narrow. README.zh.md sketches a broader
-//! `crates/acowork-android` shared engine, but upstream design doc 30 has not
-//! settled whether the Android engine is a crate compiled into `acowork-runtime`
-//! (§5, option A) or a consumer of a published Host crate (§9). Building the host
-//! subsystem first is the choice that stays correct under either answer: doc 30 §9
-//! itself places `ExecutionBackend` "在引擎内部" and orthogonal to the engine
-//! interface, so nothing here has to be unwound when that question is resolved.
+//! - [`host`] — Android host profile probe, capability model and
+//!   `ExecutionBackend` contract (ADR-AND-001 §6 P0).
+//! - [`node`] — independent Android Node pieces: configurable Runtime engine
+//!   (`EngineSpec`), process table, capability tags, enroll payload shape
+//!   (ADR-AND-003). Speaks the Gateway **protocol** only; does not depend on
+//!   upstream `acowork-node` / `acowork-runtime` crates or binaries.
+//! - [`runtime`] — Runtime-role package load (vendored from upstream loader);
+//!   LLM main loop is a later slice.
+//!
+//! B3 (engine ownership) is closed: this repo is an independent engine. B6
+//! (sibling `acowork-runtime` path) is closed: the engine is configured, never
+//! hardcoded by binary name.
 //!
 //! # Reading order
 //!
@@ -48,3 +51,5 @@
 #![warn(clippy::all)]
 
 pub mod host;
+pub mod node;
+pub mod runtime;

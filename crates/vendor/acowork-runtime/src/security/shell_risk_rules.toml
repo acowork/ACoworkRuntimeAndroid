@@ -1,0 +1,249 @@
+# Shell Risk Rules Configuration
+#
+# This file defines user-customizable risk rules for shell command assessment.
+# Rules are evaluated in order; the first matching rule determines the risk level.
+#
+# Fields:
+#   command    - Command name to match (case-insensitive, required)
+#   subcommand - Optional subcommand to match (e.g., "checkout" for "git checkout")
+#   args_pattern - Optional argument pattern (glob or regex, prefix with "regex:")
+#   risk       - Risk level: "Low", "Medium", "High", or "Blocked"
+#   reason     - Human-readable reason for the risk level
+#
+# Pattern matching:
+#   - Exact match: "HEAD" matches "HEAD"
+#   - Glob: "-f*" matches "-f", "-force", "-force-all"
+#   - Regex: "regex:--force|--no-verify" matches "--force" or "--no-verify"
+#
+# Risk levels:
+#   Low      - Direct execution (no approval needed)
+#   Medium   - Requires user approval (approval gate)
+#   High     - Requires user approval + audit log highlight
+#   Blocked  - Execution rejected without asking
+
+# ── Git destructive operations ────────────────────────────────────────────────
+
+[[rules]]
+command = "git"
+subcommand = "checkout"
+args_pattern = "HEAD"
+risk = "High"
+reason = "Destructive: discards all local uncommitted changes"
+
+[[rules]]
+command = "git"
+subcommand = "reset"
+args_pattern = "--hard"
+risk = "Blocked"
+reason = "Destructive: resets working tree to specified commit"
+
+[[rules]]
+command = "git"
+subcommand = "clean"
+args_pattern = "-f"
+risk = "High"
+reason = "Destructive: removes untracked files"
+
+[[rules]]
+command = "git"
+subcommand = "clean"
+args_pattern = "-fd"
+risk = "High"
+reason = "Destructive: removes untracked files and directories"
+
+[[rules]]
+command = "git"
+subcommand = "clean"
+args_pattern = "-fdx"
+risk = "Blocked"
+reason = "Destructive: removes all untracked files including ignored"
+
+[[rules]]
+command = "git"
+subcommand = "push"
+args_pattern = "--force"
+risk = "High"
+reason = "Destructive: force push can overwrite remote history"
+
+[[rules]]
+command = "git"
+subcommand = "push"
+args_pattern = "-f"
+risk = "High"
+reason = "Destructive: force push can overwrite remote history"
+
+[[rules]]
+command = "git"
+subcommand = "stash"
+args_pattern = "drop"
+risk = "High"
+reason = "Destructive: drops stash entries"
+
+[[rules]]
+command = "git"
+subcommand = "stash"
+args_pattern = "clear"
+risk = "High"
+reason = "Destructive: clears all stash entries"
+
+[[rules]]
+command = "git"
+subcommand = "rm"
+args_pattern = "--cached"
+risk = "High"
+reason = "Destructive: removes files from index but not working tree"
+
+[[rules]]
+command = "git"
+subcommand = "rm"
+args_pattern = "--cached -r"
+risk = "High"
+reason = "Destructive: recursively removes files from index"
+
+[[rules]]
+command = "git"
+subcommand = "restore"
+args_pattern = "--source=HEAD"
+risk = "High"
+reason = "Destructive: restores files from HEAD, discarding changes"
+
+[[rules]]
+command = "git"
+subcommand = "branch"
+args_pattern = "-D"
+risk = "High"
+reason = "Destructive: force deletes branch"
+
+# ── rm destructive operations ──────────────────────────────────────────────────
+# `rm -rf` / `rm -fr` are the canonical destructive delete patterns. They
+# must be classified at least High so that the High approval threshold can
+# gate them. The hard-coded Blocked pattern list still catches the most
+# catastrophic cases (rm -rf /, rm -rf ~) before these rules run, but in
+# general `rm -rf <path>` is just High: user-confirmed, not opaque-rejected.
+#
+# Pattern strategy:
+#   - "-rf*" / "-fr*" cover both token orderings (`-rf`, `-rfv`, `-Rfv`, ...).
+#   - glob matches per-token, so `rm -rf -f ./x` and `rm -r -f ./x` both fire.
+#   - The separate "single recursive" rule promotes `rm -r` / `rm -R` /
+#     `rm --recursive` to High even without -f (a bare `rm -r ./dir` is
+#     still a recursive delete and should not be auto-confirmed at the
+#     Medium threshold).
+
+[[rules]]
+command = "rm"
+args_pattern = "-rf*"
+risk = "High"
+reason = "Destructive: recursive force delete (rm -rf)"
+
+[[rules]]
+command = "rm"
+args_pattern = "-fr*"
+risk = "High"
+reason = "Destructive: recursive force delete (rm -fr)"
+
+[[rules]]
+command = "rm"
+args_pattern = "regex:-(r|R){1,}|--(recursive|force)"
+risk = "High"
+reason = "Destructive: recursive or force delete flag"
+
+# ── Docker destructive operations ─────────────────────────────────────────────
+
+[[rules]]
+command = "docker"
+subcommand = "rm"
+args_pattern = "-f"
+risk = "High"
+reason = "Destructive: force removes containers"
+
+[[rules]]
+command = "docker"
+subcommand = "rmi"
+args_pattern = "-f"
+risk = "High"
+reason = "Destructive: force removes images"
+
+[[rules]]
+command = "docker"
+subcommand = "system"
+args_pattern = "prune"
+risk = "Medium"
+reason = "Removes unused Docker resources"
+
+[[rules]]
+command = "docker"
+subcommand = "system"
+args_pattern = "prune -f"
+risk = "High"
+reason = "Destructive: force removes all unused Docker resources"
+
+# ── npm destructive operations ────────────────────────────────────────────────
+
+[[rules]]
+command = "npm"
+subcommand = "uninstall"
+args_pattern = "-g"
+risk = "Medium"
+reason = "Uninstalls global packages"
+
+[[rules]]
+command = "npm"
+subcommand = "cache"
+args_pattern = "clean"
+risk = "Medium"
+reason = "Cleans npm cache"
+
+# ── pip destructive operations ────────────────────────────────────────────────
+
+[[rules]]
+command = "pip"
+subcommand = "uninstall"
+args_pattern = "-y"
+risk = "Medium"
+reason = "Uninstalls packages without confirmation"
+
+# ── Terraform destructive operations ──────────────────────────────────────────
+
+[[rules]]
+command = "terraform"
+subcommand = "destroy"
+args_pattern = ""
+risk = "High"
+reason = "Destructive: destroys all managed infrastructure"
+
+[[rules]]
+command = "terraform"
+subcommand = "apply"
+args_pattern = "-auto-approve"
+risk = "High"
+reason = "Applies changes without confirmation"
+
+# ── kubectl destructive operations ────────────────────────────────────────────
+
+[[rules]]
+command = "kubectl"
+subcommand = "delete"
+args_pattern = "--force"
+risk = "High"
+reason = "Destructive: force deletes resources"
+
+[[rules]]
+command = "kubectl"
+subcommand = "delete"
+args_pattern = "pod"
+risk = "Medium"
+reason = "Deletes pods"
+
+# ── General destructive patterns ──────────────────────────────────────────────
+
+[[rules]]
+command = "chmod"
+args_pattern = "-R 777 *"
+risk = "High"
+reason = "Security risk: sets world-writable permissions recursively"
+
+[[rules]]
+command = "chown"
+args_pattern = "-R *"
+risk = "High"
+reason = "Security risk: changes ownership recursively"

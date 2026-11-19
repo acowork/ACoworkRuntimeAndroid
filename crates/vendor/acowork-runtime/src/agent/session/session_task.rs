@@ -1,0 +1,3501 @@
+//! SessionTask: independent execution actor for a single session.
+//!
+//! Each `SessionTask` runs in its own tokio task, processing messages
+//! from an inbound channel. It owns an `AgentLoop` instance for the
+//! session's lifetime, ensuring per-session isolation of history,
+//! budget, and loop detection while sharing provider/tools via Arc.
+
+use std::sync::Arc;
+
+use acowork_core::tools::traits::Tool;
+use tokio::sync::Notify;
+use tokio::sync::mpsc;
+
+use crate::agent::agent_core::AgentCore;
+use crate::agent::context::ContextBuilder;
+use crate::agent::inbound::InboundMessage;
+use crate::agent::loop_::{AgentLoop, ChunkEvent, SessionChunkEvent};
+use crate::agent::session::session_manager::RuntimeConfigOverrides;
+use crate::agent::session_core::SessionCore;
+use crate::agent::session_state::SessionState;
+use crate::cancellation::CancelHandle;
+use crate::debug::DebugHandles;
+use crate::debug::DebugObserverImpl;
+use crate::usecases::attachment::on_disk_name;
+
+/// ADR-100 follow-up: the turn-end obligations BOTH transports share, in one
+/// place. A turn that ends without this leaks its Chat facts into the next one
+/// (the surface would still point at the previous round, so a card written later
+/// belongs to the wrong one) and leaves a resolved interaction recorded as open.
+///
+/// Returns the §7.1 response context the turn owed (if any) and how the turn
+/// ended, for the arm's own terminal writer. Interactions are dropped BEFORE the
+/// surface is cleared, since the round snapshot already published what was open.
+async fn end_turn_obligations(
+    agent_loop: &mut crate::agent::loop_::AgentLoop,
+) -> (
+    Option<crate::agent::intent_turn::IntentTurnContext>,
+    crate::agent::intent_turn::TurnOutcome,
+) {
+    agent_loop.pending_intent = None;
+    let ctx = agent_loop.chat_writeback.take();
+    let outcome = agent_loop.turn_outcome;
+    // §5.5.4 safety net: an approval / ask_question still open now belongs to a
+    // finished turn and can never be answered — drop it so no later snapshot
+    // publishes a dead button onto a new round. (`pause` is intentionally kept:
+    // it outlives the turn by design and is dropped by the answering turn.)
+    // ADR-106 D8: this is bookkeeping, not a Chat write — there is no card row
+    // left in the Chat session to close.
+    agent_loop.forget_interactions_of_kind(&["approval", "ask_question"]);
+    agent_loop.turn_surface = Default::default();
+    agent_loop.turn_reference = Default::default();
+    // ADR-107: a turn that ended without persisting its parts (an abort before
+    // the user-row write) must not hand them to the next turn.
+    agent_loop.turn_message_refs.clear();
+    // Same rule for the display projection: an abort before the user-row write
+    // must not paint the next turn's row.
+    agent_loop.turn_user_row_meta = None;
+    (ctx, outcome)
+}
+
+/// A Chat attachment the Runtime pulled over node-auth HTTP from the
+/// Gateway (design 27 §4.2.1). Bytes never ride the MQTT envelope — the
+/// Intent carries ids only; this is what a successful pull yields.
+#[derive(Clone, Debug)]
+pub struct PulledAttachment {
+    pub filename: String,
+    pub mime: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Messages that can be sent to a SessionTask.
+///
+/// `large_enum_variant` is allowed on purpose: the widest variant is the Intent
+/// envelope, and design 27 §3.2 puts the sender, the action, the Chat
+/// coordinates and the attachment union on that one wire message. This is a
+/// channel message — cloned once per delivery and never held in a collection —
+/// so the size gap the lint measures buys nothing to remove (boxing a field only
+/// moves the same bytes to the heap and hides the envelope from its readers).
+#[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
+pub enum SessionMessage {
+    /// User chat message to process
+    ChatMessage {
+        content: String,
+        message_id: String,
+        /// ADR-106 revision (2026-11-16): the id of the Chat row the sending
+        /// surface claims to have written for these same words. Only the
+        /// execution surface's FIRST message carries one — the surface appends
+        /// the sentence to the bound Chat as an ordinary archive-only
+        /// `user_message` before posting here, so the Chat can show the human's
+        /// words beside the card they produce. Honored only where it can be
+        /// true (chat-bound session, first round); otherwise dropped and the
+        /// reference row stays unthreaded. Empty = no claim.
+        chat_trigger_row_id: String,
+        /// Per-turn skill instructions the user explicitly selected via a chat
+        /// `command` (resolved against the agent's `SkillRegistry`). Turn-scoped:
+        /// `None` means "no skill selected this turn" and clears only this slot —
+        /// it does NOT touch the agent-level Progressive summary, which lives on
+        /// `SessionManagerConfig.skill_summary` and is seeded separately.
+        active_skill: Option<String>,
+        /// ADR-046: unified array of attached items replacing the prior
+        /// `documents` + `attached_context` fields. Each item is a
+        /// discriminated union (file_upload / image_upload / attached_file
+        /// / attached_selection / attached_folder) carrying the full
+        /// metadata needed for JSONL persistence and prompt-side hints.
+        /// `None` / empty means no attachments.
+        attached_items: Option<Vec<acowork_core::protocol::AttachedItem>>,
+        /// Optional multimodal content parts (e.g. text + image_url).
+        /// When present, the agent loop constructs a ChatMessage::user_multimodal()
+        /// instead of ChatMessage::user(), enabling image inputs to flow to the LLM.
+        content_parts: Option<Vec<acowork_core::providers::traits::ContentPart>>,
+        /// The Chat surface this turn owes its visible behaviour to. A turn
+        /// the Chat surface asked for brings the Chat session and its own row
+        /// id — so the terminal echo threads under it and the turn's
+        /// interactive cards have somewhere to land — the sender who can
+        /// answer them, and the Gateway's human-presence fact. A turn composed
+        /// in the execution view brings no row of its own:
+        /// no row to answer, so no card, and the echo stays the standalone
+        /// `exec:` keyed line (D9) in the chat the session is bound to.
+        /// Produced by `TurnSurface::from_envelope`; see ADR-100 follow-up.
+        surface: crate::agent::intent_turn::TurnSurface,
+        /// Plan D3: who typed this turn, when that is not the session's own
+        /// initiator. Rides to the `user` row's `metadata.speaker` and is what
+        /// lets a surface say "nicholas, as agent-a" instead of "agent-a".
+        speaker: Option<acowork_core::turn_speaker::TurnSpeaker>,
+    },
+    /// Plan D5: re-run this session's last turn in place (`POST …/retry`).
+    ///
+    /// No payload: the content and the `message_id` are read from the transcript
+    /// (or from the turn the task just ran), so a retry cannot become a way to
+    /// re-submit different words under the old round's coordinate.
+    RetryTurn,
+    /// Continue execution after tool result or iteration pause
+    ContinueExecution,
+    /// Apply runtime config overrides from Gateway
+    UpdateRuntimeConfig(RuntimeConfigOverrides),
+    /// Update workspace context text
+    UpdateWorkspaceContext { context_text: String },
+    /// Update MCP tools on AgentCore (hot-push when MCP servers connect/disconnect).
+    /// Refreshes `AgentCore.all_tools` so LLM injection and debug snapshot capture
+    /// pick up the latest MCP tool list.
+    UpdateMcpTools {
+        mcp_tools: Option<Vec<Arc<dyn Tool>>>,
+    },
+    /// ADR-029: Update builtin tools enabled flags on AgentCore (hot-push
+    /// when Gateway pushes RuntimeConfigUpdate.builtin_tools_enabled).
+    /// Refreshes `AgentCore.all_tools` so LLM injection picks up
+    /// toggled tools.
+    UpdateBuiltinTools {
+        entries: Vec<crate::agent_config::AgentToolEntry>,
+    },
+    /// Per-session tool narrowing changed (`PUT /sessions/{sid}/tool-policy`).
+    ///
+    /// `None` = the session goes back to inheriting the agent layer. This is
+    /// the only per-session tool message: the agent layer keeps using the two
+    /// broadcasts above, and both re-compose this session's layer on arrival
+    /// (see `session_tool_layer`).
+    UpdateToolPolicy {
+        policy: Option<acowork_core::session_meta::SessionToolPolicy>,
+    },
+    /// ADR-063 §3.7.6: replace the main-dialog system prompt in this
+    /// session's `ContextBuilder`. Produced by
+    /// `SessionManager::apply_system_prompt` (triggered by the L2 reload
+    /// endpoint after it rebuilds the prompt from `prompts/*.md`,
+    /// including the required `system.md`). The next `build_chat_request`
+    /// uses the new value — no agent restart needed.
+    UpdateSystemPrompt { system_prompt: String },
+    /// ADR-094: replace the Progressive-mode skills summary in this
+    /// session's `ContextBuilder`. `None` clears the section
+    /// (Manual mode hot-toggle). Mirrors `UpdateSystemPrompt` /
+    /// `UpdateIdentityContext` shape and lifecycle — agent-scoped
+    /// template + per-session broadcast via `SessionManager`.
+    UpdateSkillInstructions { instructions: Option<String> },
+    /// ADR-030 C3: Sidecar came online (LSP relay became ready, embed model
+    /// switched, ...) and we want to surface a new builtin tool to this
+    /// session. Carries a pre-decorated `BuiltinToolEntry` so each session
+    /// gets its own security-wrapped clone (path guard + rate limiter).
+    ///
+    /// Replaces any existing entry with the same `name()` so hot-reload
+    /// of the LSP relay endpoint is idempotent.
+    AddDynamicBuiltinTool {
+        entry: crate::agent::agent_core::BuiltinToolEntry,
+    },
+    /// ADR-030 C3: Sidecar went away (LSP relay died, embed sidecar
+    /// restart, ...). Removing the named builtin tool from this session's
+    /// dispatch list. `name` should match `BuiltinToolEntry::name()`.
+    RemoveDynamicBuiltinTool { name: String },
+    /// Update the workspace directory path for tool execution.
+    /// Carries the fully-resolved absolute path from SessionManager.
+    SetWorkDir { path: String },
+    /// Update the workspace prompt file content (CLAUDE.md / AGENTS.md).
+    /// Content is None when no prompt file is configured.
+    SetWorkspacePromptFile { content: Option<String> },
+    /// Update identity context from Gateway UserProfileUpdate push
+    UpdateIdentityContext { identity_context: Option<String> },
+    /// Global provider list was updated (Gateway pushed new model capabilities).
+    /// Sessions should emit an updated status to the frontend so the UI
+    /// reflects the latest available models and providers.
+    ProviderListUpdated,
+    /// Stop signal to stop the current agent loop iteration
+    Stop { reason: String },
+    /// Enable debug mode at runtime (after Gateway pushes EnableDebugMode).
+    /// Carries the DebugController, event sender, and notify handles so the
+    /// SessionTask can inject them into its AgentCore and start emitting
+    /// debug events without a process restart.
+    EnableDebugMode(DebugHandles),
+    /// Disable debug mode at runtime (after Gateway pushes DisableDebugMode).
+    /// The SessionTask calls `AgentCore::clear_debug_mode()` so subsequent
+    /// agent_loop iterations stop emitting debug events. No payload, because
+    /// the per-session observer is replaced with the production no-op slot;
+    /// the SessionManager already cleared its `debug_controllers` and
+    /// `debug_event_senders` maps on the way out.
+    DisableDebugMode,
+    /// Close the session gracefully: trigger distillation and free resources.
+    /// JSONL history is preserved (use Delete to also remove the file).
+    Close,
+    /// ADR-032 C4c: User-initiated compression action (from frontend buttons).
+    /// Carries the specific action type to execute.
+    CompressAction(crate::agent::loop_::CompressionAction),
+    /// Update the embedding provider at runtime (hot-push from Gateway
+    /// via SidecarEndpointUpdate(Embed, non-empty endpoint)).
+    /// The session rebuilds its ONNX embedding provider with the new
+    /// endpoint/model/dimension.
+    ///
+    /// ADR-s1: when `embed_provider_id` is `Some`, the endpoint/model
+    /// above refer to a cloud OpenAI-compatible embedding service
+    /// (volcengine / dashscope / siliconflow / …) instead of the local
+    /// ONNX sidecar. The session constructs a
+    /// `RemoteEmbeddingProvider` and authenticates with `embed_api_key`.
+    /// When `embed_provider_id` is `None`, behaviour is unchanged —
+    /// the endpoint is the local ONNX service.
+    UpdateEmbedConfig {
+        embed_endpoint: String,
+        embed_model_id: String,
+        embed_dimension: usize,
+        /// Active cloud provider ID (e.g. "volcengine"). `None` keeps
+        /// the local ONNX path.
+        embed_provider_id: Option<String>,
+        /// Decrypted API key for `embed_provider_id`. Empty / `None`
+        /// for the local ONNX path.
+        embed_api_key: Option<String>,
+    },
+    /// Disable the embedding provider (hot-push from Gateway via
+    /// SidecarEndpointUpdate(Embed, empty endpoint)). The session clears
+    /// its ONNX embedding provider so embedding-dependent operations
+    /// degrade gracefully until the sidecar comes back (ADR-030 ISSUE-2).
+    DisableEmbedConfig,
+    /// Design 27 §6/§7: an Intent envelope delivered to this execution
+    /// session as a *turn trigger* (the session was idle, or the turn must
+    /// run with responder-role semantics). The turn's role and write-back
+    /// come from `acowork_core::intent::TurnOrigin::parse(kind).policy()`:
+    /// an agent `request` puts the turn in responder role (tool trimming
+    /// R1, no human-awaiting pauses R3, system `response` write-back at
+    /// turn end §7.1); a `user_message` / `pm_task` is an initiator turn
+    /// that owes its Chat session a terminal row; a `response` renders the
+    /// initiator-side answer turn.
+    Intent {
+        /// Rendered user-visible message text (shared renderer,
+        /// `intent_turn::render_intent_message`).
+        content: String,
+        /// Stable envelope id — also the write-back path coordinate for
+        /// requests (`POST /api/intents/{request_id}/response`).
+        message_id: String,
+        /// ADR-100 follow-up: the Chat surface this turn owes its cards, its
+        /// human-awaiting gate and its Chat rows to, produced from the
+        /// envelope by `TurnSurface::from_envelope`. Carries what used to be
+        /// the loose `source_chat_session_id` + `has_human` pair.
+        surface: crate::agent::intent_turn::TurnSurface,
+        /// Sender instance (write-back `target`).
+        from: String,
+        action: String,
+        repo: String,
+        kind: String,
+        /// Chat attachment ids from a human Chat message. Runtime pulls from Gateway HTTP.
+        chat_attachment_ids: Vec<String>,
+        /// ADR-100: the ADR-046 attachment union the sender carried — for a
+        /// human Chat turn, the workspace references ("Add to Chat") picked on
+        /// the surface. Unlike `chat_attachment_ids` these need no pull: the
+        /// path is node-local and this agent's own tools read it. Empty for
+        /// agent-to-agent Intents, which have no attachment channel.
+        attached_items: Vec<acowork_core::protocol::AttachedItem>,
+        /// Design 27 §5.3.1: the durable `user_message` row the attachments
+        /// are pinned to. For a 1:1 chat message this is empty (the
+        /// attachment coordinate is `message_id`, which matches the row). For
+        /// a group @ fan-out the per-target `message_id` is a fresh uuid with
+        /// no durable row — the bytes live on the shared `user_message` whose
+        /// id is carried here, so attachment pulls fall back to this
+        /// coordinate. Never rendered; purely the pull address.
+        in_reply_to: String,
+        /// ADR-106 D3 (rev. 2026-11-06): the durable Chat row this turn opens
+        /// or answers, as declared by the Gateway that wrote it. Becomes the
+        /// reference row's `in_reply_to`, so the block hangs under the sentence
+        /// that asked for the work. Empty = an origin turn (agent-to-agent,
+        /// cron) — the reference row stays unthreaded rather than pointing at a
+        /// coordinate no transcript holds.
+        chat_row_id: String,
+        /// A `pm_task` dispatch's model-facing wake-up playbook (claim →
+        /// work → submit). Injected into the turn's system block via
+        /// `ContextBuilder::set_task_brief` — never part of `content`,
+        /// never written to a Chat surface, never persisted with the
+        /// conversation. Empty for every other origin.
+        assignment_brief: String,
+        /// The PM task this delivery's conversation names (`task:{project}:{task}`),
+        /// empty for every other conversation. ADR-106 D13: the round's reference
+        /// row renders it as the block's task chip, since a Chat may not read the
+        /// projection to paint a list. Parsed off the Gateway's routing contract by
+        /// the transport — never off a peer's params.
+        task_id: String,
+        /// Whether this delivery opened the execution session it landed in, or
+        /// reused one already mapped to the Chat. `None` when the transport did
+        /// not resolve it (a parked-card answer, a PM dispatch that re-enters an
+        /// existing session). ADR-106 D3: written verbatim onto the round's
+        /// reference row — the only place a reader learns that a Chat message
+        /// started new work rather than continuing it.
+        opened_new: Option<bool>,
+        /// ADR-107: reference parts the sender attached to this turn — context
+        /// the Runtime supplies and the human did not type, today the Chat
+        /// Router's `exec_session_create(background)`. NEVER folded into
+        /// `content`: the model sees them after the human's words
+        /// (`intent_turn::render_user_turn`) and the JSONL keeps them as
+        /// `context_ref` rows beside the `user` row. Empty for every origin
+        /// that has no such context.
+        context_refs: Vec<acowork_core::MessageRef>,
+        /// The **human** rendering of the same envelope
+        /// (`intent_turn::render_intent_display`), or `None` when the origin has
+        /// none — a human turn's `content` already is the person's words.
+        ///
+        /// Two audiences, two formats, one wire: `content` stays the
+        /// machine-facing prompt (reply coordinates in it, `params` as compact
+        /// JSON) because the model must read those coordinates, while this rides
+        /// the turn's user row as `metadata.intent` for every surface that draws
+        /// pixels. Without it those surfaces have no text but the prompt, which
+        /// is how a block came to read `[intent:2f3c…:analyze] {"title":…}`.
+        display: Option<crate::agent::intent_turn::IntentDisplay>,
+    },
+    // ADR-035 Phase 3: EnableNotify/DisableNotify removed — push drives all
+    // streaming, the front/back suppression mechanism is gone.
+}
+
+impl std::fmt::Debug for SessionMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionMessage::ChatMessage {
+                content,
+                message_id,
+                chat_trigger_row_id,
+                active_skill,
+                attached_items,
+                content_parts,
+                surface,
+                speaker,
+            } => f
+                .debug_struct("ChatMessage")
+                .field("content", &content.chars().take(64).collect::<String>())
+                .field("message_id", message_id)
+                .field("chat_trigger_row_id", chat_trigger_row_id)
+                .field("has_skill", &active_skill.is_some())
+                .field(
+                    "attached_count",
+                    &attached_items.as_ref().map(|c| c.len()).unwrap_or(0),
+                )
+                .field("has_content_parts", &content_parts.is_some())
+                .field("chat", &surface.chat_session_id)
+                // Provenance is a debugging fact: "whose words are these" is
+                // the first question a transcript bug asks.
+                .field("speaker", &speaker.as_ref().map(|s| s.author.clone()))
+                .field("round", &surface.round_id)
+                .finish(),
+            SessionMessage::RetryTurn => f.debug_tuple("RetryTurn").finish(),
+            SessionMessage::ContinueExecution => f.debug_tuple("ContinueExecution").finish(),
+            SessionMessage::UpdateRuntimeConfig(overrides) => f
+                .debug_struct("UpdateRuntimeConfig")
+                .field("max_output_tokens", &overrides.max_output_tokens)
+                .field("max_iterations", &overrides.max_iterations)
+                .field("temperature", &overrides.temperature)
+                .field("context_window", &overrides.context_window)
+                .field(
+                    "has_system_prompt",
+                    &overrides.system_prompt_override.is_some(),
+                )
+                .field(
+                    "shell_approval_threshold",
+                    &overrides.shell_approval_threshold,
+                )
+                .field("approval_timeout_secs", &overrides.approval_timeout_secs)
+                .finish(),
+            SessionMessage::UpdateWorkspaceContext { context_text } => f
+                .debug_struct("UpdateWorkspaceContext")
+                .field("len", &context_text.len())
+                .finish(),
+            SessionMessage::UpdateMcpTools { mcp_tools } => f
+                .debug_struct("UpdateMcpTools")
+                .field(
+                    "mcp_tool_count",
+                    &mcp_tools.as_ref().map(|t| t.len()).unwrap_or(0),
+                )
+                .finish(),
+            SessionMessage::UpdateToolPolicy { policy } => f
+                .debug_struct("UpdateToolPolicy")
+                .field("inherits_agent", &policy.is_none())
+                .finish(),
+            SessionMessage::UpdateBuiltinTools { entries } => f
+                .debug_struct("UpdateBuiltinTools")
+                .field("entry_count", &entries.len())
+                .field(
+                    "enabled_count",
+                    &entries.iter().filter(|e| e.enabled).count(),
+                )
+                .finish(),
+            SessionMessage::UpdateSystemPrompt { system_prompt } => f
+                .debug_struct("UpdateSystemPrompt")
+                .field("prompt_len", &system_prompt.len())
+                .finish(),
+            SessionMessage::UpdateSkillInstructions { instructions } => f
+                .debug_struct("UpdateSkillInstructions")
+                .field("has_skills", &instructions.is_some())
+                .finish(),
+            SessionMessage::AddDynamicBuiltinTool { entry } => f
+                .debug_struct("AddDynamicBuiltinTool")
+                .field("name", &entry.name())
+                .field("enabled", &entry.enabled)
+                .finish(),
+            SessionMessage::RemoveDynamicBuiltinTool { name } => f
+                .debug_struct("RemoveDynamicBuiltinTool")
+                .field("name", name)
+                .finish(),
+            SessionMessage::SetWorkDir { path } => {
+                f.debug_struct("SetWorkDir").field("path", path).finish()
+            }
+            SessionMessage::SetWorkspacePromptFile { content } => f
+                .debug_struct("SetWorkspacePromptFile")
+                .field("has_content", &content.is_some())
+                .field("content_len", &content.as_ref().map(|c| c.len()))
+                .finish(),
+            SessionMessage::UpdateIdentityContext { identity_context } => f
+                .debug_struct("UpdateIdentityContext")
+                .field("has_identity", &identity_context.is_some())
+                .finish(),
+            SessionMessage::ProviderListUpdated => f.debug_struct("ProviderListUpdated").finish(),
+            SessionMessage::Stop { reason } => {
+                f.debug_struct("Stop").field("reason", reason).finish()
+            }
+            SessionMessage::EnableDebugMode(_) => f.debug_tuple("EnableDebugMode").finish(),
+            SessionMessage::DisableDebugMode => f.debug_tuple("DisableDebugMode").finish(),
+            SessionMessage::Close => f.debug_tuple("Close").finish(),
+            SessionMessage::CompressAction(action) => f
+                .debug_tuple("CompressAction")
+                .field(&format!("{:?}", action))
+                .finish(),
+            SessionMessage::UpdateEmbedConfig {
+                embed_endpoint,
+                embed_model_id,
+                embed_dimension,
+                embed_provider_id,
+                embed_api_key,
+            } => f
+                .debug_struct("UpdateEmbedConfig")
+                .field("embed_endpoint", embed_endpoint)
+                .field("embed_model_id", embed_model_id)
+                .field("embed_dimension", embed_dimension)
+                .field("embed_provider_id", embed_provider_id)
+                .field(
+                    "embed_api_key_redacted",
+                    &embed_api_key.as_ref().map(|_| "***"),
+                )
+                .finish(),
+            SessionMessage::DisableEmbedConfig => f.debug_tuple("DisableEmbedConfig").finish(),
+            SessionMessage::Intent {
+                message_id,
+                kind,
+                from,
+                action,
+                ..
+            } => f
+                .debug_struct("Intent")
+                .field("message_id", message_id)
+                .field("kind", kind)
+                .field("from", from)
+                .field("action", action)
+                .finish(),
+        }
+    }
+}
+
+/// Independent execution actor for a single session.
+///
+/// Each `SessionTask` runs as a separate tokio task, processing
+/// `SessionMessage`s from its inbound channel. It owns an `AgentLoop`
+/// built from a cloned `AgentCore` plus its own `SessionState`,
+/// ensuring full per-session isolation.
+pub(crate) struct SessionTask {
+    /// The session's AgentLoop, pre-constructed so that external callers
+    /// can obtain its `InboundMessage` sender at session-creation time.
+    agent_loop: AgentLoop,
+    /// Clone of the AgentLoop's inbound sender, kept here purely as a
+    /// fallback so that legacy `SessionMessage::ContinueExecution` /
+    /// `SessionMessage::Stop` messages (if anyone still sends them)
+    /// can be forwarded. The primary, deadlock-safe path is via
+    /// `SessionHandle::send_inbound`.
+    agent_inbound_tx: mpsc::Sender<InboundMessage>,
+    /// Inbound message receiver (SessionMessage-level, not InboundMessage)
+    inbound_rx: mpsc::Receiver<SessionMessage>,
+    /// System prompt for context building
+    system_prompt: String,
+    /// ADR-021: Single chunk sender for control events.
+    chunk_tx: Option<mpsc::Sender<SessionChunkEvent>>,
+    /// Unique session identifier (used for logging and chunk tagging)
+    session_id: String,
+    /// Identity context string injected by Gateway
+    identity_context: Option<String>,
+    /// LLM protocol type (for image token estimation)
+    protocol_type: acowork_core::protocol::ProtocolType,
+    /// ADR-094: agent-level Progressive-mode skills summary, seeded from
+    /// `SessionManagerConfig.skill_summary` at session creation. Applied to
+    /// the new session's `ContextBuilder` in `run()` via
+    /// `set_skill_summary` (parallel to how `system_prompt` and
+    /// `identity_context` are applied). Hot reloads arrive via
+    /// `SessionMessage::UpdateSkillInstructions`.
+    ///
+    /// Named `skill_summary` (not `skill_instructions`) because it is a
+    /// different lifecycle from the per-turn `ChatMessage.active_skill`:
+    /// this one lives as long as the session.
+    skill_summary: Option<String>,
+    /// Agent layer ∧ session layer, and the single writer of this session's
+    /// tool set. Every agent-wide broadcast lands here first, so the session
+    /// narrowing is re-composed on top instead of being overwritten (see
+    /// `session_tool_layer`).
+    tool_layer: crate::agent::session::session_tool_layer::SessionToolLayer,
+}
+
+// ADR-046: pre-extraction helpers (`extract_document_text`,
+// `build_attached_context_blocks`) were removed. Attachment records are
+// now persisted as standalone system JSONL entries via
+// `AgentLoop::write_attached_items` and rendered by the frontend from
+// the JSONL metadata. The Runtime no longer reads uploaded file bytes
+// or assembles complex prompt prefixes — see ADR-046 §2.4.
+
+/// ADR-083: surface a manual-compaction error to the frontend as an error
+/// chunk — UNLESS it is a cancellation.
+///
+/// A user cancel or deadline expiry leaves history untouched and is already
+/// reported through [`ChunkEvent::CompactionCancelled`]; emitting the generic
+/// `Error` bubble on top of it would double-report and wrongly read as a
+/// failure. `label` only affects the log line.
+async fn report_manual_compaction_error(
+    chunk_tx: Option<&mpsc::Sender<SessionChunkEvent>>,
+    session_id: &str,
+    label: &str,
+    e: &crate::error::RuntimeError,
+) {
+    if matches!(e, crate::error::RuntimeError::CompactionCancelled(_)) {
+        tracing::warn!(
+            session_id = %session_id,
+            error = %e,
+            "Manual compaction cancelled (no error chunk: CompactionCancelled already emitted)"
+        );
+        return;
+    }
+    tracing::error!(
+        session_id = %session_id,
+        error = %e,
+        label = label,
+        "Manual compaction failed"
+    );
+    if let Some(tx) = chunk_tx {
+        let (user_message, detail, error_type) = e.error_info();
+        let event = SessionChunkEvent {
+            session_id: session_id.to_string(),
+            event: ChunkEvent::Error {
+                user_message,
+                detail,
+                error_type,
+                message_id: String::new(),
+            },
+        };
+        if tx.send(event).await.is_err() {
+            tracing::warn!(
+                session_id = %session_id,
+                label = label,
+                "Failed to send Error chunk event (manual compaction)"
+            );
+        }
+    }
+}
+
+impl SessionTask {
+    /// Create a new SessionTask with the given shared core, session state,
+    /// message receiver, system prompt, and optional chunk channel.
+    ///
+    /// Returns the task together with the `AgentLoop`'s `InboundMessage`
+    /// sender. Callers (SessionManager) must stash that sender in
+    /// `SessionHandle` so that out-of-band signals (Continue/Interrupt)
+    /// can be delivered directly to the AgentLoop without going through
+    /// the SessionTask's main loop — which would otherwise deadlock
+    /// whenever the AgentLoop is awaiting a pause-resume signal.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        core: Arc<AgentCore>,
+        session: SessionState,
+        inbound_rx: mpsc::Receiver<SessionMessage>,
+        system_prompt: String,
+        // ADR-094: agent-level Progressive-mode skills summary - see struct
+        // field docs. Mirrors `system_prompt` / `identity_context` placement
+        // in the parameter list.
+        skill_summary: Option<String>,
+        chunk_tx: Option<mpsc::Sender<SessionChunkEvent>>,
+        session_id: String,
+        identity_context: Option<String>,
+        protocol_type: acowork_core::protocol::ProtocolType,
+        mcp_tools: Option<Vec<Arc<dyn Tool>>>,
+        // ADR-030 C3: Dynamic builtin tools registered via SidecarEndpointUpdate
+        // before this session was created. Injected into the cloned AgentCore's
+        // `builtin_tools` so the session starts with them (ISSUE-1 fix).
+        dynamic_builtin_tools: Vec<crate::agent::agent_core::BuiltinToolEntry>,
+        runtime_debug: Option<DebugHandles>,
+        pending_debug_handles: Arc<tokio::sync::Mutex<Option<DebugHandles>>>,
+        // Accumulated runtime config overrides from Gateway pushes.
+        // Applied directly to AgentCore during session init so the session
+        // starts with correct values (not patched via message replay).
+        runtime_overrides: RuntimeConfigOverrides,
+        // Resolved workspace directory for tool execution. Shared with SessionManager.
+        current_work_dir: Arc<std::sync::RwLock<Option<String>>>,
+        // Per-session committed_lines counter, shared with the writer thread.
+        committed_lines: Arc<std::sync::atomic::AtomicUsize>,
+        // Shared streaming lines map, cloned into SessionCore.
+        streaming_lines: crate::conversation::StreamingStateMap,
+    ) -> (Self, mpsc::Sender<InboundMessage>) {
+        // Create per-session SessionCore from the shared AgentCore template.
+        let notify_interval_ms = core.config.data_flow.notify_interval_ms;
+        let session_core = SessionCore::new(
+            session_id.clone(),
+            chunk_tx.clone(),
+            committed_lines,
+            notify_interval_ms,
+            current_work_dir,
+            streaming_lines,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+
+        // Build per-session AgentCore clone from the shared template.
+        let mut core_mut = (*core).clone();
+        // Inject dynamic builtin tools (from SidecarEndpointUpdate pushes that
+        // arrived before this session was created). Same-name tools in the
+        // template are replaced; new tools are appended.
+        for entry in dynamic_builtin_tools {
+            let name = entry.name();
+            if let Some(existing) = core_mut.builtin_tools.iter().position(|e| e.name() == name) {
+                core_mut.builtin_tools[existing] = entry;
+            } else {
+                core_mut.builtin_tools.push(entry);
+            }
+        }
+        // Set MCP tools and rebuild
+        core_mut.mcp_tools = mcp_tools;
+
+        // Two-layer tool composition (agent ∧ session). Built BEFORE the
+        // dispatch list so the very first `all_tools` already reflects the
+        // session's persisted narrowing: the baselines are captured from the
+        // freshly cloned core (agent-layer values), then `apply_to` writes the
+        // composed set back. A resumed session hydrates its policy from
+        // `SessionMeta.tool_policy` inside `ConversationSession::resume`, so
+        // this is the only place the meta → live-tool-set wiring is needed.
+        let session_policy = session.conversation().and_then(|c| c.tool_policy());
+        let tool_layer = crate::agent::session::session_tool_layer::SessionToolLayer::from_core(
+            &core_mut,
+            session_policy,
+        );
+        tool_layer.apply_to(&mut core_mut);
+        core_mut.rebuild_all_tools();
+
+        // Inject pending debug handles
+        core_mut.set_debug_pending_injection(pending_debug_handles);
+
+        // Inject runtime debug handles
+        if let Some(handles) = runtime_debug {
+            let observer = DebugObserverImpl::new(handles);
+            core_mut.set_debug_mode(observer);
+        }
+
+        // Rebuild LLM Provider for this session
+        if let Some(ref provider_id) = session.provider
+            && let Some(new_provider) = session_core.build_provider_for(
+                provider_id,
+                session.model.as_deref(),
+                session.account_id.as_deref(),
+                &crate::agent::session_core::ProviderBuildContext {
+                    config: &core_mut.config,
+                    global_provider_list: &core_mut.global_provider_list,
+                    provider_key_vault: &core_mut.provider_key_vault,
+                    compat_cache: core_mut.compat_cache.as_ref(),
+                    responses_compat_cache: core_mut.responses_compat_cache.as_ref(),
+                    anthropic_compat_cache: core_mut.anthropic_compat_cache.as_ref(),
+                },
+            )
+        {
+            let model = session.model.clone().unwrap_or_default();
+            core_mut.update_provider(new_provider, model);
+        } else {
+            let raw = core_mut.provider.clone();
+            let retry_config =
+                crate::providers::reliable::RetryConfig::from(&core_mut.config.timeouts.retry);
+            let mut reliable = crate::providers::reliable::ReliableProvider::new(raw, retry_config);
+            if let Some(status) = &session_core.retry_session_status
+                && let Some(handle) = &session_core.retry_wait_handle
+                && let Some(tx) = &session_core.chunk_tx
+                && let Some(sid) = &session_core.session_id
+            {
+                reliable = reliable.with_retry_ux(
+                    crate::providers::reliable::RetryWaitHandle {
+                        state: handle.state.clone(),
+                        skip_notify: handle.skip_notify.clone(),
+                    },
+                    status.clone(),
+                    tx.clone(),
+                    sid.clone(),
+                );
+            }
+            let model = session.model.clone().unwrap_or_default();
+            core_mut.update_provider(Arc::new(reliable), model);
+        }
+
+        // Apply accumulated runtime config overrides
+        core_mut.apply_runtime_config(&runtime_overrides);
+
+        // Sync temperature override
+        let mut session = session;
+        if core_mut.temperature_override.is_some() {
+            session.set_temperature(core_mut.temperature_override);
+        }
+
+        let (agent_loop, agent_inbound_tx) =
+            AgentLoop::from_core_and_session(core_mut, session_core, session);
+
+        let task = Self {
+            agent_loop,
+            agent_inbound_tx: agent_inbound_tx.clone(),
+            inbound_rx,
+            system_prompt,
+            skill_summary,
+            chunk_tx,
+            session_id,
+            identity_context,
+            protocol_type,
+            tool_layer,
+        };
+        (task, agent_inbound_tx)
+    }
+
+    /// Set the status watch sender (ADR-014).
+    /// Called by SessionManager after creating the SessionTask, before spawning.
+    pub(crate) fn set_status_tx(
+        &mut self,
+        tx: tokio::sync::watch::Sender<crate::agent::session_state::SessionStatus>,
+    ) {
+        self.agent_loop.session_core.status_tx = Some(tx);
+    }
+
+    /// Return the per-session urgent_stop Notify so SessionManager can
+    /// route fire_urgent_stop() to only the target session.
+    /// Returns None in standalone mode (where urgent_stop is not initialized).
+    pub(crate) fn urgent_stop_notify(&self) -> Option<Arc<Notify>> {
+        self.agent_loop.session_core.urgent_stop.clone()
+    }
+
+    /// Return the `Arc` slot handle to the session's per-request
+    /// [`CancelHandle`] so [`crate::agent::session::session_manager::SessionManager`]
+    /// can route external cancellation signals (MQTT `StopGeneration`,
+    /// debug `Stop`, CLI cancel) to the **current** generation of the
+    /// handle on every dispatch.
+    ///
+    /// Unlike [`urgent_stop_notify`](Self::urgent_stop_notify) this always
+    /// returns a clonable handle — the slot is unconditionally allocated
+    /// in [`crate::agent::session_core::SessionCore::new`].
+    ///
+    /// ADR-044 §4.5: the field exposed here is an `Arc<parking_lot::Mutex<CancelHandle>>`,
+    /// not a plain `CancelHandle`, because external sources must always
+    /// observe the *current* request's generation. Storing a plain clone
+    /// would freeze the generation to whatever was in the slot at
+    /// registration time (the bug this design eliminates — see
+    /// `SessionCore::begin_new_request`).
+    pub(crate) fn cancel_handle_arc(&self) -> Arc<parking_lot::Mutex<CancelHandle>> {
+        self.agent_loop.session_core.cancel_handle_arc()
+    }
+
+    /// ADR-083: return the `Arc` slot to the session's per-compaction
+    /// [`CancelHandle`] so [`crate::agent::session::session_manager::SessionManager`]
+    /// can route the `compress_type = 3` cancel to the *current* compaction
+    /// on every dispatch. See [`SessionCore::compaction_cancel_handle_arc`].
+    pub(crate) fn compaction_cancel_handle_arc(&self) -> Arc<parking_lot::Mutex<CancelHandle>> {
+        self.agent_loop.session_core.compaction_cancel_handle_arc()
+    }
+
+    /// Run the session task, processing messages until Stop or channel close.
+    pub async fn run(self) {
+        let Self {
+            mut agent_loop,
+            agent_inbound_tx,
+            session_id,
+            chunk_tx,
+            mut inbound_rx,
+            system_prompt,
+            identity_context,
+            protocol_type,
+            skill_summary,
+            mut tool_layer,
+        } = self;
+
+        // Build ContextBuilder with identity. Tool definitions are NOT
+        // seeded from a pre-baked snapshot — we derive them live from
+        // `core.builtin_tools` so hot-reloads (e.g. MCP install/uninstall
+        // toggles) propagate to NEW sessions the same way they propagate
+        // to live sessions. Pre-baked snapshots were the root cause of
+        // the bug where the LLM still saw stale tool definitions after a
+        // runtime config change (see commit history and
+        // `rebuild_context_tool_definitions`).
+        let mut context_builder =
+            ContextBuilder::new(system_prompt.clone()).with_identity(identity_context.clone());
+
+        // ADR-094: seed the agent-level Progressive-mode skills summary.
+        // `None` means Manual mode, so the section simply stays unset.
+        // This slot is session-lifetime: the per-turn skill-command path
+        // writes `active_skill`, never this field, so a turn without a
+        // selected skill cannot wipe the summary (see
+        // `ContextBuilder::set_active_skill`).
+        if let Some(ref skills) = skill_summary {
+            context_builder.set_skill_summary(skills.clone());
+        }
+
+        // Plan D3/D6: a session with an intervention roster is one a human can
+        // type into, voiced as its initiator. Say so once, in Block A — the
+        // roster is write-once at creation, so this is a session-lifetime fact
+        // and Block A stays byte-stable.
+        if let Some(conv) = agent_loop.session.conversation()
+            && !conv.interveners().is_empty()
+        {
+            context_builder
+                .set_operator_presence(operator_presence_note(conv.initiator().as_deref()));
+        }
+
+        // Mirror the identity onto SessionState so compaction paths
+        // (loop_context / loop_session) can inject the user's preferred
+        // language into the compact model's system prompt.
+        agent_loop
+            .session
+            .set_identity_context(identity_context.clone());
+
+        // ADR-012: Apply per-session model from SessionState.
+        // For new sessions, model is set from provider_config during creation.
+        // For resumed sessions, model is restored from JSONL metadata.
+        if let Some(ref model) = agent_loop.session.model {
+            context_builder = context_builder.with_override_model(model.clone());
+        }
+
+        // Set protocol type for image token estimation in HistoryManager.
+        agent_loop
+            .session
+            .history_mut()
+            .set_protocol_type(protocol_type.clone());
+
+        // Seed ContextBuilder.tool_definitions from the freshly built
+        // per-session `core.builtin_tools`. Done here so the very first
+        // `build_chat_request` reflects the current runtime config
+        // (already applied during `SessionTask::new` via
+        // `core_mut.apply_runtime_config`). Mirror of the hot-reload
+        // path inside the `UpdateRuntimeConfig` handler — single
+        // derivation logic, single source of truth (`core.builtin_tools`).
+        rebuild_context_tool_definitions(&agent_loop.core.builtin_tools, &mut context_builder);
+
+        // Emit initial session state so the snapshot is populated
+        // before the frontend's first fetchSessionState pull request.
+        // Without this, the snapshot stays with default values until the first
+        // status transition, causing the frontend to see null for
+        // reasoning_effort and hide the thinking level control.
+        agent_loop.emit_session_state();
+
+        // Emit initial context-usage indicator for resumed sessions so the
+        // frontend can show input/output token counts without waiting for
+        // the first LLM round. Only fires when persisted SessionTokens
+        // exist and model capabilities are available.
+        //
+        // See `context::build_persisted_ctx_usage` for the
+        // caps-resolution + cumulative-patch sequence this used to
+        // spell out by hand (regression t-83afab47 refactor). `None`
+        // (no persisted tokens / no caps) is a legitimate skip — the
+        // first live `ChunkEvent::ContextUsage` will fill the gap.
+        if let Some(ref conv) = agent_loop.session.conversation
+            && let Some(ctx) =
+                crate::agent::context::build_persisted_ctx_usage(&agent_loop.core, conv)
+            && let Some(ref tx) = chunk_tx
+        {
+            let _ = tx
+                .send(SessionChunkEvent {
+                    session_id: session_id.clone(),
+                    event: ChunkEvent::ContextUsage(ctx),
+                })
+                .await;
+        }
+
+        // Saved user message for debug resume re-execution.
+        // When the user presses resume after the agent loop has exited
+        // (e.g. after rewind was issued post-completion), SessionTask
+        // replays the agent loop with this saved message.
+        let mut last_user_message: Option<(String, String)> = None;
+
+        // ADR-047 (amended): config version polling state lives on the
+        // AgentLoop now (`last_config_version` / `last_config_snapshot`) so
+        // `run_inner` can poll it at iteration boundaries too — a settings
+        // change must take effect WITHOUT stopping a long-running turn.
+        // The startup apply (Bug B fix: version initialised to 0 so the first
+        // poll always applies and rebuilds a provider created against an
+        // empty cache) is documented on the fields in loop_.rs.
+
+        loop {
+            // ── ADR-047: Check if config was mutated during previous turn ──
+            // Applied both here (turn boundary after a run) and before every
+            // inbound message (see the `apply_pending_config_effects` call
+            // before `match msg`), so a config change landing while the task
+            // waits in `select!` is picked up BEFORE the next run starts —
+            // not after it finishes.
+            agent_loop.apply_pending_config_effects(&mut context_builder);
+
+            // Use tokio::select! to await inbound messages, rewind
+            // notifications, and resume notifications — all sourced
+            // from the debug observer slot (ADR-013).
+            let msg = if let Some(rewind) = agent_loop.core.debug_observer.rewind_notify().cloned()
+            {
+                let resume = agent_loop
+                    .core
+                    .debug_observer
+                    .resume_notify()
+                    .cloned()
+                    .expect("resume_notify must be set when rewind_notify is set");
+                tokio::select! {
+                    msg = inbound_rx.recv() => msg,
+                    _ = rewind.notified() => {
+                        // Apply rewind via the observer
+                        agent_loop.core.debug_observer.apply_rewind(
+                            &session_id,
+                            &mut agent_loop.session.history,
+                        ).await;
+                        continue;
+                    }
+                    _ = resume.notified() => {
+                        // Resume or Step pressed while agent loop is not running.
+                        let can_continue = if let Some(ctrl) = agent_loop.core.debug_observer.debug_ctrl() {
+                            let guard = ctrl.lock().await;
+                            matches!(
+                                guard.state,
+                                crate::debug::controller::DebugState::Running
+                                    | crate::debug::controller::DebugState::Stepping
+                            )
+                        } else {
+                            false
+                        };
+                        if can_continue
+                            && let Some((ref content, ref msg_id)) = last_user_message
+                        {
+                                tracing::info!(
+                                    session_id = %session_id,
+                                    "Debug: resume/step notify — restarting agent loop"
+                                );
+                                // ADR-047: apply any config changes that
+                                // landed while the run was paused before
+                                // replaying (same rationale as the
+                                // ChatMessage path).
+                                agent_loop.apply_pending_config_effects(&mut context_builder);
+                                // Apply rewind/patches before run
+                                agent_loop.core.debug_observer.apply_rewind_and_patches(
+                                    &session_id,
+                                    &mut agent_loop.session.history,
+                                    &mut context_builder,
+                                ).await;
+                                // Use replay() to avoid appending a duplicate user message
+                                // to history (the original is already there). The message
+                                // id travels so the replayed rows stay under the round that
+                                // message opened (ADR-106 D2).
+                                match agent_loop
+                                    .replay(content, &mut context_builder, None, Some(msg_id.clone()))
+                                    .await
+                                {
+                                    Ok(response) => {
+                                        tracing::info!(
+                                            session_id = %session_id,
+                                            response_len = response.len(),
+                                            "SessionTask processed chat message (replay)"
+                                        );
+                                        if let Some(ref tx) = chunk_tx {
+                                            let event = SessionChunkEvent {
+                                                session_id: session_id.clone(),
+                                                event: ChunkEvent::Done {
+                                                    content: response,
+                                                    message_id: msg_id.clone(),
+                                                },
+                                            };
+                                            if tx.send(event).await.is_err() {
+                                                tracing::warn!(
+                                                    session_id = %session_id,
+                                                    "Failed to send Done chunk event (replay)"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            session_id = %session_id,
+                                            error = %e,
+                                            "SessionTask agent loop error (replay)"
+                                        );
+                                        if let Some(ref tx) = chunk_tx {
+                                            let (user_message, detail, error_type) = e.error_info();
+                                            let event = SessionChunkEvent {
+                                                session_id: session_id.clone(),
+                                                event: ChunkEvent::Error {
+                                                    user_message,
+                                                    detail,
+                                                    error_type,
+                                                    message_id: msg_id.clone(),
+                                                },
+                                            };
+                                            if tx.send(event).await.is_err() {
+                                                tracing::warn!(
+                                                    session_id = %session_id,
+                                                    "Failed to send Error chunk event (replay)"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        continue;
+                    }
+                }
+            } else {
+                inbound_rx.recv().await
+            };
+
+            // ADR-047: Re-check the config version before handling ANY
+            // inbound message. A model_switch / reasoning_effort /
+            // workspace_switch that landed while this task was blocked in
+            // `select!` must be applied before the next run (ChatMessage /
+            // ContinueExecution / debug replay) — otherwise the run still
+            // executes against the stale LLM provider.
+            agent_loop.apply_pending_config_effects(&mut context_builder);
+
+            // Note: msg is now Option<SessionMessage> directly (no
+            // Ok/Err wrapper from the old timeout pattern).
+            match msg {
+                Some(SessionMessage::ChatMessage {
+                    content,
+                    message_id,
+                    chat_trigger_row_id,
+                    active_skill,
+                    attached_items,
+                    content_parts,
+                    surface,
+                    speaker,
+                }) => {
+                    let has_attached = attached_items.as_ref().is_some_and(|a| !a.is_empty());
+                    let has_content_parts = content_parts.as_ref().is_some_and(|p| !p.is_empty());
+                    if content.trim().is_empty() && !has_attached && !has_content_parts {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            "SessionTask received empty chat message, ignoring"
+                        );
+                        continue;
+                    }
+
+                    // Save the user message so it can be replayed if
+                    // resume is pressed after the agent loop exits
+                    // (e.g. after a rewind issued post-completion).
+                    last_user_message = Some((content.clone(), message_id.clone()));
+
+                    // ADR-046: Attachment records are persisted inside
+                    // `agent_loop.run()` (loop_.rs) AFTER the user message, so
+                    // their timestamps are slightly later than the user entry.
+                    // This ensures the frontend's `foldMessages` (which looks
+                    // for part entries *after* the user message by
+                    // timestamp) can fold them into a single
+                    // `user_with_parts` block.
+
+                    // Save the raw user message before any prompt assembly.
+                    // Used by AgentLoop for session title generation and
+                    // other metadata extraction that needs clean user input.
+                    let raw_user_message = content.clone();
+
+                    // ADR-046: Build a *minimal* prompt-side hint for
+                    // attached workspace files / selections AND user-uploaded
+                    // documents. The full attachment metadata is already in
+                    // the JSONL as separate system entries (written above),
+                    // so the LLM has the authoritative record. The prompt
+                    // hint exists only to point the LLM at the right tool
+                    // call when the user asks about an attached file by name.
+                    //
+                    // No doc_reader pre-extraction (the LLM calls it
+                    // itself), no human-readable file list (frontend
+                    // renders that from the JSONL entries), no "The
+                    // following workspace files..." preamble.
+                    //
+                    // The hint is built by the pure helper
+                    // [`build_attachment_hint`] (kept module-level so the
+                    // tests below can pin the wire shape), but only *after*
+                    // the content parts are derived (below): the hint must
+                    // state what actually reached the model, and only the
+                    // derivation knows whether an image's pixels made it into
+                    // this message or were dropped (too large, format the
+                    // model cannot read, attachment store unavailable). A hint
+                    // built from the intent instead of the outcome is what
+                    // invited `image_read` on pictures that were already
+                    // inline.
+                    // Folders (AttachedFolder) are intentionally unhinted —
+                    // the LLM has no tool to walk a directory tree in one
+                    // shot.
+
+                    // Per-turn skill selection (from the chat `command`) goes
+                    // on the turn-scoped slot. One unconditional call:
+                    // `Some` sets it, `None` clears it so a skill chosen last
+                    // turn cannot leak into this one. The agent-level
+                    // Progressive summary is a different field and is not
+                    // touched here — see `ContextBuilder::set_active_skill`.
+                    //
+                    // Injected via ContextBuilder rather than prepended to the
+                    // user message so it shows up in the debug panel's system
+                    // prompt section.
+                    if active_skill.is_some() {
+                        tracing::info!(
+                            session_id = %session_id,
+                            skill_len = active_skill.as_deref().map(str::len).unwrap_or(0),
+                            "Applying per-turn skill instructions to ContextBuilder"
+                        );
+                    }
+                    context_builder.set_active_skill(active_skill);
+
+                    // ── Debug mode: apply rewind/patches before running agent loop ──
+                    agent_loop
+                        .core
+                        .debug_observer
+                        .apply_rewind_and_patches(
+                            &session_id,
+                            &mut agent_loop.session.history,
+                            &mut context_builder,
+                        )
+                        .await;
+
+                    // ── Debug mode: auto-resume if paused/stopped ──
+                    // When the user sends a chat message while the debug controller
+                    // is Paused, the agent loop is blocking in await_step_or_continue()
+                    // on rewind_notify (polled every 100ms).  Switch to Running so the
+                    // next poll sees the new state and continues processing.
+                    //
+                    // We do NOT match Stepping here — stepping is a deliberate mode
+                    // where each phase step auto-pauses (on_phase_step_done → Paused).
+                    // Overriding Stepping to Running would defeat the user's intent to
+                    // single-step through the agent's reasoning.
+                    //
+                    // We do NOT call resume_notify.notify_one() — the paused agent loop
+                    // waits on rewind_notify (polling), not resume_notify.  Calling
+                    // notify_one() here would leak a permit to the next iteration of
+                    // the SessionTask loop, causing an unwanted replay of the last
+                    // user message via the resume.notified() branch.
+                    if let Some(ctrl) = agent_loop.core.debug_observer.debug_ctrl() {
+                        let mut guard = ctrl.lock().await;
+                        match guard.state {
+                            crate::debug::controller::DebugState::Paused
+                            | crate::debug::controller::DebugState::Stopped => {
+                                let old_state = guard.state;
+                                guard.state = crate::debug::controller::DebugState::Running;
+                                let iteration = guard.iteration;
+                                drop(guard);
+                                tracing::info!(
+                                    session_id = %session_id,
+                                    old_state = ?old_state,
+                                    "Debug: auto-resuming on chat_message"
+                                );
+                                // Notify the debug frontend so it updates the UI
+                                if let Some(event_tx) =
+                                    agent_loop.core.debug_observer.debug_event_tx()
+                                {
+                                    let _ = event_tx.send(
+                                        crate::debug::DebugEvent::ExecutionStateChanged {
+                                            new_state:
+                                                crate::debug::controller::DebugState::Running,
+                                            iteration,
+                                        },
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // Check for bypass-injected debug handles before each agent
+                    // loop run (safety net for idle sessions).
+                    agent_loop.core.debug_observer.check_pending_injection();
+
+                    // ── ADR-046: synthesise multimodal content parts from attached_items ──
+                    //
+                    // Pre-ADR-046, the frontend inlined base64 image payloads in
+                    // `params.content_parts`. ADR-046 moved attachment metadata
+                    // into `attached_items` (the `image_upload` variant carries
+                    // document_id / format / dimensions only — never raw bytes).
+                    //
+                    // The Runtime now reads each blob from the `AttachmentService`
+                    // slot populated in Phase B and emits `ContentPart::ImageUrl`
+                    // for images plus `ContentPart::Document` for PDFs a
+                    // document-capable model accepts (see
+                    // [`crate::agent::attachment_to_document`] for why that one
+                    // is gated and the image path is not). Any legacy
+                    // `content_parts` sent by the frontend are preserved (text
+                    // first) and the derived parts are appended. If
+                    // `attached_items` is None/empty, `content_parts` is
+                    // forwarded unchanged — the legacy pre-046 path stays
+                    // bit-compatible.
+                    //
+                    // Read errors are not silently dropped — they short-circuit
+                    // the chat turn with the same `ChunkEvent::Error` shape used
+                    // by `agent_loop.run` failures below, so the frontend sees a
+                    // consistent error surface regardless of which stage failed.
+                    // ADR-100 follow-up: the Chat this turn is accountable to.
+                    // A turn the Chat surface asked for says so itself; a turn
+                    // composed in the execution view has no row of its own but
+                    // may still sit in a chat-bound session, whose reference row
+                    // and interactive cards land there (ADR-106 D2 keeps the
+                    // Rev. 6 backfill: the binding supplies the chat, the write
+                    // endpoint's verified caller supplies who can answer).
+                    let mut surface = surface;
+                    if surface.chat_session_id.is_empty()
+                        && let Some(bound) = agent_loop
+                            .session
+                            .conversation
+                            .as_ref()
+                            .and_then(|c| c.chat_session_id())
+                            .filter(|c| !c.is_empty())
+                    {
+                        surface.chat_session_id = bound;
+                    }
+                    // ADR-106 D3: a turn composed against the execution surface
+                    // answers no Chat row of the Chat's own making — the human
+                    // typed it here, not there (Rev. 8: execution-surface
+                    // messages never enter the Chat channel *through the
+                    // Router*) — so its reference row is written unthreaded,
+                    // and the routing did not open anything.
+                    //
+                    // ADR-106 revision (2026-11-16) carves one exception out
+                    // of that, and the exception is a CLAIM, not a derivation:
+                    // the surface that took the human's first words may have
+                    // already appended them to the bound Chat as an ordinary
+                    // archive-only `user_message` (the human surface writes
+                    // human speech; the Runtime never impersonates it), and it
+                    // says so with that row's id. The claim is honored only
+                    // where it can be true — chat-bound, and the side table
+                    // names no round before this turn's `open_round`. A claim
+                    // that cannot be honored is dropped, not corrected: the
+                    // round then runs exactly as every execution-surface
+                    // round ran before this revision.
+                    let first_round = agent_loop
+                        .session
+                        .conversation
+                        .as_ref()
+                        .and_then(|conv| {
+                            crate::rounds::fold_or_rebuild(
+                                conv.rounds_index_path(),
+                                conv.session_path(),
+                            )
+                            .ok()
+                        })
+                        .is_some_and(|rounds| rounds.is_empty());
+                    agent_loop.turn_reference =
+                        crate::agent::intent_turn::TurnReference::from_exec_mirror_claim(
+                            &chat_trigger_row_id,
+                            !surface.chat_session_id.is_empty(),
+                            first_round,
+                        );
+
+                    let (final_content_parts, enriched_content): (
+                        Option<Vec<acowork_core::providers::traits::ContentPart>>,
+                        String,
+                    ) = match attached_items.as_deref() {
+                        Some(items) if !items.is_empty() => {
+                            // Document parts need the model this turn will
+                            // actually talk to, so the capability is resolved
+                            // here rather than inside the derivation: a model
+                            // switch mid-session changes what may be inlined.
+                            let caps = agent_loop
+                                .session
+                                .model
+                                .as_deref()
+                                .and_then(|m| agent_loop.get_model_capabilities(m));
+                            // Two derivations, one failure surface: an
+                            // attachment the runtime cannot read stops the turn
+                            // whichever channel it belonged to.
+                            // The derivation yields the parts *and* one
+                            // delivery verdict per image: the prompt hint is
+                            // built from the verdict, so an image dropped here
+                            // can never be announced to the model as attached.
+                            let derived: Result<
+                                (
+                                    Option<Vec<acowork_core::providers::traits::ContentPart>>,
+                                    crate::agent::attachment_to_image::ImageParts,
+                                ),
+                                crate::error::RuntimeError,
+                            > = match (
+                                crate::agent::attachment_to_document::derive_document_parts(
+                                    agent_loop.core.attachment_service(),
+                                    items,
+                                    caps.as_ref(),
+                                )
+                                .await,
+                                crate::agent::attachment_to_image::derive_image_parts(
+                                    agent_loop.core.attachment_service(),
+                                    items,
+                                    caps.as_ref(),
+                                )
+                                .await,
+                            ) {
+                                (Ok(documents), Ok(mut images)) => {
+                                    let parts =
+                                        crate::agent::attachment_to_image::merge_turn_parts(
+                                            content_parts,
+                                            documents,
+                                            images.take_parts(),
+                                        );
+                                    Ok((parts, images))
+                                }
+                                (Err(e), _) | (_, Err(e)) => Err(e),
+                            };
+                            match derived {
+                                Ok((parts, images)) => {
+                                    // Only now can the hint tell the truth:
+                                    // a picture's pixels are in `parts` iff its
+                                    // verdict is `Delivered`.
+                                    let hint = build_attachment_hint(
+                                        &content,
+                                        Some(items),
+                                        Some(&agent_loop.core.config.work_dir),
+                                        Some(&images),
+                                    );
+                                    (parts, hint)
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        session_id = %session_id,
+                                        error = %e,
+                                        "Failed to derive attachment content_parts from attached_items"
+                                    );
+                                    let (user_message, detail, error_type) = e.error_info();
+                                    // ADR-106: nothing is written to the Chat
+                                    // here. The round never opened (the loop has
+                                    // not run yet), so there is no block to close
+                                    // and no row to answer — the error event below
+                                    // is the whole surface consequence, and the
+                                    // human's own words stay in the Chat
+                                    // transcript where they were written.
+                                    if let Some(ref tx) = chunk_tx {
+                                        let event = SessionChunkEvent {
+                                            session_id: session_id.clone(),
+                                            event: ChunkEvent::Error {
+                                                user_message,
+                                                detail,
+                                                error_type,
+                                                message_id: message_id.clone(),
+                                            },
+                                        };
+                                        if tx.send(event).await.is_err() {
+                                            tracing::warn!(
+                                                session_id = %session_id,
+                                                "Failed to send Error chunk event (derive failure)"
+                                            );
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                        // No attachments: nothing was derived, so there is
+                        // nothing to report — the human's words are the turn.
+                        _ => (content_parts, content.clone()),
+                    };
+
+                    // ADR-100 follow-up: the loop reads this turn's Chat
+                    // obligations from one place — set here, released by
+                    // `end_turn_obligations` when the turn is over.
+                    agent_loop.turn_surface = surface;
+                    // Plan D3: the row's provenance, written at the same moment
+                    // the surface is installed and by the same rule — the entry
+                    // that dequeued the message owns both facts for this turn.
+                    // `None` (the initiator's own words, or a transport with no
+                    // identity) leaves the metadata untouched, so an ordinary
+                    // turn's row is byte-identical to what it was before.
+                    if let Some(speaker) = speaker {
+                        agent_loop.turn_user_row_meta =
+                            Some(serde_json::Value::Object(speaker.to_meta()));
+                    }
+                    match agent_loop
+                        .run(
+                            &enriched_content,
+                            &mut context_builder,
+                            final_content_parts,
+                            Some(message_id.clone()),
+                            Some(raw_user_message.as_str()),
+                            attached_items.as_deref(),
+                        )
+                        .await
+                    {
+                        Ok(response) => {
+                            tracing::info!(
+                                session_id = %session_id,
+                                response_len = response.len(),
+                                "SessionTask processed chat message"
+                            );
+                            if let Some(ref tx) = chunk_tx {
+                                let event = SessionChunkEvent {
+                                    session_id: session_id.clone(),
+                                    event: ChunkEvent::Done {
+                                        content: response,
+                                        message_id,
+                                    },
+                                };
+                                if tx.send(event).await.is_err() {
+                                    tracing::warn!(
+                                        session_id = %session_id,
+                                        "Failed to send Done chunk event"
+                                    );
+                                }
+                            }
+                            // ADR-021: Notify frontend that new conversation data
+                            // is available for polling.  This is the canonical
+                            // notification point — by the time run() returns, ALL
+                            // response data (text, tool_calls, assistant messages,
+                            // reasoning) has been persisted to JSONL regardless of
+                            // whether the LLM produced text-only, tool calls, or
+                            // mixed output.  The per-chunk notifications during
+                            // streaming (loop_llm.rs) serve real-time streaming UX;
+                            // this one guarantees a signal after full persistence.
+                            agent_loop.session_core.notify_new_data_available();
+                            // ADR-106 D3/D5: nothing is echoed to the Chat here.
+                            // The round `run()` opened already carries its
+                            // terminal status in the side-table projection, and
+                            // the Chat block reads the answer from that round —
+                            // a copied `agent_message` row would be a second,
+                            // staler source of the same sentence. `run()` closed
+                            // the round on every exit path, including the stopped
+                            // and empty-answer ones, so the block never sticks on
+                            // "in progress".
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                session_id = %session_id,
+                                error = %e,
+                                "SessionTask agent loop error"
+                            );
+                            let (user_message, detail, error_type) = e.error_info();
+                            // ADR-106: no terminal row is written here either —
+                            // `run()` already closed the round it opened with
+                            // `failed`, and the Chat block renders that state
+                            // from the projection. The error event below is the
+                            // execution surface's consequence.
+                            //
+                            // Plan D5: the event alone is not enough, and it is
+                            // the reason an agent-to-agent run could end with
+                            // *nothing* to act on. `ChunkEvent::Error` reaches
+                            // whoever is connected at that instant; a session
+                            // whose human opens it a minute later sees a normal
+                            // Idle transcript and no trace of the failure, so
+                            // there is no affordance to fix the model and retry.
+                            // A `system` row is the durable notice: the restorer
+                            // replays it at System role for the transcript and
+                            // `ContextBuilder::build` strips it from the model
+                            // context, so it informs the human without becoming
+                            // a standing instruction to the agent.
+                            let notice = format!(
+                                "This turn ended without finishing: {user_message}. The session is idle — change its model or provider, or press Retry, to continue."
+                            );
+                            if let Some(conv) = agent_loop.session.conversation() {
+                                conv.append_message(
+                                    "system",
+                                    &notice,
+                                    Some(serde_json::json!({
+                                        "notice": "turn_failed",
+                                        "error_type": error_type,
+                                        "detail": detail,
+                                    })),
+                                );
+                            }
+                            if let Some(ref tx) = chunk_tx {
+                                let event = SessionChunkEvent {
+                                    session_id: session_id.clone(),
+                                    event: ChunkEvent::Error {
+                                        user_message,
+                                        detail,
+                                        error_type,
+                                        message_id,
+                                    },
+                                };
+                                if tx.send(event).await.is_err() {
+                                    tracing::warn!(
+                                        session_id = %session_id,
+                                        "Failed to send Error chunk event"
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // ADR-100 follow-up: release this turn's Chat obligations
+                    // (close its still-open cards, clear the surface) through
+                    // the same function the Intent arm uses — a turn composed in
+                    // the execution view writes cards now (ADR-100 Rev. 6), so
+                    // it needs their safety net too.
+                    end_turn_obligations(&mut agent_loop).await;
+                }
+                Some(SessionMessage::Intent {
+                    content,
+                    message_id,
+                    surface,
+                    from,
+                    action,
+                    repo: _,
+                    kind,
+                    chat_attachment_ids,
+                    attached_items,
+                    in_reply_to,
+                    chat_row_id,
+                    assignment_brief,
+                    task_id,
+                    opened_new,
+                    context_refs,
+                    display,
+                }) => {
+                    // A PM dispatch's playbook joins Block A for this
+                    // session's remaining requests: constant per task, so
+                    // the ADR-060 byte-stability holds; ephemeral, so the
+                    // JSONL and every chat surface stay clean. After a
+                    // runtime restart the claim/submit contract is
+                    // recoverable from the session's own tool-call history.
+                    // Origin-gated a second time (see `brief_for_system_block`):
+                    // a stored Intent whose kind is not a PM dispatch can
+                    // never feed the system block, whatever filled the field.
+                    // The Chat this turn is accountable to, kept as a local so
+                    // the pre-turn bookkeeping (queue row, pause-card
+                    // supersession, attachment pull) can read it while the loop
+                    // borrows are still free. Same value the loop sees through
+                    // `turn_surface`.
+                    let chat_id = surface.chat_session_id.clone();
+                    let brief =
+                        crate::agent::intent_turn::brief_for_system_block(&kind, &assignment_brief);
+                    if !brief.is_empty() {
+                        context_builder.set_task_brief(brief.to_string());
+                    }
+                    // §5.5.5: this intent has left the pending queue and is
+                    // starting its turn — drop its queue row so the execution
+                    // UI stops showing it as waiting. A no-op when it reached
+                    // an idle session and was never recorded as pending.
+                    if !chat_id.is_empty()
+                        && let Some(conv) = agent_loop.session.conversation.as_ref()
+                    {
+                        conv.remove_pending_intent(&message_id);
+                    }
+                    // Design 27 §7.1 / plan D-C/C1: the inbound kind
+                    // decides two orthogonal things — the responder role
+                    // (`request` only: hide intent_send / ask_user_question,
+                    // refuse human-awaiting pauses) and the write-back the
+                    // turn owes (a `request`, or a human `user_message`
+                    // routed from a Chat session per §5.4.4). A `response`
+                    // is an ordinary turn for the initiator (the answer
+                    // arrives as user input; the model decides any
+                    // follow-up with a fresh request).
+                    let (responder, write_back) =
+                        crate::agent::intent_turn::turn_kind_semantics(&kind, &message_id);
+                    let turn_ctx = || {
+                        crate::agent::intent_turn::IntentTurnContext::new(
+                            &message_id,
+                            &from,
+                            &action,
+                        )
+                    };
+                    agent_loop.pending_intent = if responder { Some(turn_ctx()) } else { None };
+                    agent_loop.chat_writeback = if write_back { Some(turn_ctx()) } else { None };
+                    // ADR-100 revision: the round-open milestone is a RUNTIME
+                    // state. It used to be a durable `turn_started` row so a
+                    // refresh mid-turn could recover "a round is in flight",
+                    // but that made every transcript accumulate status lines
+                    // that mean nothing once the turn is over. The live surface
+                    // now derives its waiting indicator from the unanswered
+                    // trigger (frontend `pendingTurn`), and this turn's own
+                    // terminal write-back closes it.
+                    // ADR-100 follow-up: the Chat obligations this turn carries
+                    // (card coordinates, answerability, terminal echo). The
+                    // Intent transport used to hand over only the
+                    // answerability half of this and keep the rest in fields
+                    // the card writer could not see.
+                    // ADR-106 D3: the two facts about this delivery the loop
+                    // cannot derive for itself — which Chat row started the
+                    // round, and whether the routing opened a new session —
+                    // handed over before the turn runs, so the single reference
+                    // row `run()` writes can state them. The trigger follows the
+                    // attachment-pull convention below: a group @ fan-out's
+                    // per-target id matches no durable row, so the shared
+                    // `user_message` id is the one worth threading under. A turn
+                    // that owes no write-back (`response`) has no such row and
+                    // stays unthreaded rather than pointing at its own intent id.
+                    agent_loop.turn_reference = crate::agent::intent_turn::TurnReference {
+                        // Router-supplied coordinate: the row it names exists
+                        // by construction (the Router wrote it before
+                        // delivering), so a refusal here is a fault, not a
+                        // stale mirror claim — see `mirror_claim`.
+                        mirror_claim: false,
+                        trigger_message_id: if write_back {
+                            chat_row_id.clone()
+                        } else {
+                            String::new()
+                        },
+                        opened_new,
+                        // D13: the round's one-line task name, written once with
+                        // the reference and never rewritten. `brief` is the
+                        // system slot (the PM playbook), so it may name a row
+                        // only when it is NOT the playbook, and a peer round is
+                        // named by its display projection — see
+                        // `reference_name`.
+                        round_name: crate::agent::intent_turn::reference_name(
+                            &kind,
+                            brief,
+                            &content,
+                            display.as_ref(),
+                        ),
+                        // D13: the chip's coordinate, stated once with the row. The
+                        // transport parsed it off the conversation key, so an empty
+                        // string here means "not a task conversation" — a task id no
+                        // peer could invent.
+                        task_id: if task_id.is_empty() {
+                            None
+                        } else {
+                            Some(task_id)
+                        },
+                    };
+                    agent_loop.turn_surface = surface;
+                    // §5.5.4: this turn is the answer to any pause card still
+                    // showing — drop it from the loop's bookkeeping before this
+                    // turn's own interactions open, so the round snapshot never
+                    // publishes "continue?" alongside a running round.
+                    agent_loop.supersede_pause_cards();
+                    // The model-facing message starts as the user's verbatim
+                    // text; the auto-title and the JSONL `user` entry stay
+                    // clean (ADR-046).
+                    //
+                    // ADR-107: the turn's reference parts are handed to the
+                    // loop for the user-row write, and rendered AFTER the words
+                    // for the model — the ask leads, the framing follows. This
+                    // is the whole fix for "every chat-dispatched session opens
+                    // with the same sentence": the persisted row (and with it
+                    // the auto-title) is the human's message, not the router's
+                    // paraphrase of it.
+                    agent_loop.turn_message_refs = context_refs;
+                    // The row's other side: this turn's human display projection
+                    // rides `metadata.intent`, next to the machine envelope the
+                    // row body already carries. `None` for a human origin, whose
+                    // body is already the person's words.
+                    //
+                    // A PM dispatch is the one human origin whose words are NOT
+                    // the person's: they are the PM's generated Markdown, spoken
+                    // in the owner's name. The row says so (`metadata.turn_origin`),
+                    // so a surface can render them as markdown instead of
+                    // painting their syntax as characters (design 27 §5.4.4).
+                    agent_loop.turn_user_row_meta =
+                        crate::agent::intent_turn::turn_row_meta(&kind, display.as_ref());
+                    let mut llm_message = crate::agent::intent_turn::render_user_turn(
+                        &content,
+                        &agent_loop.turn_message_refs,
+                    );
+                    // Design 27 §4.2.1 chat attachments: the Intent carries
+                    // ids only — the bytes are pulled over node-auth HTTP
+                    // through the Gateway (never the MQTT envelope) and
+                    // materialized into the agent-home `files/` dir through
+                    // the SAME `AttachmentService` the execution surface
+                    // uses, so the hint path / `doc_reader` resolve in
+                    // lock-step. A failed pull degrades that ONE attachment
+                    // to "invisible this turn" (the durable chat row still
+                    // records it); the turn must still run.
+                    let mut intent_content_parts: Option<
+                        Vec<acowork_core::providers::traits::ContentPart>,
+                    > = None;
+                    // The image derivation's verdicts (see `ImageParts`): the
+                    // hint is built after the workspace references join the
+                    // list, so the delivery facts have to outlive this block.
+                    let mut intent_images: Option<
+                        crate::agent::attachment_to_image::ImageParts,
+                    > = None;
+                    let mut intent_attached_items: Option<
+                        Vec<acowork_core::protocol::AttachedItem>,
+                    > = if chat_attachment_ids.is_empty() {
+                        None
+                    } else if chat_id.is_empty() {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            message_id = %message_id,
+                            "chat attachments carry ids but the Intent has no chat session — skipped"
+                        );
+                        None
+                    } else {
+                        let gateway_host = agent_loop
+                            .core
+                            .config
+                            .gateway_host
+                            .clone()
+                            .unwrap_or_else(|| "127.0.0.1".to_string());
+                        let node_token = agent_loop
+                            .core
+                            .config
+                            .mqtt_password
+                            .clone()
+                            .unwrap_or_default();
+                        let instance = agent_loop.core.config.agent_instance_id.clone();
+                        // Design 27 §5.3.1: a group @ fan-out's per-target
+                        // `message_id` matches no durable row; the shared
+                        // `user_message` (`in_reply_to`) carries the
+                        // attachments. A 1:1 chat message leaves
+                        // `in_reply_to` empty and pulls by `message_id`.
+                        let attach_coord = if in_reply_to.is_empty() {
+                            &message_id
+                        } else {
+                            &in_reply_to
+                        };
+                        let mut pulled = Vec::new();
+                        for aid in &chat_attachment_ids {
+                            match crate::agent::intent_turn::pull_chat_attachment(
+                                &gateway_host,
+                                &node_token,
+                                &instance,
+                                &chat_id,
+                                aid,
+                                attach_coord,
+                            )
+                            .await
+                            {
+                                Ok((filename, mime, bytes)) => pulled.push(PulledAttachment {
+                                    filename,
+                                    mime,
+                                    bytes,
+                                }),
+                                Err(e) => tracing::warn!(
+                                    session_id = %session_id,
+                                    attachment_id = %aid,
+                                    error = %e,
+                                    "chat attachment pull failed, turn continues without it"
+                                ),
+                            }
+                        }
+                        let items = materialize_pulled_attachments(
+                            agent_loop.core.attachment_service(),
+                            &session_id,
+                            pulled,
+                        )
+                        .await;
+                        if items.is_empty() {
+                            None
+                        } else {
+                            // Images and documents flow to the LLM the same
+                            // way they do on the execution surface; a derive
+                            // failure only drops the parts (the file hint
+                            // below already stands). The hint itself is
+                            // built once, after the workspace references
+                            // join this turn's attachment list.
+                            let caps = agent_loop
+                                .session
+                                .model
+                                .as_deref()
+                                .and_then(|m| agent_loop.get_model_capabilities(m));
+                            match (
+                                crate::agent::attachment_to_document::derive_document_parts(
+                                    agent_loop.core.attachment_service(),
+                                    &items,
+                                    caps.as_ref(),
+                                )
+                                .await,
+                                crate::agent::attachment_to_image::derive_image_parts(
+                                    agent_loop.core.attachment_service(),
+                                    &items,
+                                    caps.as_ref(),
+                                )
+                                .await,
+                            ) {
+                                (Ok(documents), Ok(mut images)) => {
+                                    intent_content_parts =
+                                        crate::agent::attachment_to_image::merge_turn_parts(
+                                            None,
+                                            documents,
+                                            images.take_parts(),
+                                        );
+                                    intent_images = Some(images);
+                                }
+                                (Err(e), _) | (_, Err(e)) => tracing::warn!(
+                                    session_id = %session_id,
+                                    error = %e,
+                                    "chat attachment content parts unavailable, hint only"
+                                ),
+                            }
+                            Some(items)
+                        }
+                    };
+                    // ADR-100: the workspace references ("Add to Chat") join
+                    // the pulled uploads. They need no pull — the path is
+                    // node-local and this agent's own tools read it — so they
+                    // arrive as parsed. One hint for the union, in the order the
+                    // composer attached them.
+                    intent_attached_items =
+                        merge_intent_attachments(intent_attached_items.take(), attached_items);
+                    if let Some(items) = intent_attached_items.as_ref() {
+                        llm_message = build_attachment_hint(
+                            &llm_message,
+                            Some(items),
+                            Some(agent_loop.core.config.work_dir.as_str()),
+                            intent_images.as_ref(),
+                        );
+                    }
+                    last_user_message = Some((content.clone(), message_id.clone()));
+                    let result = agent_loop
+                        .run(
+                            &llm_message,
+                            &mut context_builder,
+                            intent_content_parts,
+                            Some(message_id.clone()),
+                            Some(content.as_str()),
+                            intent_attached_items.as_deref(),
+                        )
+                        .await;
+                    // Release this turn's Chat obligations and take back the
+                    // §7.1 response context (D-C/C1) the write-back posts.
+                    let (ctx, outcome) = end_turn_obligations(&mut agent_loop).await;
+                    match result {
+                        Ok(response) => {
+                            if let Some(ref tx) = chunk_tx {
+                                let event = SessionChunkEvent {
+                                    session_id: session_id.clone(),
+                                    event: ChunkEvent::Done {
+                                        content: response.clone(),
+                                        message_id: message_id.clone(),
+                                    },
+                                };
+                                if tx.send(event).await.is_err() {
+                                    tracing::warn!(
+                                        session_id = %session_id,
+                                        "Failed to send Done chunk event (intent turn)"
+                                    );
+                                }
+                            }
+                            agent_loop.session_core.notify_new_data_available();
+                            if let Some(ctx) = ctx {
+                                // System write-back (§7.1) — the model had
+                                // no tool that could produce this.
+                                let body = crate::agent::intent_turn::truncate_response_body(
+                                    &response,
+                                    64 * 1024,
+                                );
+                                if let Err(e) = crate::agent::intent_turn::post_intent_response(
+                                    &agent_loop.core.config.agent_instance_id,
+                                    &agent_loop
+                                        .core
+                                        .config
+                                        .gateway_host
+                                        .clone()
+                                        .unwrap_or_else(|| "127.0.0.1".to_string()),
+                                    &agent_loop
+                                        .core
+                                        .config
+                                        .mqtt_password
+                                        .clone()
+                                        .unwrap_or_default(),
+                                    &session_id,
+                                    &ctx,
+                                    outcome,
+                                    &body,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(
+                                        session_id = %session_id,
+                                        request_id = %ctx.request_id,
+                                        error = %e,
+                                        "Intent response write-back failed (turn already ended; Gateway mailbox keeps the fact)"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                session_id = %session_id,
+                                error = %e,
+                                "SessionTask agent loop error (intent turn)"
+                            );
+                            let (user_message, detail, error_type) = e.error_info();
+                            if let Some(ref tx) = chunk_tx {
+                                let event = SessionChunkEvent {
+                                    session_id: session_id.clone(),
+                                    event: ChunkEvent::Error {
+                                        user_message: user_message.clone(),
+                                        detail,
+                                        error_type,
+                                        message_id: message_id.clone(),
+                                    },
+                                };
+                                if tx.send(event).await.is_err() {
+                                    tracing::warn!(
+                                        session_id = %session_id,
+                                        "Failed to send Error chunk event (intent turn)"
+                                    );
+                                }
+                            }
+                            if let Some(ctx) = ctx {
+                                // §7.1 failed row: user-facing summary only,
+                                // no internal detail / stack on the wire.
+                                let _ = crate::agent::intent_turn::post_intent_response(
+                                    &agent_loop.core.config.agent_instance_id,
+                                    &agent_loop
+                                        .core
+                                        .config
+                                        .gateway_host
+                                        .clone()
+                                        .unwrap_or_else(|| "127.0.0.1".to_string()),
+                                    &agent_loop
+                                        .core
+                                        .config
+                                        .mqtt_password
+                                        .clone()
+                                        .unwrap_or_default(),
+                                    &session_id,
+                                    &ctx,
+                                    crate::agent::intent_turn::TurnOutcome::Failed,
+                                    &user_message,
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                }
+                Some(SessionMessage::ContinueExecution) => {
+                    tracing::debug!(
+                        session_id = %session_id,
+                        "SessionTask: ContinueExecution received"
+                    );
+                    // 429 retry UX: if the ReliableProvider is currently in a
+                    // long retry wait, wake it immediately via skip_notify.
+                    if let Some(ref handle) = agent_loop.session_core.retry_wait_handle {
+                        handle.skip_notify.notify_one();
+                        tracing::info!(
+                            session_id = %session_id,
+                            "Skip retry wait triggered via ContinueExecution"
+                        );
+                    }
+                    let _ = agent_inbound_tx
+                        .send(crate::agent::inbound::InboundMessage::ContinueExecution {
+                            // ADR-034: populate session_id for Phase 2 routing.
+                            session_id: session_id.clone(),
+                            reason: "user_requested".to_string(),
+                        })
+                        .await;
+                }
+                Some(SessionMessage::UpdateRuntimeConfig(overrides)) => {
+                    tracing::info!(
+                        session_id = %session_id,
+                        max_output_tokens = ?overrides.max_output_tokens,
+                        max_iterations = ?overrides.max_iterations,
+                        temperature = ?overrides.temperature,
+                        context_window = ?overrides.context_window,
+                        "SessionTask: applying runtime config overrides"
+                    );
+                    // No tool_definitions change originates from
+                    // runtime-config pushes anymore — the tool
+                    // compression surface was retired.
+                    agent_loop.apply_runtime_config(&overrides);
+
+                    // Push updated state to frontend immediately so the
+                    // ResultsPanel temperature display reflects the new value
+                    // without waiting for the next LLM iteration.
+                    agent_loop.emit_session_state();
+                }
+                Some(SessionMessage::UpdateWorkspaceContext { context_text }) => {
+                    tracing::info!(
+                        session_id = %session_id,
+                        "SessionTask: updating workspace context"
+                    );
+                    context_builder.set_workspace_context(context_text);
+                }
+                Some(SessionMessage::UpdateMcpTools { mcp_tools }) => {
+                    tracing::info!(
+                        session_id = %session_id,
+                        mcp_tool_count = mcp_tools.as_ref().map(|t| t.len()).unwrap_or(0),
+                        "SessionTask: updating MCP tools on AgentCore"
+                    );
+                    // The payload is the AGENT-layer set (already filtered at
+                    // connect time by `agent_mcp_tools.json`), so it becomes a
+                    // baseline, not the answer: re-compose the session layer on
+                    // top or this broadcast would erase the session's switches.
+                    tool_layer.set_agent_mcp(mcp_tools);
+                    tool_layer.apply_to(&mut agent_loop.core);
+                    refresh_builtin_tools_dependents(&mut agent_loop.core, &mut context_builder);
+                }
+                Some(SessionMessage::UpdateToolPolicy { policy }) => {
+                    let changed = tool_layer.set_policy(policy);
+                    tracing::info!(
+                        session_id = %session_id,
+                        changed,
+                        inherits_agent = tool_layer.policy().is_none(),
+                        "SessionTask: applying per-session tool policy"
+                    );
+                    if changed {
+                        tool_layer.apply_to(&mut agent_loop.core);
+                        refresh_builtin_tools_dependents(
+                            &mut agent_loop.core,
+                            &mut context_builder,
+                        );
+                    }
+                }
+                Some(SessionMessage::UpdateBuiltinTools { entries }) => {
+                    let update_count = entries.len();
+                    let enabled_count = entries.iter().filter(|e| e.enabled).count();
+                    tracing::info!(
+                        session_id = %session_id,
+                        update_count,
+                        enabled_count,
+                        "SessionTask: updating builtin tools on AgentCore"
+                    );
+                    // The payload is the AGENT-layer desired state. Record it
+                    // as the baseline and re-compose the session layer on top
+                    // (`apply_builtin_tools_update` alone would write layer A
+                    // verbatim, dropping this session's narrowing).
+                    tool_layer.set_agent_builtin(&entries);
+                    apply_builtin_tools_update(
+                        &mut agent_loop.core,
+                        &mut context_builder,
+                        tool_layer.effective_builtin(),
+                    );
+                }
+                Some(SessionMessage::UpdateSystemPrompt { system_prompt }) => {
+                    tracing::info!(
+                        session_id = %session_id,
+                        prompt_len = system_prompt.len(),
+                        "SessionTask: updating main-dialog system prompt (ADR-063 hot-reload)"
+                    );
+                    // Replace the main-dialog system prompt in the
+                    // ContextBuilder. The next `build_chat_request` picks
+                    // up the new value — no agent restart needed.
+                    context_builder.set_system_prompt(system_prompt);
+                }
+                // ── ADR-094: Progressive-mode skills summary hot-reload ──
+                //
+                // Mirrors the `UpdateSystemPrompt` handler above: replace (or
+                // clear) the agent-level `skill_summary` slot so the next
+                // `build_chat_request` picks up the new value. `None` clears
+                // the summary (Manual mode hot-toggle) and deliberately leaves
+                // any per-turn `active_skill` alone — that slot is owned by the
+                // user-message branch above, not by config reloads.
+                Some(SessionMessage::UpdateSkillInstructions { instructions }) => {
+                    tracing::info!(
+                        session_id = %session_id,
+                        has_skills = instructions.is_some(),
+                        "SessionTask: updating skill instructions (ADR-094)"
+                    );
+                    match instructions {
+                        Some(skills) => context_builder.set_skill_summary(skills),
+                        None => context_builder.clear_skill_summary(),
+                    }
+                }
+                // ── ADR-030 C3: dynamic builtin tool add/remove ──────
+                //
+                // A SidecarEndpointUpdate just told us a sidecar came
+                // online (LSP relay ready, embed model restart, ...).
+                // `entry` is already wrapped with security decorators by
+                // the SessionManager, so the session just appends /
+                // replaces it in its own `builtin_tools` and rebuilds
+                // the dispatch list.
+                Some(SessionMessage::AddDynamicBuiltinTool { entry }) => {
+                    let tool_name = entry.name().to_string();
+                    let replaced = if let Some(existing) = agent_loop
+                        .core
+                        .builtin_tools
+                        .iter_mut()
+                        .find(|e| e.name() == tool_name)
+                    {
+                        *existing = entry;
+                        true
+                    } else {
+                        agent_loop.core.builtin_tools.push(entry);
+                        false
+                    };
+                    // Rebuild dispatch list + LLM tool_definitions in one
+                    // place (single source of truth for the reroute).
+                    refresh_builtin_tools_dependents(&mut agent_loop.core, &mut context_builder);
+                    tracing::info!(
+                        session_id = %session_id,
+                        tool = %tool_name,
+                        replaced,
+                        "SessionTask: dynamic builtin tool added/updated"
+                    );
+                }
+                Some(SessionMessage::RemoveDynamicBuiltinTool { name }) => {
+                    let before = agent_loop.core.builtin_tools.len();
+                    agent_loop.core.builtin_tools.retain(|e| e.name() != name);
+                    let removed = agent_loop.core.builtin_tools.len() < before;
+                    if removed {
+                        refresh_builtin_tools_dependents(
+                            &mut agent_loop.core,
+                            &mut context_builder,
+                        );
+                    }
+                    tracing::info!(
+                        session_id = %session_id,
+                        tool = %name,
+                        removed,
+                        "SessionTask: dynamic builtin tool removed"
+                    );
+                }
+                Some(SessionMessage::SetWorkDir { path }) => {
+                    tracing::debug!(
+                        session_id = %session_id,
+                        path = %path,
+                        "SessionTask: SetWorkDir received (SessionCore already updated synchronously by SessionManager)"
+                    );
+                    // SessionCore.current_work_dir is already set via the shared
+                    // Arc<RwLock> by SessionManager — no further action needed.
+                }
+                Some(SessionMessage::SetWorkspacePromptFile { content }) => {
+                    tracing::info!(
+                        session_id = %session_id,
+                        has_content = content.is_some(),
+                        "SessionTask: updating workspace prompt file content"
+                    );
+                    context_builder.set_workspace_prompt_file(content);
+                }
+                Some(SessionMessage::UpdateIdentityContext { identity_context }) => {
+                    tracing::info!(
+                        session_id = %session_id,
+                        has_context = identity_context.is_some(),
+                        "SessionTask: updating identity context"
+                    );
+                    let next = identity_context.unwrap_or_default();
+                    context_builder.set_identity_context(next.clone());
+                    // Keep SessionState in sync so compaction sees the latest value.
+                    agent_loop.session.set_identity_context(if next.is_empty() {
+                        None
+                    } else {
+                        Some(next)
+                    });
+                }
+                Some(SessionMessage::ProviderListUpdated) => {
+                    // The shared global_provider_list on AgentCore is already updated
+                    // (written by SessionManager before broadcasting this message).
+                    // Just emit session state so the frontend sees the latest info.
+                    // Reasoning_effort is NOT reset here — it was correctly initialized
+                    // at session creation in build_initial_session_state, and the user
+                    // may have explicitly overridden it via ReasoningEffort messages.
+                    agent_loop.emit_session_state();
+                }
+                Some(SessionMessage::Stop { reason }) => {
+                    tracing::info!(
+                        session_id = %session_id,
+                        reason = %reason,
+                        "SessionTask: forwarding stop signal"
+                    );
+                    let _ = agent_inbound_tx
+                        .send(crate::agent::inbound::InboundMessage::Stop { reason })
+                        .await;
+                }
+                Some(SessionMessage::EnableDebugMode(handles)) => {
+                    tracing::info!(
+                        session_id = %session_id,
+                        "SessionTask: injecting debug mode into existing session"
+                    );
+                    // Create a DevMode observer from the handles and inject it
+                    // into AgentCore (ADR-013: Observer Pipeline).
+                    let observer = DebugObserverImpl::new(handles);
+                    agent_loop.core.set_debug_mode(observer);
+                }
+                Some(SessionMessage::DisableDebugMode) => {
+                    tracing::info!(
+                        session_id = %session_id,
+                        "SessionTask: clearing debug mode from existing session"
+                    );
+                    // Symmetric counterpart to EnableDebugMode above.
+                    // The SessionManager already cleared its controller/sender
+                    // maps and `runtime_debug_handles`; we only need to drop
+                    // the observer on AgentCore so future agent_loop iterations
+                    // emit no debug events.
+                    agent_loop.core.clear_debug_mode();
+                }
+                Some(SessionMessage::Close) => {
+                    tracing::info!(
+                        session_id = %session_id,
+                        "SessionTask: Close received, shutting down"
+                    );
+                    break;
+                }
+                // Plan D5: re-run the last turn in place.
+                //
+                // Three facts make this a *retry* rather than a re-submission:
+                // the words come from the transcript (never from the caller),
+                // the `message_id` is the one the row already carries, and the
+                // run goes through `replay` — which appends no `user` row. So the
+                // round keeps its coordinate, the transcript gains an answer
+                // instead of a duplicate question, and the model does not read
+                // the same instruction twice.
+                Some(SessionMessage::RetryTurn) => {
+                    let last = match last_user_message.clone() {
+                        Some(pair) => Some(pair),
+                        // After a restart the task holds no memory of the turn,
+                        // and that is exactly when a human retries (they come
+                        // back to a session they left). The transcript is the
+                        // record, so read it rather than inventing a second one.
+                        None => last_user_row(&agent_loop, &session_id),
+                    };
+                    let Some((content, msg_id)) = last else {
+                        tracing::info!(
+                            session_id = %session_id,
+                            "RetryTurn: session has no user turn to replay — ignored"
+                        );
+                        continue;
+                    };
+                    tracing::info!(
+                        session_id = %session_id,
+                        message_id = %msg_id,
+                        "RetryTurn: replaying the last user turn"
+                    );
+                    // The chosen model/provider/effort must be the ones the human
+                    // just picked, and a config change lands as a pending effect
+                    // applied before the next run — so apply them first, exactly
+                    // as the ChatMessage path does before its run.
+                    agent_loop.apply_pending_config_effects(&mut context_builder);
+                    agent_loop.supersede_pause_cards();
+                    // A retry is not a Chat-composed turn: it answers no row and
+                    // owes no card to one. Leaving the previous surface in place
+                    // would let the resumed round inherit another turn's chat
+                    // obligations.
+                    agent_loop.turn_surface = Default::default();
+                    agent_loop.turn_user_row_meta = None;
+                    match agent_loop
+                        .replay(&content, &mut context_builder, None, Some(msg_id.clone()))
+                        .await
+                    {
+                        Ok(response) => {
+                            tracing::info!(
+                                session_id = %session_id,
+                                response_len = response.len(),
+                                "RetryTurn: replay finished"
+                            );
+                            if let Some(ref tx) = chunk_tx {
+                                let event = SessionChunkEvent {
+                                    session_id: session_id.clone(),
+                                    event: ChunkEvent::Done {
+                                        content: response,
+                                        message_id: msg_id,
+                                    },
+                                };
+                                if tx.send(event).await.is_err() {
+                                    tracing::warn!(
+                                        session_id = %session_id,
+                                        "RetryTurn: failed to send Done chunk event"
+                                    );
+                                }
+                            }
+                            agent_loop.session_core.notify_new_data_available();
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                session_id = %session_id,
+                                error = %e,
+                                "RetryTurn: replay failed"
+                            );
+                            // The durable notice the failure path writes belongs to
+                            // this turn too: a retry that fails again must leave the
+                            // same evidence, or the second failure would be the one
+                            // that looks like nothing happened.
+                            let (user_message, detail, error_type) = e.error_info();
+                            if let Some(conv) = agent_loop.session.conversation() {
+                                conv.append_message(
+                                    "system",
+                                    &format!("The retry ended without finishing: {user_message}. "),
+                                    Some(serde_json::json!({
+                                        "notice": "turn_failed",
+                                        "error_type": error_type,
+                                        "detail": detail,
+                                    })),
+                                );
+                            }
+                            if let Some(ref tx) = chunk_tx {
+                                let event = SessionChunkEvent {
+                                    session_id: session_id.clone(),
+                                    event: ChunkEvent::Error {
+                                        user_message,
+                                        detail,
+                                        error_type,
+                                        message_id: msg_id,
+                                    },
+                                };
+                                if tx.send(event).await.is_err() {
+                                    tracing::warn!(
+                                        session_id = %session_id,
+                                        "RetryTurn: failed to send Error chunk event"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(SessionMessage::CompressAction(action)) => {
+                    tracing::info!(
+                        session_id = %session_id,
+                        action = ?action,
+                        "SessionTask: manual compress action triggered"
+                    );
+                    match action {
+                        crate::agent::loop_::CompressionAction::CompressSummary => {
+                            let model_name =
+                                agent_loop.session.model().unwrap_or("default").to_string();
+                            if let Err(e) = agent_loop
+                                .compact_history_if_needed(&model_name, true)
+                                .await
+                            {
+                                report_manual_compaction_error(
+                                    chunk_tx.as_ref(),
+                                    &session_id,
+                                    "compress_action",
+                                    &e,
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                }
+                Some(SessionMessage::UpdateEmbedConfig {
+                    embed_endpoint,
+                    embed_model_id,
+                    embed_dimension,
+                    embed_provider_id,
+                    embed_api_key,
+                }) => {
+                    let cloud_provider_label =
+                        embed_provider_id.as_deref().unwrap_or("<local-onnx>");
+                    tracing::info!(
+                        session_id = %session_id,
+                        endpoint = %embed_endpoint,
+                        model_id = %embed_model_id,
+                        dimension = embed_dimension,
+                        cloud_provider = cloud_provider_label,
+                        has_api_key = embed_api_key.is_some(),
+                        "SessionTask: updating embedding provider"
+                    );
+
+                    // ADR-101: the dimension migration that used to run here
+                    // re-embedded the agent's memory nodes. Those nodes now live
+                    // in the memory service, which owns re-embedding and is
+                    // reconfigured through `/api/memory/admin/*`. The Runtime
+                    // only swaps the provider used by the conversation index.
+
+                    // S1-5c: cloud embedding provider needs the API key to
+                    // authenticate. For local ONNX, the key is unused and we
+                    // pass None to keep the original call shape.
+                    let api_key_ref = embed_api_key.as_deref();
+
+                    // Build the new embedding provider (local ONNX or cloud).
+                    // `RemoteEmbeddingProvider::with_config_and_timeouts` already
+                    // supports any OpenAI-compatible `/v1/embeddings` endpoint
+                    // with optional API key — for local ONNX, the api_key is
+                    // None and the sidecar runs without auth.
+                    let new_onnx_provider =
+                        crate::embedding::remote::RemoteEmbeddingProvider::with_config_and_timeouts(
+                            &embed_endpoint,
+                            api_key_ref,
+                            &embed_model_id,
+                            embed_dimension,
+                            &agent_loop.core.config.timeouts,
+                        );
+                    // Wrap as FallbackEmbeddingProvider with ONNX as primary,
+                    // keeping the existing provider chain as fallback (if available).
+                    // Lock the dimension so that fallback providers with a
+                    // different dimension are automatically filtered out.
+                    let new_emb: Arc<dyn crate::embedding::EmbeddingProvider> =
+                        if let Some(ref old_provider) = agent_loop.core.embedding_provider {
+                            Arc::new(
+                                crate::embedding::FallbackEmbeddingProvider::with_providers(
+                                    vec![
+                                // ONNX local base timeout: 5s. The effective
+                                // timeout is scaled by in-flight concurrency
+                                // (ProviderEntry::scaled_timeout_ms) so queued
+                                // attempts on the serialized ONNX session are
+                                // not killed before they get to run.
+                                (Box::new(new_onnx_provider), 5000),
+                                (
+                                    Box::new(
+                                        crate::embedding::ArcDelegateEmbeddingProvider::from_arc(
+                                            old_provider.clone(),
+                                        ),
+                                    ),
+                                    5000,
+                                ),
+                            ],
+                                    crate::embedding::EmbeddingConfig::default(),
+                                )
+                                .with_locked_dimension(embed_dimension),
+                            )
+                        } else {
+                            Arc::new(
+                                crate::embedding::FallbackEmbeddingProvider::with_providers(
+                                    vec![(Box::new(new_onnx_provider), 5000)],
+                                    crate::embedding::EmbeddingConfig::default(),
+                                )
+                                .with_locked_dimension(embed_dimension),
+                            )
+                        };
+                    agent_loop.core.update_embedding_provider(new_emb);
+                }
+                Some(SessionMessage::DisableEmbedConfig) => {
+                    tracing::info!(
+                        session_id = %session_id,
+                        "SessionTask: disabling embedding provider (embed sidecar unavailable)"
+                    );
+                    agent_loop.core.clear_embedding_provider();
+                }
+                // ADR-035 Phase 3: EnableNotify/DisableNotify removed.
+                None => {
+                    tracing::info!(
+                        session_id = %session_id,
+                        "SessionTask: inbound channel closed, shutting down"
+                    );
+                    break;
+                }
+            }
+        }
+
+        // Graceful shutdown: attempt to close session with distillation
+        if let Err(e) = agent_loop.close_session_with_distillation().await {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "SessionTask: failed to close session with distillation (non-fatal)"
+            );
+        }
+    }
+}
+
+/// Rebuild the LLM-visible tool definitions from `builtin_tools` (enabled
+/// only) and update the `context_builder` so the next LLM call sees the
+/// current tool set.
+///
+/// **Why this is needed:** `UpdateBuiltinTools`, `AddDynamicBuiltinTool`,
+/// and `RemoveDynamicBuiltinTool` all modify `agent_loop.core.builtin_tools`
+/// and call `rebuild_all_tools()` to refresh the dispatch list, but they did
+/// NOT update the `tool_definitions` stored in `ContextBuilder`. This caused
+/// a mismatch between what the LLM *sees* (stale tool_definitions) and what
+/// the runtime can *dispatch* (fresh all_tools):
+///
+/// The one place that words the operator-presence note (plan D3/D6).
+///
+/// An execution session created by an Intent has an **agent** initiator, and a
+/// human added to its intervention roster may type into it. Their words are
+/// voiced as that initiator — which is the point, because the run is the
+/// initiator's task and a second voice from nowhere would re-open the question
+/// of whose work this is. But the model must not be left to conclude that every
+/// instruction it reads is the requester's own: an operator stepping in to fix a
+/// broken launch parameter is *not* the requester confirming a plan.
+///
+/// So the fact is stated once, in Block A, for the whole session — not attached
+/// to the operator's message, because the turns before it were written by the
+/// agent and would otherwise read as if a human had been present all along.
+///
+/// `initiator` is the session's own row (an agent instance id in an
+/// agent-to-agent session, a human account id in a human-started one), and the
+/// note is worded to be true in both cases.
+pub(crate) fn operator_presence_note(initiator: Option<&str>) -> String {
+    let voice = initiator
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("the account this session belongs to");
+    format!(
+        "This session is shared with a human operator who can append turns. A message may therefore have been typed by that person while being voiced as {voice}, so that the work stays on one task and one thread. Treat such a message as an instruction from {voice}: act on it, answer it, and do not treat it as {voice} confirming anything the operator did not write. The operator can also change this session's model, provider or reasoning effort and can retry a turn; if a turn of yours ended in an error, say plainly what failed rather than assuming the work is finished."
+    )
+}
+
+/// The last genuine user turn of a session, read back from its transcript.
+///
+/// `SessionTask` keeps `last_user_message` in memory, which is enough while the
+/// task that saw the turn is still running. A human pressing Retry usually does
+/// so after a restart, when that memory is gone — but the transcript still holds
+/// the row, so the retry has something to replay instead of silently doing
+/// nothing. Assistant/system rows, internal artifacts and compaction events are
+/// skipped: only a turn that was actually written as `user` may be replayed.
+fn last_user_row(
+    agent_loop: &crate::agent::loop_::AgentLoop,
+    session_id: &str,
+) -> Option<(String, String)> {
+    let conversation = agent_loop.session.conversation()?;
+    let path = conversation.session_path();
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut found = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<crate::conversation::ConversationEntry>(line) else {
+            continue;
+        };
+        if entry.role != "user" || entry.is_internal() || entry.kind.is_some() {
+            continue;
+        }
+        if entry.content.trim().is_empty() {
+            continue;
+        }
+        found = Some((entry.content, entry.id));
+    }
+    if found.is_none() {
+        tracing::info!(session_id = %session_id, "no replayable user turn in transcript");
+    }
+    found
+}
+
+/// - Tool enabled at runtime → LLM never sees it → never calls it
+/// - Tool disabled at runtime → LLM still sees it → calls it → "Unknown tool"
+///
+/// See also: `loop_context.rs` MCP injection — MCP tools are injected
+/// separately at the `build_chat_request` level, not in tool_definitions.
+fn rebuild_context_tool_definitions(
+    builtin_tools: &[crate::agent::agent_core::BuiltinToolEntry],
+    context_builder: &mut ContextBuilder,
+) {
+    let new_tool_definitions: Vec<serde_json::Value> = builtin_tools
+        .iter()
+        .filter(|e| e.enabled || crate::agent_config::is_protected_tool(&e.name()))
+        .map(|e| {
+            let spec = e.tool.spec();
+            serde_json::to_value(&spec).unwrap_or_default()
+        })
+        .collect();
+    tracing::info!(
+        old_count = context_builder
+            .tool_definitions()
+            .map(|t| t.len())
+            .unwrap_or(0),
+        new_count = new_tool_definitions.len(),
+        "Rebuilding context builder tool definitions from builtin_tools"
+    );
+    context_builder.set_tool_definitions(new_tool_definitions);
+}
+
+/// Atomic builtin-tools enabled mutation - one of the two call sites
+/// for [`AgentCore::apply_builtin_enabled_entries`] (the other being
+/// the `SessionManager` template sync).
+///
+/// Routes the per-session write through the shared policy so the
+/// platform-protected filter is never re-implemented here. After the
+/// flag rewrite, refreshes both dependents in lock-step so the
+/// dispatch list (`all_tools`) and the LLM's `tool_definitions`
+/// (`ContextBuilder`) cannot diverge - the invariant the original
+/// `UpdateBuiltinTools` hot path broke.
+///
+/// `entries` carries the *desired* (name, enabled) state for every
+/// registered builtin tool. The wrapped `tool` impl behind each
+/// registered slot is preserved by the shared policy; only the
+/// `enabled` flag is rewritten, so security decorators set during
+/// `ToolRegistry::activate` survive.
+fn apply_builtin_tools_update(
+    core: &mut AgentCore,
+    context_builder: &mut ContextBuilder,
+    entries: Vec<crate::agent_config::AgentToolEntry>,
+) {
+    // Re-resolve through the shared policy (the empty patch drops
+    // unregistered slots, so this stays correct even if the incoming
+    // `entries` came from a write path that didn't itself consult the
+    // same policy).
+    core.apply_builtin_enabled_entries(&entries);
+
+    // Refresh both dependents in lock-step - the dispatch list for
+    // the runtime, and the LLM-visible spec list for the LLM.
+    refresh_builtin_tools_dependents(core, context_builder);
+}
+
+/// Rebuild `all_tools` (dispatch list) and `ContextBuilder` tool_definitions
+/// (LLM-visible spec list) from the current `core.builtin_tools`.
+///
+/// Used by callers that mutate `builtin_tools` directly (e.g. dynamic
+/// sidecar add/remove) and by [`apply_builtin_tools_update`]. Callers
+/// MUST NOT call `rebuild_all_tools` / `rebuild_context_tool_definitions`
+/// separately — that would re-introduce the duplicated flow that this
+/// function deprecates.
+pub(crate) fn refresh_builtin_tools_dependents(
+    core: &mut AgentCore,
+    context_builder: &mut ContextBuilder,
+) {
+    core.rebuild_all_tools();
+    rebuild_context_tool_definitions(&core.builtin_tools, context_builder);
+}
+
+// ---------------------------------------------------------------------------
+// ADR-046 §2.4 — prompt-side attachment hint builder
+// ---------------------------------------------------------------------------
+//
+// Pure helper, lifted out of the ChatMessage handler so unit tests can pin
+// the exact wire shape the LLM sees. Returns the *enriched* user-message
+// content (i.e. original text + a small bracketed "use `read_file` /
+// `doc_reader`" hint when at least one hintable item is present), or the
+// original content unchanged when nothing is hintable.
+//
+// Hint contract (ADR-046 §2.4 + this revision):
+//
+//   workspace file   → - file: `<abs_path>`
+//   workspace sel    → - file: `<abs_path>` (L10-L25)  (range collapsed when same line)
+//   file_upload      → - file: `<filename>` (id=<doc_id>, format=<fmt>, path=<abs_path>)
+//                        A `pdf` additionally flows as `ContentPart::Document`
+//                        when the model declares that input — the hint is sent
+//                        either way, because it is what the `doc_reader`
+//                        fallback reads the file by.
+//   image_upload     → (no hint — flows via multimodal ContentPart::ImageUrl)
+//   attached_folder  → (no hint — no single-tool way to enumerate a folder)
+//
+// The on-disk path for `file_upload` mirrors the layout chosen by
+// `attachment::on_disk_name` (the single source of truth shared with
+// `RuntimeAttachmentService::write_blob_atomic`):
+// `<work_dir>/files/<sanitized_stem>_<document_id>.<safe_ext>`.
+// `doc_reader` resolves blobs by absolute path and dispatches on the
+// file extension — so the `<ext>` suffix is the only contract surface
+// between the upload pipeline and the read tool. Keeping the call here
+// in lock-step with `on_disk_name` is what guarantees the path string
+// the LLM receives matches the actual file on disk.
+/// Derive the on-disk `format` (lowercase extension, no dot) for a
+/// Gateway-forwarded chat attachment. Prefers the filename extension — the
+/// same source the execution surface's multipart upload feeds the store —
+/// and falls back to a MIME subtype when the name carries no dot. Unknown
+/// values are fine: `safe_extension` collapses anything off the whitelist to
+/// `bin`, exactly as a direct execution-view upload would.
+fn forwarded_format(filename: &str, mime: &str) -> String {
+    if let Some(ext) = filename
+        .rsplit('.')
+        .next()
+        .filter(|e| !e.is_empty() && *e != filename)
+    {
+        return ext.to_ascii_lowercase();
+    }
+    if let Some(sub) = mime.split('/').nth(1) {
+        let sub = sub.split(';').next().unwrap_or(sub);
+        if !sub.is_empty() {
+            return sub.to_ascii_lowercase();
+        }
+    }
+    "bin".to_string()
+}
+
+/// Materialize HTTP-pulled Chat attachments (design 27 §4.2.1) into the
+/// agent-home `files/` dir and fold them into `attached_items`.
+///
+/// Each blob is re-uploaded through the SAME [`AttachmentService`] the
+/// execution surface uses, so the content-hash `document_id`, the on-disk
+/// name (`on_disk_name`), and the LLM hint / `doc_reader` path all stay in
+/// lock-step — a chat attachment and an execution-view upload of the same
+/// bytes land in exactly the same place. A missing service slot or a store
+/// rejection degrades that ONE blob to "invisible this turn" (a warning,
+/// not an error): the durable chat row already records it, and the turn
+/// must still run.
+async fn materialize_pulled_attachments(
+    svc: Option<&Arc<dyn crate::usecases::AttachmentService>>,
+    session_id: &str,
+    pulled: Vec<PulledAttachment>,
+) -> Vec<acowork_core::protocol::AttachedItem> {
+    let Some(svc) = svc else {
+        tracing::warn!(
+            session_id = %session_id,
+            blob_count = pulled.len(),
+            "chat attachments: AttachmentService slot not ready, pull skipped"
+        );
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for blob in pulled {
+        let is_image = blob.mime.starts_with("image/");
+        let format = forwarded_format(&blob.filename, &blob.mime);
+        let params = crate::usecases::attachment::UploadFileParams {
+            filename: blob.filename.clone(),
+            format,
+            bytes: blob.bytes,
+            width: None,
+            height: None,
+        };
+        match svc.upload_file(params).await {
+            Ok(resp) => {
+                out.push(if is_image {
+                    acowork_core::protocol::AttachedItem::ImageUpload {
+                        document_id: resp.document_id,
+                        filename: resp.filename,
+                        format: resp.format,
+                        size_bytes: resp.size_bytes,
+                        width: None,
+                        height: None,
+                        client_id: None,
+                    }
+                } else {
+                    acowork_core::protocol::AttachedItem::FileUpload {
+                        document_id: resp.document_id,
+                        filename: resp.filename,
+                        format: resp.format,
+                        size_bytes: resp.size_bytes,
+                        client_id: None,
+                    }
+                });
+            }
+            Err(e) => tracing::warn!(
+                session_id = %session_id,
+                filename = %blob.filename,
+                error = %e,
+                "chat attachment store failed, turn continues without it"
+            ),
+        }
+    }
+    out
+}
+
+/// Merge the two arms a routed Chat turn can arrive with into the one list the
+/// turn sees (ADR-100). They are independent — uploads are pulled by Chat
+/// attachment id, workspace references arrive already parsed — so either one
+/// alone must survive the merge, and `None` means this turn attached nothing.
+fn merge_intent_attachments(
+    pulled: Option<Vec<acowork_core::protocol::AttachedItem>>,
+    references: Vec<acowork_core::protocol::AttachedItem>,
+) -> Option<Vec<acowork_core::protocol::AttachedItem>> {
+    let pulled = pulled.unwrap_or_default();
+    if pulled.is_empty() && references.is_empty() {
+        return None;
+    }
+    let mut merged = pulled;
+    merged.extend(references);
+    Some(merged)
+}
+
+/// Append the attachment block a turn's prompt carries, one line per
+/// attachable item:
+/// - `attached_file` / `attached_selection` / `attached_folder` — the workspace path
+/// - `image_upload` — the path **plus what the derivation actually did with the
+///   pixels** (see [`image_hint_line`]): `ImageUrl` parts travel with the
+///   request when the image was deliverable, and only the text line is left
+///   when it was not
+/// - `file_upload` — the on-disk path, **and** a PDF additionally travels as a
+///   `ContentPart::Document` when the model declares pdf input
+///
+/// The hint is emitted whether or not the bytes were inlined, and it is never
+/// stripped by the inlining: on the degraded paths (no pdf capability, over
+/// budget, a mid-session model switch that drops the part) this line is the
+/// only pointer the agent has left to the file. See
+/// [`crate::agent::attachment_to_document`] for the gate.
+///
+/// For images the line is phrased from `images`, the verdicts the image
+/// derivation returned — never from the attachment list. The difference is the
+/// whole point: an image that was inlined needs no `image_read`, and one that
+/// was dropped must not be described as if the model had seen it.
+fn is_image_filename(path: &str) -> bool {
+    let ext = path.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("");
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg"
+    )
+}
+
+fn build_attachment_hint(
+    user_content: &str,
+    items: Option<&[acowork_core::protocol::AttachedItem]>,
+    work_dir: Option<&str>,
+    images: Option<&crate::agent::attachment_to_image::ImageParts>,
+) -> String {
+    let mut enriched = user_content.to_string();
+    let Some(items) = items else {
+        return enriched;
+    };
+    if items.is_empty() {
+        return enriched;
+    }
+
+    let hint_lines: Vec<String> = items
+        .iter()
+        .map(|item| match item {
+            acowork_core::protocol::AttachedItem::AttachedFile { abs_path, name, .. } => {
+                let is_image = is_image_filename(abs_path);
+                let suffix = if name.is_empty() || name == abs_path || is_image { String::new() } else { format!(" ({name})") };
+                let action = if is_image { " (image — open with `image_read`)" } else { "" };
+                format!("- file: `{abs_path}`{action}{suffix}")
+            },
+            acowork_core::protocol::AttachedItem::AttachedSelection {
+                abs_path,
+                start_line,
+                end_line,
+                ..
+            } => {
+                let line_info = if start_line != end_line {
+                    format!(" (L{}-L{})", start_line, end_line)
+                } else {
+                    format!(" (L{})", start_line)
+                };
+                format!("- file: `{}`{}", abs_path, line_info)
+            }
+            acowork_core::protocol::AttachedItem::FileUpload {
+                document_id,
+                filename,
+                format,
+                ..
+            } => {
+                // The on-disk path is built by `attachment::on_disk_name`
+                // — the same helper `write_blob_atomic` uses — so the
+                // absolute path handed to the LLM always matches the
+                // actual file. Without `work_dir` we still emit the hint
+                // but mark the path as `<work_dir>/...` so the LLM knows
+                // it can be resolved once `current_work_dir` is set by
+                // the SessionManager.
+                let on_disk = on_disk_name(document_id, format, filename);
+                let path_str = match work_dir {
+                    Some(wd) => format!("{}/files/{}", wd.trim_end_matches('/'), on_disk),
+                    None => format!("<work_dir>/files/{}", on_disk),
+                };
+                format!(
+                    "- file: `{}` (id={}, format={}, path={})",
+                    filename, document_id, format, path_str
+                )
+            }
+            acowork_core::protocol::AttachedItem::ImageUpload {
+                document_id, filename, format, width, height, ..
+            } => {
+                let on_disk = on_disk_name(document_id, format, filename);
+                let path = match work_dir {
+                    Some(wd) => format!("{}/files/{on_disk}", wd.trim_end_matches('/')),
+                    None => format!("<work_dir>/files/{on_disk}"),
+                };
+                let dimensions = match (width, height) {
+                    (Some(w), Some(h)) => format!(", {w}x{h}"),
+                    _ => String::new(),
+                };
+                image_hint_line(
+                    filename,
+                    document_id,
+                    &dimensions,
+                    &path,
+                    format,
+                    images.and_then(|i| i.verdict(document_id)),
+                )
+            },
+            // A folder reference used to produce no line at all, so adding a
+            // directory to the conversation was invisible to the Agent that
+            // was asked about it. It cannot be read as a file, but the path is
+            // actionable with the tools the Agent already has.
+            acowork_core::protocol::AttachedItem::AttachedFolder {
+                abs_path, name, ..
+            } => format!(
+                "- folder: `{}`{} — list it before answering",
+                abs_path,
+                if name.is_empty() || name == abs_path {
+                    String::new()
+                } else {
+                    format!(" ({name})")
+                }
+            ),
+        })
+        .collect();
+
+    if !hint_lines.is_empty() {
+        let sep = if enriched.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n\n", enriched)
+        };
+        // The header must not contradict the per-item lines it introduces: it
+        // told the model to open every attachment, while an inlined image's own
+        // line says its pixels are already here. One carve-out keeps the two
+        // readable in the same breath.
+        enriched = format!(
+            "{}[Attached workspace files & uploads — the user pointed at these \
+             to make the request. Open them (`file_read` / `doc_reader`, list a \
+             folder with `bash`) before answering, except an item whose line \
+             below says it is already part of this message; do not describe \
+             contents you have not read.]\n{}",
+            sep,
+            hint_lines.join("\n")
+        );
+    }
+    enriched
+}
+
+/// One hint line for an uploaded image, phrased from the image derivation's
+/// [`crate::agent::attachment_to_image::ImageDelivery`] verdict.
+///
+/// The two ways this used to be wrong are the reason the verdict is a
+/// parameter:
+/// - `Delivered` was announced as "pixels were attached … reopen with
+///   `image_read`". The pixels are already in the request, so the only thing
+///   that instruction could produce was a redundant tool round-trip.
+/// - `Skipped` was announced the same way. The model then described a picture
+///   whose pixels it had never received.
+///
+/// Every arm states a fact about *this* message and never a standing order:
+/// the line is written into the user turn and therefore replayed for the rest
+/// of the session, where it outlives the message it describes. "Do not call
+/// `image_read`" would then still be sitting in the history after an image
+/// part had been reclaimed (a mid-session switch to a text-only model strips
+/// them in `context.rs` §7.6), forbidding the one tool that could still get
+/// the picture back. `Delivered` says the pixels travel with this message,
+/// which the model can check against what it actually received.
+///
+/// `None` means the derivation did not run for this item (a path that got
+/// here without inlining); it degrades to the pre-inline wording, which is
+/// still actionable through `image_read`.
+fn image_hint_line(
+    filename: &str,
+    document_id: &str,
+    dimensions: &str,
+    path: &str,
+    format: &str,
+    delivery: Option<&crate::agent::attachment_to_image::ImageDelivery>,
+) -> String {
+    use crate::agent::attachment_to_image::{ImageDelivery, ImageSkip, MAX_INLINE_IMAGE_BYTES};
+
+    let head = format!("- image: `{filename}` (id={document_id}{dimensions})");
+    match delivery {
+        // Fact, not prohibition: the pixels are in the request the model is
+        // reading right now, so a `image_read` of the same file would only
+        // hand it the same picture a second time.
+        Some(ImageDelivery::Delivered) => format!(
+            "{head} — its pixels are already part of this message, so \
+             `image_read` on it would only send the same picture again"
+        ),
+        Some(ImageDelivery::Skipped(ImageSkip::NoVisionCapability)) => format!(
+            "{head} — this model takes no image input, so its pixels are NOT \
+             in this message; it is on disk at `{path}` and only a vision \
+             model can be shown it"
+        ),
+        Some(ImageDelivery::Skipped(ImageSkip::TooLarge)) => format!(
+            "{head} — over the {} MiB inline limit, so its pixels are NOT in \
+             this message; open it with `image_read` on `{path}`",
+            MAX_INLINE_IMAGE_BYTES / (1024 * 1024)
+        ),
+        Some(ImageDelivery::Skipped(ImageSkip::FormatNotReadable)) => format!(
+            "{head} — `{format}` is not a format the model's image input can \
+             carry, so its pixels are NOT in this message; convert it to png, \
+             then open it with `image_read` on `{path}`"
+        ),
+        Some(ImageDelivery::Skipped(ImageSkip::NoBlobStore)) => format!(
+            "{head} — the attachment store was unavailable, so its pixels are \
+             NOT in this message; open it with `image_read` on `{path}`"
+        ),
+        None => format!(
+            "{head} — its pixels were not inlined with this message; open it \
+             with `image_read` on `{path}`"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // ADR-046: replaced the old `UploadedDocumentEntry` tests with
+    // direct `AttachedItem` wire-format verification. The runtime no
+    // longer uses a separate `UploadedDocumentEntry` struct.
+
+    /// Round-trips the wire schema for a file upload — the frontend sends
+    /// camelCase, the runtime reads the `AttachedItem` discriminated union.
+    #[test]
+    fn test_attached_item_file_upload_roundtrip() {
+        let item = acowork_core::protocol::AttachedItem::FileUpload {
+            document_id: "0123456789ab-3".to_string(),
+            filename: "report.pdf".to_string(),
+            format: "pdf".to_string(),
+            size_bytes: 12345,
+            client_id: None,
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(json.contains("\"documentId\":"));
+        assert!(json.contains("\"type\":\"file_upload\""));
+        assert!(!json.contains("\"width\":"));
+
+        let parsed: acowork_core::protocol::AttachedItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, item);
+    }
+
+    /// Image upload round-trips optional width/height when present.
+    #[test]
+    fn test_attached_item_image_upload_with_dimensions() {
+        let item = acowork_core::protocol::AttachedItem::ImageUpload {
+            document_id: "doc".to_string(),
+            filename: "screen.png".to_string(),
+            format: "png".to_string(),
+            size_bytes: 987654,
+            width: Some(1920),
+            height: Some(1080),
+            client_id: None,
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(json.contains("\"type\":\"image_upload\""));
+        assert!(json.contains("\"width\":1920"));
+        assert!(json.contains("\"height\":1080"));
+
+        let parsed: acowork_core::protocol::AttachedItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, item);
+    }
+
+    /// CLI-style clients may omit width/height; the field is genuinely
+    /// optional and serializes as absent (not null).
+    #[test]
+    fn test_attached_item_image_upload_omits_dimensions() {
+        let item = acowork_core::protocol::AttachedItem::ImageUpload {
+            document_id: "doc".to_string(),
+            filename: "x.png".to_string(),
+            format: "png".to_string(),
+            size_bytes: 1,
+            width: None,
+            height: None,
+            client_id: None,
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(!json.contains("width"));
+        assert!(!json.contains("height"));
+    }
+
+    /// ADR-100: a routed Chat turn merges its two attachment arms, and either
+    /// one alone must survive the merge — on the Chat surface a workspace
+    /// reference arrives with no uploaded blob beside it (a Chat-surface turn
+    /// carries no chat upload ids, so `chat_attachment_ids` is empty).
+    #[test]
+    fn test_merge_intent_attachments_keeps_either_arm() {
+        use super::merge_intent_attachments;
+        use acowork_core::protocol::AttachedItem;
+        let reference = || AttachedItem::AttachedFile {
+            abs_path: "E:/work/demo/src/main.rs".to_string(),
+            name: "src/main.rs".to_string(),
+            client_id: None,
+        };
+        let upload = AttachedItem::FileUpload {
+            document_id: "doc-1".to_string(),
+            filename: "notes.md".to_string(),
+            format: "md".to_string(),
+            size_bytes: 3,
+            client_id: None,
+        };
+
+        assert!(merge_intent_attachments(None, Vec::new()).is_none());
+        assert_eq!(
+            merge_intent_attachments(None, vec![reference()])
+                .unwrap()
+                .len(),
+            1,
+            "a reference-only routed turn is still an attached turn"
+        );
+        let both = merge_intent_attachments(Some(vec![upload.clone()]), vec![reference()]).unwrap();
+        assert_eq!(both.len(), 2);
+        assert_eq!(
+            both[0], upload,
+            "the pulled upload keeps its slot ahead of the reference"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // ADR-046 §2.4 — `build_attachment_hint` regression suite
+    //
+    // Pre-revision: `session_task.rs` ChatMessage handler built the
+    // hint inline with a `.filter_map(...)` that returned `None` for
+    // every `AttachedItem::FileUpload`. Result: docx/pptx/xlsx/pdf
+    // uploads landed in `<work_dir>/files/<id>.bin` (broken whitelist)
+    // AND were invisible to the LLM (no hint ⇒ doc_reader never
+    // invoked). These tests pin both halves of the fix.
+    // -----------------------------------------------------------------
+
+    use super::build_attachment_hint;
+
+    // ADR-046 §2.4 — image delivery: the hint states the *outcome* of the image
+    // derivation, not the attachment list.
+    //
+    // Regression this suite locks down: a pasted image reached the model as a
+    // `ContentPart::ImageUrl`, the hint still said "pixels were attached …
+    // reopen with `image_read`", and every paste bought a redundant tool
+    // round-trip. The mirror-image bug was worse: an image the derivation had
+    // dropped (>8 MiB, unsupported format, no attachment service) was announced
+    // as attached, so the model described a picture it never received.
+
+    use crate::agent::attachment_to_image::{ImageDelivery, ImageParts, ImageSkip};
+
+    fn image_upload_item() -> acowork_core::protocol::AttachedItem {
+        acowork_core::protocol::AttachedItem::ImageUpload {
+            document_id: "0123456789ab-3".to_string(),
+            filename: "shot.png".to_string(),
+            format: "png".to_string(),
+            size_bytes: 123,
+            width: Some(1280),
+            height: Some(800),
+            client_id: None,
+        }
+    }
+
+    /// The verdict map a real derivation would have returned for one item.
+    fn image_parts_with(document_id: &str, verdict: ImageDelivery) -> ImageParts {
+        ImageParts::for_test(document_id, verdict)
+    }
+
+    /// A delivered image's line states a fact (its pixels travel with this
+    /// message) instead of a standing order.
+    ///
+    /// The line lands in the user turn and is replayed for the rest of the
+    /// session, so "do not call `image_read`" would outlive the image part it
+    /// was written about — after a switch to a text-only model, `context.rs`
+    /// §7.6 strips those parts and `image_read` is the only way back.
+    #[test]
+    fn test_build_attachment_hint_delivered_image_states_the_fact_not_an_order() {
+        let items = vec![image_upload_item()];
+        let images = image_parts_with("0123456789ab-3", ImageDelivery::Delivered);
+        let s = build_attachment_hint("look", Some(&items), Some("E:/ws"), Some(&images));
+        assert!(
+            s.contains(
+                "- image: `shot.png` (id=0123456789ab-3, 1280x800) — its pixels \
+                 are already part of this message, so `image_read` on it would \
+                 only send the same picture again"
+            ),
+            "{s}"
+        );
+        // The prohibition form is what this test exists to keep out.
+        assert!(!s.contains("do not call"), "{s}");
+        assert!(!s.contains("reopen with"), "{s}");
+        // The header introduces the per-item lines; it must not order the model
+        // to open the one item whose line says it is already here.
+        assert!(
+            s.contains("except an item whose line below says it is already part"),
+            "{s}"
+        );
+    }
+
+    /// A dropped image must be announced as dropped, with the reason and the
+    /// path that makes `image_read` actionable.
+    #[test]
+    fn test_build_attachment_hint_dropped_image_is_not_announced_as_attached() {
+        let cases = [
+            (ImageSkip::TooLarge, "over the 8 MiB inline limit"),
+            (
+                ImageSkip::FormatNotReadable,
+                "not a format the model's image input can carry",
+            ),
+            (ImageSkip::NoBlobStore, "attachment store was unavailable"),
+        ];
+        for (skip, reason) in cases {
+            let items = vec![image_upload_item()];
+            let images = image_parts_with("0123456789ab-3", ImageDelivery::Skipped(skip));
+            let s = build_attachment_hint("look", Some(&items), Some("E:/ws"), Some(&images));
+            assert!(
+                s.contains("pixels are NOT in this message"),
+                "{skip:?}: {s}"
+            );
+            assert!(s.contains(reason), "{skip:?}: {s}");
+            assert!(
+                s.contains("`image_read` on `E:/ws/files/shot_0123456789ab-3.png`"),
+                "{skip:?}: {s}"
+            );
+            // The header itself contains "already part of this message",
+            // so the check has to be the per-item claim.
+            assert!(!s.contains("its pixels are already part"), "{skip:?}: {s}");
+        }
+    }
+
+    /// No vision: the pixels never reach the model even though the file is
+    /// readable, so the line must not send it after `image_read` — that tool
+    /// answers with the same "switch to a vision model" refusal, and the human
+    /// is the one who can act.
+    #[test]
+    fn test_build_attachment_hint_no_vision_names_the_real_blocker() {
+        let items = vec![image_upload_item()];
+        let images = image_parts_with(
+            "0123456789ab-3",
+            ImageDelivery::Skipped(ImageSkip::NoVisionCapability),
+        );
+        let s = build_attachment_hint("look", Some(&items), Some("E:/ws"), Some(&images));
+        assert!(s.contains("pixels are NOT in this message"), "{s}");
+        assert!(s.contains("this model takes no image input"), "{s}");
+        assert!(s.contains("only a vision model can be shown it"), "{s}");
+        assert!(!s.contains("image_read"), "{s}");
+        assert!(!s.contains("its pixels are already part"), "{s}");
+    }
+
+    /// No verdict (the derivation never saw this item) degrades to the
+    /// pre-inline wording instead of guessing either way.
+    #[test]
+    fn test_build_attachment_hint_image_upload_without_verdict_points_at_the_file() {
+        let items = vec![image_upload_item()];
+        let s = build_attachment_hint("look", Some(&items), Some("E:/ws"), None);
+        assert!(
+            s.contains(
+                "its pixels were not inlined with this message; open it with \
+                 `image_read` on `E:/ws/files/shot_0123456789ab-3.png`"
+            ),
+            "{s}"
+        );
+    }
+
+    /// No attachments → user content returned verbatim (no hint block).
+    #[test]
+    fn test_build_attachment_hint_no_items_returns_verbatim() {
+        let s = build_attachment_hint("hello", None, Some("/work"), None);
+        assert_eq!(s, "hello");
+    }
+
+    /// Empty vec → same as None (frontend always sends an empty array
+    /// rather than omitting the field for a turn with no attachments).
+    #[test]
+    fn test_build_attachment_hint_empty_vec_returns_verbatim() {
+        let s = build_attachment_hint("hello", Some(&[]), Some("/work"), None);
+        assert_eq!(s, "hello");
+    }
+
+    /// Workspace `AttachedFile` keeps the pre-046 hint shape exactly
+    /// — no `(id=, format=, path=)` clutter, just the absolute path.
+    /// This protects the chip-renderer / read_file call sites that
+    /// were already wired up before this revision.
+    #[test]
+    fn test_build_attachment_hint_workspace_file_shape_unchanged() {
+        let items = vec![acowork_core::protocol::AttachedItem::AttachedFile {
+            abs_path: "/work/src/main.rs".to_string(),
+            name: "main.rs".to_string(),
+            client_id: None,
+        }];
+        let s = build_attachment_hint("review this", Some(&items), Some("/work"), None);
+        assert!(s.contains("- file: `/work/src/main.rs`"));
+        assert!(s.contains("[Attached workspace files & uploads"));
+        // The original user text is preserved verbatim — no [Attached
+        // context:] prefix is allowed per ADR-046 §2.1.
+        assert!(s.starts_with("review this\n\n"));
+    }
+
+    /// `AttachedSelection` with same start/end line → single line
+    /// marker `(L10)`. Different lines → range `(L10-L25)`.
+    #[test]
+    fn test_build_attachment_hint_selection_range() {
+        let items = vec![acowork_core::protocol::AttachedItem::AttachedSelection {
+            abs_path: "/work/lib.rs".to_string(),
+            name: "lib.rs".to_string(),
+            start_line: 10,
+            end_line: 25,
+            client_id: None,
+        }];
+        let s = build_attachment_hint("x", Some(&items), Some("/work"), None);
+        assert!(s.contains("- file: `/work/lib.rs` (L10-L25)"), "got: {s}");
+
+        let items = vec![acowork_core::protocol::AttachedItem::AttachedSelection {
+            abs_path: "/work/lib.rs".to_string(),
+            name: "lib.rs".to_string(),
+            start_line: 7,
+            end_line: 7,
+            client_id: None,
+        }];
+        let s = build_attachment_hint("x", Some(&items), Some("/work"), None);
+        assert!(s.contains("- file: `/work/lib.rs` (L7)"), "got: {s}");
+    }
+
+    #[test]
+    fn test_build_attachment_hint_image_file_has_image_read_action_and_fixed_file_read_name() {
+        let items = vec![acowork_core::protocol::AttachedItem::AttachedFile {
+            abs_path: "E:/ws/shot.png".to_string(),
+            name: "shot.png".to_string(),
+            client_id: None,
+        }];
+        let s = build_attachment_hint("inspect", Some(&items), Some("E:/ws"), None);
+        assert!(
+            s.contains("- file: `E:/ws/shot.png` (image — open with `image_read`)"),
+            "{s}"
+        );
+        assert!(s.contains("`file_read` / `doc_reader`"), "{s}");
+        assert!(!s.contains("`read_file`"), "{s}");
+    }
+
+    #[test]
+    fn test_build_attachment_hint_image_upload_emits_image_read_path() {
+        let items = vec![image_upload_item()];
+        let s = build_attachment_hint("look", Some(&items), Some("E:/ws"), None);
+        assert!(s.contains("- image: `shot.png` (id=0123456789ab-3, 1280x800)"), "{s}");
+        assert!(s.contains("E:/ws/files/shot_0123456789ab-3.png"), "{s}");
+    }
+
+    /// REGRESSION: `FileUpload` MUST show up in the hint block with
+    /// `(id, format, path)` triple — pre-revision the filter_map
+    /// returned `None` for this variant, leaving docx/pptx/xlsx/pdf
+    /// uploads invisible to the LLM (no doc_reader call possible).
+    #[test]
+    fn test_build_attachment_hint_file_upload_emits_path_metadata() {
+        let items = vec![acowork_core::protocol::AttachedItem::FileUpload {
+            document_id: "0123456789ab-3".to_string(),
+            filename: "report.pdf".to_string(),
+            format: "pdf".to_string(),
+            size_bytes: 12345,
+            client_id: None,
+        }];
+        let s = build_attachment_hint("summarise this contract", Some(&items), Some("/work"), None);
+        assert!(s.starts_with("summarise this contract\n\n"));
+        assert!(
+            s.contains("- file: `report.pdf` (id=0123456789ab-3, format=pdf, path=/work/files/report_0123456789ab-3.pdf)"),
+            "got: {s}"
+        );
+        // The on-disk suffix must come from the format, NOT the old
+        // hardcoded `.bin` (the safe_extension whitelist regression).
+        assert!(
+            s.contains(".pdf)"),
+            "docx should land with real extension, got: {s}"
+        );
+        assert!(
+            !s.contains(".bin"),
+            "must not regress to .bin fallback, got: {s}"
+        );
+    }
+
+    /// Office docs all emit their real extension in the hint path —
+    /// this is what `doc_reader` keys on. Without real extensions
+    /// the LLM would invoke doc_reader and get an "Unsupported
+    /// document format" error back.
+    #[test]
+    fn test_build_attachment_hint_office_docs_emit_real_extensions() {
+        for (fmt, ext) in [
+            ("pdf", "pdf"),
+            ("docx", "docx"),
+            ("pptx", "pptx"),
+            ("xlsx", "xlsx"),
+        ] {
+            let items = vec![acowork_core::protocol::AttachedItem::FileUpload {
+                document_id: "0123456789ab-3".to_string(),
+                filename: format!("report.{fmt}"),
+                format: fmt.to_string(),
+                size_bytes: 100,
+                client_id: None,
+            }];
+            let s = build_attachment_hint("x", Some(&items), Some("/work"), None);
+            assert!(
+                s.contains(&format!("path=/work/files/report_0123456789ab-3.{ext}")),
+                "format={fmt} must yield .{ext} suffix in hint, got: {s}"
+            );
+        }
+    }
+
+    /// Without `work_dir` the path segment becomes the literal
+    /// `<work_dir>/files/<id>.<ext>` so the LLM at least knows the
+    /// shape — better than a fabricated absolute path that points
+    /// nowhere. (CLI / detached sessions may legitimately have no
+    /// `current_work_dir` set.)
+    #[test]
+    fn test_build_attachment_hint_falls_back_to_placeholder_path() {
+        let items = vec![acowork_core::protocol::AttachedItem::FileUpload {
+            document_id: "abc123-0".to_string(),
+            filename: "report.docx".to_string(),
+            format: "docx".to_string(),
+            size_bytes: 1,
+            client_id: None,
+        }];
+        let s = build_attachment_hint("x", Some(&items), None, None);
+        assert!(
+            s.contains("path=<work_dir>/files/report_abc123-0.docx"),
+            "without work_dir hint must use placeholder, got: {s}"
+        );
+    }
+
+    /// Mixed attachments preserve order and the prompt hint contains
+    /// every hintable variant — workspace file first, file_upload
+    /// second — image_upload also carries its reopenable on-disk path.
+    #[test]
+    fn test_build_attachment_hint_mixed_items_in_order() {
+        let items = vec![
+            acowork_core::protocol::AttachedItem::AttachedFile {
+                abs_path: "/work/src/lib.rs".to_string(),
+                name: "lib.rs".to_string(),
+                client_id: None,
+            },
+            acowork_core::protocol::AttachedItem::FileUpload {
+                document_id: "0123456789ab-3".to_string(),
+                filename: "report.docx".to_string(),
+                format: "docx".to_string(),
+                size_bytes: 1,
+                client_id: None,
+            },
+            acowork_core::protocol::AttachedItem::ImageUpload {
+                document_id: "img1".to_string(),
+                filename: "screen.png".to_string(),
+                format: "png".to_string(),
+                size_bytes: 1,
+                width: Some(800),
+                height: Some(600),
+                client_id: None,
+            },
+        ];
+        let s = build_attachment_hint("look at these", Some(&items), Some("/work"), None);
+        let ws_idx = s.find("/work/src/lib.rs").expect("workspace hint present");
+        let doc_idx = s.find("report.docx").expect("file upload hint present");
+        assert!(
+            ws_idx < doc_idx,
+            "workspace hint must come before upload hint, got: {s}"
+        );
+        assert!(
+            s.contains("screen.png"),
+            "image_upload path hint must be present"
+        );
+        assert!(
+            s.contains("/work/files/screen_img1.png"),
+            "canonical image path must appear: {s}"
+        );
+    }
+
+    /// A folder reference is named in the hint. It used to be silent on the
+    /// reasoning that no single tool enumerates a directory — but the Agent has
+    /// `bash`, and silence was indistinguishable from "the attachment never
+    /// arrived", which is the complaint this closes.
+    #[test]
+    fn test_build_attachment_hint_folder_is_named_and_actionable() {
+        let items = vec![acowork_core::protocol::AttachedItem::AttachedFolder {
+            abs_path: "/work/src".to_string(),
+            name: "src".to_string(),
+            client_id: None,
+        }];
+        let s = build_attachment_hint("x", Some(&items), Some("/work"), None);
+        assert!(s.contains("- folder: `/work/src` (src)"), "got: {s}");
+        assert!(s.contains("list it before answering"), "got: {s}");
+    }
+
+    /// A file reference carries the display name the user saw, not only the
+    /// node path — which project the file matters in is part of the ask.
+    #[test]
+    fn test_build_attachment_hint_file_names_the_reference() {
+        let items = vec![acowork_core::protocol::AttachedItem::AttachedFile {
+            abs_path: "E:/p/core/src/chat_prompt.rs".to_string(),
+            name: "core/src/chat_prompt.rs".to_string(),
+            client_id: None,
+        }];
+        let s = build_attachment_hint("你先看看这个", Some(&items), None, None);
+        assert!(
+            s.contains("- file: `E:/p/core/src/chat_prompt.rs` (core/src/chat_prompt.rs)"),
+            "got: {s}"
+        );
+        // A reference whose name repeats the path adds no parenthetical.
+        let bare = vec![acowork_core::protocol::AttachedItem::AttachedFile {
+            abs_path: "/work/a.rs".to_string(),
+            name: "/work/a.rs".to_string(),
+            client_id: None,
+        }];
+        let s = build_attachment_hint("x", Some(&bare), None, None);
+        assert!(s.contains("- file: `/work/a.rs`"), "got: {s}");
+        assert!(!s.contains("(/work/a.rs)"), "got: {s}");
+    }
+
+    // ── Design 27 §4.2.1 chat-attachment forwarding ──────────────────
+    use super::{PulledAttachment, forwarded_format, materialize_pulled_attachments};
+
+    #[test]
+    fn forwarded_format_prefers_filename_extension() {
+        assert_eq!(forwarded_format("report.PDF", "application/pdf"), "pdf");
+        assert_eq!(forwarded_format("shot.png", "image/png"), "png");
+    }
+
+    #[test]
+    fn forwarded_format_falls_back_to_mime_subtype() {
+        // A name with no extension derives `format` from the MIME subtype.
+        assert_eq!(forwarded_format("noext", "image/jpeg"), "jpeg");
+    }
+
+    #[test]
+    fn forwarded_format_defaults_to_bin_when_nothing_usable() {
+        assert_eq!(forwarded_format("", ""), "bin");
+    }
+
+    #[tokio::test]
+    async fn materialize_without_service_yields_nothing() {
+        // The Phase-B slot not ready degrades gracefully: the attachments
+        // are invisible this turn (a warning, not an error), the turn runs.
+        let pulled = vec![PulledAttachment {
+            filename: "pic.png".into(),
+            mime: "image/png".into(),
+            bytes: vec![1, 2, 3],
+        }];
+        let out = materialize_pulled_attachments(None, "s1", pulled).await;
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn materialize_uploads_pulled_bytes_into_attached_items() {
+        use crate::usecases::{AttachmentService, RuntimeAttachmentService};
+        let dir = tempfile::tempdir().unwrap();
+        let svc = RuntimeAttachmentService::new(dir.path().to_path_buf());
+        let arc: std::sync::Arc<dyn AttachmentService> = std::sync::Arc::new(svc);
+        let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 1, 2, 3];
+        let pulled = vec![
+            PulledAttachment {
+                filename: "pic.png".into(),
+                mime: "image/png".into(),
+                bytes: png,
+            },
+            PulledAttachment {
+                filename: "note.txt".into(),
+                mime: "text/plain".into(),
+                bytes: b"hi".to_vec(),
+            },
+        ];
+        let out = materialize_pulled_attachments(Some(&arc), "s1", pulled).await;
+        assert_eq!(out.len(), 2);
+        // image mime → ImageUpload, everything else → FileUpload.
+        assert!(matches!(
+            &out[0],
+            acowork_core::protocol::AttachedItem::ImageUpload { filename, .. } if filename == "pic.png"
+        ));
+        assert!(matches!(
+            &out[1],
+            acowork_core::protocol::AttachedItem::FileUpload { filename, .. } if filename == "note.txt"
+        ));
+        // The blobs landed in the agent-home `files/` dir.
+        let files_dir = dir.path().join("files");
+        assert!(std::fs::read_dir(&files_dir).unwrap().count() >= 2);
+    }
+}

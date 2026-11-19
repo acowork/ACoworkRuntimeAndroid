@@ -24,16 +24,20 @@
 > descriptions, the §4.6.1 audit outlet, the measured evidence surface and the §4.6.4 rollback ledger). 636 tests pass, the contract layer also builds for a bare-metal RISC-V
 > target, and the chain has been run against a physical device — a Huawei BLA-AL00 over adb:
 > 20 read-only probes → `HostProfile` → real commands, exit 0 in ~120 ms, including `logcat`,
-> which only works because the probe spot-checks for it. **No node binary exists yet** (the
-> runnable thing today is that device harness), and nothing here is ready for production use.
+> which only works because the probe spot-checks for it. **The host CLI `acowork-android` ships**
+> (`probe` / `exec` / `settings` / `evidence` / `serve` / `runtime`). B3/B6 are closed
+> ([ADR-AND-003](docs/adr/zh/ADR-AND-003-independent-engine-and-spawn-contract.md)): independent
+> node+runtime with MQTT enroll, reverse proxy `:19900`, and Gateway control
+> `ping`/`start`/`stop`. Still early — not production-hardened.
 >
 > ⚠️ **Partially synced with [README.zh.md](README.zh.md).** The repository layout, roadmap, and build
 > sections below were brought in line on 2026-10-29. The Chinese version remains authoritative for the
 > prose sections (the two deliverables, host profiles) and for the APK deliverable's unresolved
-> form-factor overlap with upstream `apps/acowork-mobile`. **All `docs/` are Chinese-only** — start with
-> the [readiness assessment](docs/review/zh/2026-10-28-readiness-assessment.md) for what conflicts with
-> upstream, and [ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md) for the multi-platform
-> contract layer. Everything below marked 🚧 or *planned* is a design intent, not shipped code.
+> B4 closed ([ADR-AND-004](docs/adr/zh/ADR-AND-004-independent-apk-deliverable.md)): this repo's APK is a
+> **host**; main-repo mobile is a **client**. **All `docs/` are Chinese-only** — start with the
+> [readiness assessment](docs/review/zh/2026-10-28-readiness-assessment.md) and
+> [ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md). Everything below marked 🚧 or
+> *planned* is a design intent, not shipped code.
 
 ---
 
@@ -62,8 +66,9 @@ The Android port ships as two binaries from the same core, sharing one library c
 The command-line version, run inside Termux or any Android terminal environment.
 
 ```bash
-# placeholder — the subcommand surface is not finalized yet
-acowork-android serve --gateway-http http://<gateway-host>:19876
+acowork-android probe
+acowork-android serve --gateway-http http://<gateway-host>:19876 --agent demo
+# default engine = this binary re-entered as `runtime` (override with --engine PATH)
 ```
 
 - Same CLI ergonomics as the desktop `acowork-node`: enroll with a Gateway, start / stop agents, browse files, install packages.
@@ -74,15 +79,19 @@ acowork-android serve --gateway-http http://<gateway-host>:19876
 
 ### 2. APK build — `acowork-android-app`
 
-The same capabilities packaged as an Android application.
+The same **host** capabilities packaged as an Android application (Node + Runtime on-device). This is
+**not** the main-repo `acowork-mobile` client (that App is peer to desktop UI and carries no Runtime).
 
 - A foreground service that keeps the Node Agent alive under Android's background execution limits.
 - MQTT enrollment and reconnect handling driven by Android's connectivity / battery callbacks.
 - Workspace and package storage mapped to scoped app-private directories, with optional user-granted access to shared storage.
 - Intended for everyday use: an always-on agent host that a Gateway can reach over the network.
 
-Both builds share the same agent engine — the difference is **lifecycle management** (Termux process vs.
-foreground service) and **storage / permission strategy**, not the runtime semantics.
+> ✅ **B4 closed** ([ADR-AND-004](docs/adr/zh/ADR-AND-004-independent-apk-deliverable.md)). Host APK
+> scaffold lives under [`apps/android`](apps/android) (foreground service + JNI; see roadmap #4).
+
+Both builds in **this** repo share the same agent engine — the difference is **lifecycle management**
+(Termux process vs. foreground service) and **storage / permission strategy**, not the runtime semantics.
 
 ## Host profiles
 
@@ -141,23 +150,26 @@ traits, so that once the port is stable, the differences can be reconciled with 
 
 ## Repository layout
 
-The two crates under `crates/` **exist and build**; `crates/acowork-android-cli` and `apps/android` are
-still 🚧 *planned*.
+The libraries, host CLI, and APK shell under `crates/` + `apps/android` **exist and build**. C1
+Termux CLI path enrolls a real Gateway over MQTT; the APK host enrolls via JNI (start/stop/install
+agents still share the CLI path in this slice).
 
 ```mermaid
 graph TD
     subgraph Repo["ACoworkRuntimeAndroid"]
         Contract["crates/acowork-platform-contract<br/>✅ platform-neutral rules: serde-only, builds bare-metal"]
-        Lib["crates/acowork-android<br/>✅ Android facts & mechanisms: probe, capability values, su wrapper, avc feedback"]
-        Cli["crates/acowork-android-cli<br/>🚧 CLI binary: acowork-android"]
-        App["apps/android<br/>🚧 APK: foreground service + UI"]
+        Lib["crates/acowork-android<br/>✅ host + node: probe, EngineSpec, process table, enroll shape"]
+        Cli["crates/acowork-android-cli<br/>✅ acowork-android: host CLI + serve/runtime"]
+        App["apps/android<br/>✅ APK: foreground service + JNI"]
+        Ffi["crates/acowork-android-ffi<br/>✅ JNI cdylib"]
     end
     Node["Node Agent tier<br/>enroll / process table / package store"]
     Rt["Runtime tier<br/>LLM loop / memory / tools"]
     Gw["acowork-gateway<br/>remote control plane"]
 
     Cli --> Lib
-    App --> Lib
+    App --> Ffi
+    Ffi --> Lib
     Lib --> Contract
     Lib --> Node
     Lib --> Rt
@@ -168,10 +180,11 @@ graph TD
 | Path | Contents |
 |------|----------|
 | `crates/acowork-platform-contract/` | **The platform-neutral rules**: the four capability axes, the evidence discipline behind a claim, the execution envelope, the authorization gate, the feedback primitives. Depends on `serde` alone and builds under `no_std + alloc`. Any platform joining the cluster — Android, ESP32, whatever comes next — must satisfy R1–R13 as stated here. See [ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md) (Chinese). |
-| `crates/acowork-android/` | **Android's facts and mechanisms**: which commands to probe, how to parse them, the four-axis values for the five `android:*` capabilities, the `su -c` wrapper, `avc: denied` feedback. The test is: swap the platform and the contract crate does not change by one line, while this crate is rewritten entirely. |
-| `crates/` (planned) | The remaining Rust crates shared by both builds — the Android-aware runtime + node engine. |
-| `apps/` (planned) | The APK application (Gradle project, Kotlin/Java shell, foreground service). |
-| `docs/` | Design notes, platform notes, and the porting rationale — see [ADR-AND-001](docs/adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md) (host profiles & privilege model), [ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md) (the platform contract layer), [android-host-probe.md](docs/design/zh/android-host-probe.md) (startup capability probing), [android-runtime-settings.md](docs/design/zh/android-runtime-settings.md) (what an operator may set, and what only the device may answer), and the [readiness assessment](docs/review/zh/2026-10-28-readiness-assessment.md) (conflicts with upstream). All Chinese. |
+| `crates/acowork-android/` | **Android facts + independent node half**: host probe/`ExecutionBackend`, plus `node::{EngineSpec, ProcessTable, EnrollRequest, capability_tags}` ([ADR-AND-003](docs/adr/zh/ADR-AND-003-independent-engine-and-spawn-contract.md)). No dependency on upstream `acowork-node` / `acowork-runtime`. |
+| `crates/acowork-android-cli/` | **One binary, two roles**: `probe` / `exec` / `settings` / `evidence` / `restore`; **Node** = `serve`, **Runtime** = `runtime` (or `--engine PATH`). Root-shell is a probed mode of the same binary. |
+| `crates/acowork-android-ffi/` | **JNI `cdylib`**: `libacowork_android_ffi.so` for the host APK (enroll / ping / probe / settings). |
+| `apps/android/` | **Host APK** (`com.acowork.androidhost`): Gradle + Kotlin foreground service, scoped `filesDir/acowork`, connectivity re-start. See [`apps/android/README.md`](apps/android/README.md). |
+| `docs/` | Design notes, platform notes, and the porting rationale — see [ADR-AND-001](docs/adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md), [ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md), [ADR-AND-003](docs/adr/zh/ADR-AND-003-independent-engine-and-spawn-contract.md), [android-host-probe.md](docs/design/zh/android-host-probe.md), [android-runtime-settings.md](docs/design/zh/android-runtime-settings.md), and the [readiness assessment](docs/review/zh/2026-10-28-readiness-assessment.md). All Chinese. |
 
 ### Android is only the first port
 
@@ -196,15 +209,15 @@ itself — is the artifact a second port should copy.
 
 | # | Scope | Status |
 |---|-------|--------|
-| 1 | Repository skeleton, license, and this README | ✅ **Delivered** — workspace of two crates ([`acowork-platform-contract`](crates/acowork-platform-contract) + [`acowork-android`](crates/acowork-android)), Apache-2.0 [LICENSE](LICENSE) identical to upstream so code flows either way, toolchain mirrors upstream `core/Cargo.toml` (edition 2024, rust-version 1.95), bilingual README, and `docs/` carrying the ADRs, the probe design and the readiness assessment |
-| 2 | Shared crate: extract node + runtime engine behind platform traits | ⛔ **Blocked (B3)** — upstream design 30 §5 and §9 give two different answers on engine ownership. Note this blocks the *engine*; the *host rules* layer shipped independently as #5a and is unaffected by how B3 is ruled |
-| 3 | CLI build running under Termux, enrolling with a real Gateway | ⬜ Planned (depends on #2) |
-| 4 | APK build: foreground service, scoped storage, keep-alive | ⛔ **Blocked (B4)** — collides with upstream `apps/acowork-mobile` (Tauri v2 Android APK, design 25 / ADR-086): same form factor, opposite purpose, ownership unresolved |
+| 1 | Repository skeleton, license, and this README | ✅ **Delivered** — workspace ([`acowork-platform-contract`](crates/acowork-platform-contract) + [`acowork-android`](crates/acowork-android) + [`acowork-android-cli`](crates/acowork-android-cli)), Apache-2.0 [LICENSE](LICENSE) identical to upstream so code flows either way, toolchain mirrors upstream `core/Cargo.toml` (edition 2024, rust-version 1.95), bilingual README, and `docs/` carrying the ADRs, the probe design and the readiness assessment |
+| 2 | Independent Android node+runtime engine (protocol-only Gateway coupling) | ✅ **Delivered (B3/B6 closed)** — [ADR-AND-003](docs/adr/zh/ADR-AND-003-independent-engine-and-spawn-contract.md): `node::EngineSpec` + process table; default integrated `serve`→`runtime`; no upstream node/runtime binary dependency |
+| 3 | CLI build running under Termux, enrolling with a real Gateway | ✅ **Delivered (C1 + Runtime engine)** — MQTT enroll, proxy, install `.agent` / `package_url`; `runtime` runs **vendored full `acowork-runtime`** with `android-host` (shell → `ExecutionBackend`). Provenance: [docs/VENDOR.md](docs/VENDOR.md). |
+| 4 | APK build: foreground service, scoped storage, keep-alive | ✅ **Delivered (C2 slice)** — [`apps/android`](apps/android) + [`acowork-android-ffi`](crates/acowork-android-ffi): foreground service, `filesDir/acowork`, connectivity → MQTT re-start, JNI enroll/ping/probe/settings. Agent start/stop/install still via CLI in this slice; signed release is #7. |
 | 5 | `ExecutionBackend` trait + startup HostProfile probe | ✅ **Delivered** (P0) — `crates/acowork-android/src/host/` |
 | 5a | **Platform-neutral contract layer** `acowork-platform-contract`: rules R1–R13 plus a per-rule conformance suite (the template for ESP32-class ports) | ✅ **Delivered** — builds for a bare-metal target; see [ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md) |
 | 5b | Execution stack: script assembly, the `SpawnRunner` seam, `ShellBackend` / `RootShellBackend` / `AppSandboxBackend`, and an adb transport | ✅ **Delivered and verified on hardware** — `cargo run --example device_probe` drives a real device end to end; reconciling its answers against the fixtures corrected five things the fixtures had invented (see [the ground-truth suite](crates/acowork-android/tests/device_ground_truth.rs)) |
 | 6 | Battery / doze tuning and long-run stability testing | ⬜ Planned |
-| 7 | Release artifacts (Termux package + signed APK) | ⬜ Planned (depends on #2/#4; the NDK pipeline can reuse upstream `apps/acowork-mobile`) |
+| 7 | Release artifacts (Termux package + signed APK) | ⬜ Planned (depends on #4 APK project) |
 | 5c | The **three outlets** of the §7.1 reporting boundary: capability summary / backend error text / a command's own stdout·stderr | ✅ **Delivered** — the third was found by measuring, not by thinking: 181 avc audit records from a single `logcat -d` were crossing the port verbatim, and the guard test asserted on the JSON of a `Vec<u8>`, which serde writes as an array of numbers, so **any content passed**. Audit records are now rewritten at the projection into permissions + object class + target type; user, role, MLS range and path stay on the device. Non-record lines such as a `ps -Z` row survive byte-for-byte |
 | 8 | `root-shell` profile, **read-only capabilities** (`logcat` / `dumpsys` / `getprop`) | 🚧 **Mostly delivered** — the read tier is now enforced on script content, not on the caller's label ([`host/commands.rs`](crates/acowork-android/src/host/commands.rs)), the commands it covers are probed rather than assumed (item 6c), and the tier means what it says: a read whose path the port cannot bound (`$F`, a relative name, a pattern centred on `/data`) and a read of another uid's files are both outside it. Verified end to end on a BLA-AL00. Remaining: `RootShellBackend` on a rooted device — it has never been run against a real `su` |
 | 9 | Android debugging toolset (screencap, ANR / tombstone / bugreport capture) + command audit log | 🚧 **Half delivered** — the audit log is ([`host/audit.rs`](crates/acowork-android/src/host/audit.rs)): `AuditedBackend` writes an `attempted` record before the device is touched and a terminal one after, and a sink that cannot take the opening record stops the command. The evidence surface is measured (probe items 13 / 13b): on a `user` build with no root, **none** of the six sources ADR §4.6 item 6 commits to can yield `/data/anr` contents, and `dumpsys` is 246 services each with its own answer. **The capture actions are now delivered** ([`host/evidence.rs`](crates/acowork-android/src/host/evidence.rs)): `screencap -p`, `logcat -d`, `dumpsys <service>` and `bugreportz` come back as files in the Agent workspace, verified against a digest the device computed before the transfer — a 1 377 361-byte PNG in 6 reads and a 4 101 144-byte bugreport zip in 16, both measured on BLA-AL00. What is still planned is the *correlation* half (feeding artifacts to an analysis step), and `/data/anr` + `/data/tombstones` stay unreadable because the device says so, not because the port has not got to it |
@@ -274,11 +287,11 @@ Toolchain mirrors upstream `core/Cargo.toml`: edition 2024, rust-version 1.95, A
 **Dependency discipline**: `acowork-platform-contract` depends on `serde` alone
 (`default-features = false` + `alloc`/`derive`) — not even `async-trait`, since async is spelled with
 `core::future::Future` plus a GAT associated future type, unboxed. `acowork-android`'s only non-serde
-dependency is the contract crate. Neither depends on `acowork-runtime` / `acowork-core`. This is a
-*structural* guarantee rather than a convention; verify with
-`cargo tree -p acowork-platform-contract --no-default-features -e features --edges no-dev` and confirm no
-`serde_core feature "std"` edge in the lib graph (`--edges no-dev` matters — the `serde_json`
-dev-dependency will otherwise mislead you).
+dependency is the contract crate. Neither depends on `acowork-runtime` / `acowork-core` /
+`acowork-node` — B3 closed that as an independent engine ([ADR-AND-003](docs/adr/zh/ADR-AND-003-independent-engine-and-spawn-contract.md)).
+Verify with `cargo tree -p acowork-android-cli` (no upstream node/runtime) and
+`cargo tree -p acowork-platform-contract --no-default-features -e features --edges no-dev`
+(no `serde_core feature "std"` in the lib graph).
 
 ### Is the number I set the number that is in force?
 
@@ -303,15 +316,22 @@ the output. Verified on a BLA-AL00: `printf ... > /data/local/tmp/f` ran, the st
 previous bytes, and `restore` put them back — the audit file then held the capture, the write and
 the undo as attempt/result pairs grouped by `(session_id, id)`.
 
-### Android side (not started)
+### Android APK host
 
-The cross-compilation, JNI, and `.so` packaging pipeline does not exist yet, so the exact NDK version and
-target triple are not pinned.
+NDK **26.1.10909125**, target **`aarch64-linux-android`** (arm64-v8a only in this slice).
 
-**Do not build it from scratch**: upstream `apps/acowork-mobile` already has a working Tauri v2 Android
-build (its `Cargo.toml` carries a `cfg(target_os = "android")` section and a `jni` dependency). Take its
-NDK version, target triple, and packaging steps as the baseline and adjust. This is the "existing facts
-left unused" item under B4 in the assessment.
+```powershell
+# From repo root — sets CC/CFLAGS/sysroot for zstd-sys etc.
+. .\scripts\android-ndk-env.ps1
+cargo build -p acowork-android-ffi --release --target aarch64-linux-android
+# Copy lands in apps/android/app/src/main/jniLibs/arm64-v8a/ (or: cd apps/android && ./gradlew cargoNdkArm64)
+
+cd apps/android
+./gradlew :app:assembleDebug
+```
+
+Details: [`apps/android/README.md`](apps/android/README.md). Main-repo mobile remains a separate
+**client** product ([ADR-AND-004](docs/adr/zh/ADR-AND-004-independent-apk-deliverable.md)).
 
 ## Contributing
 

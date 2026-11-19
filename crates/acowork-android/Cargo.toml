@@ -29,13 +29,27 @@ base64 = "0.22"
 # list is the minimum for that one type. A port that supplies its own `SpawnRunner` (over
 # adb, or a blocking thread) does not need this dependency at all.
 tokio.workspace = true
-# `std` because Android is a std platform and the models here are stored, logged and put on
-# the wire as owned `String`s. The workspace default is `no_std`; opting in is deliberate.
-serde = { workspace = true, features = ["std"] }
+serde = { workspace = true }
 # The audit trail (§4.6.1) is stored as JSONL, and `host::audit::FileAuditSink` is library code,
 # not test code, so this cannot stay a dev-dependency. Nothing else in the crate serialises to
 # JSON: the contract layer owns the wire format, and the wire never carries a device record.
-serde_json = { workspace = true, features = ["std"] }
+serde_json = { workspace = true }
+# Node control-plane wire codec (ADR-AND-003). Generated from
+# `proto/node_control.proto` — a local subset of upstream mqtt_payload.proto.
+prost.workspace = true
+bytes.workspace = true
+# MQTT broker client for Gateway enroll / NodeInfo / control (no upstream session crate).
+rumqttc.workspace = true
+# Stable node_id (UUID v4) for identity.json — ADR-075 routing key.
+uuid.workspace = true
+# .agent = ZIP archive + root manifest.toml (vendor of upstream install/loader).
+zip.workspace = true
+toml.workspace = true
+ureq.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
+protoc-bin-vendored.workspace = true
 
 # One call: `kill(-pgid, SIGKILL)`, to stop a timed-out command's whole process group
 # instead of only its shell (`std` has no `killpg`). Target-gated to unix, and already in

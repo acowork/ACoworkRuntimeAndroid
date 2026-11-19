@@ -21,10 +21,11 @@
 > `ExecutionBackend` 实现、§4.4 只读档护栏、§4.5 动态工具描述、§4.6.1 审计日志出口、§4.6 item 6 证据面实测、§4.6.4 写操作可撤销）已交付为可构建、可测试的 Rust 库，636 个测试通过，
 > 且整条链路已在真机上跑通过（华为 BLA-AL00，经 adb：20 条只读探测 → `HostProfile` → 真实命令，
 > ~120ms / exit 0，其中 `logcat` 之所以能跑，是因为探测项 6c 去抽查了它）。
-> **仍无 node 二进制产物**——目前唯一可运行的东西就是那个真机 harness——不适合用于生产环境。
+> **宿主 CLI `acowork-android` 已交付**（`probe` / `exec` / `settings` / `evidence` / `serve` / `runtime`）。
+> B3/B6/B4 已关。C1 + **vendor 全量 Runtime**（`android-host`）已通。宿主 APK（#4 / C2 切片）已脚手架：
+> [`apps/android`](apps/android) + JNI。仍属早期。
 >
-> 下文标注 🚧 / ⬜ / ⛔ 的内容均为设计意图。三条 ⛔ 是「本仓库裁定 vs 上游权威」的冲突，
-> 需上游或产品裁定，详见[开发就绪度评估](docs/review/zh/2026-10-28-readiness-assessment.md)。
+> 下文标注 🚧 / ⬜ / ⛔ 的内容均为设计意图。剩余 ⛔ 见[开发就绪度评估](docs/review/zh/2026-10-28-readiness-assessment.md)。
 
 ---
 
@@ -51,8 +52,10 @@ Android 移植版从同一份核心代码出发，产出两个二进制 / 产物
 运行在 Termux 或其他 Android 终端环境下的命令行版本。
 
 ```bash
-# 占位示例 —— 子命令形态尚未定稿
-acowork-android serve --gateway-http http://<gateway-host>:19876
+acowork-android probe
+acowork-android exec -- "getprop ro.build.version.release"
+acowork-android serve --gateway-http http://<gateway-host>:19876 --agent demo
+# 默认引擎 = 本二进制再入 `runtime`（可用 --engine PATH 替换）
 ```
 
 - 与桌面端 `acowork-node` 一致的 CLI 使用体验：注册 Gateway、启动 / 停止 Agent、浏览文件、安装包。
@@ -63,22 +66,18 @@ acowork-android serve --gateway-http http://<gateway-host>:19876
 
 ### 2. App 版本 —— `acowork-android-app`
 
-同样能力的 Android 应用形态。
+同样的 **宿主**能力打成 Android 应用（设备上跑 Node + Runtime）。这与主仓 `acowork-mobile`
+**不是一类东西**：mobile 是与 desktop 同级的**客户端**，里面没有 Runtime。
 
 - 通过前台服务在 Android 后台执行限制下保持 Node Agent 存活。
 - MQTT 注册与重连由 Android 的网络 / 电池回调驱动。
 - 工作区与包存储映射到应用私有的受作用域目录，可按需申请共享存储访问权限。
 - 面向日常使用：一个常在线、可被 Gateway 通过网络访问的 Agent 宿主。
 
-> ⛔ **形态归属未裁定（评估 B4）。** 上游已有 Android APK：`apps/acowork-mobile`
-> （Tauri v2，design 25 v1.3「工程开发中」/ ADR-086），但定位**相反**——它是「IM 形态的对话控制终端」，
-> 明确「❌ 无本地 Gateway 进程」「❌ Agent 管理不做」，且刻意不带 `acowork-core` / `rumqttc` 依赖；
-> 而本交付物是承载 Node Agent 的**节点宿主**。
->
-> 未回答的问题：用户装两个 APK，还是 mobile 长出 host mode？包名 / 签名 / 前台服务 / 电池白名单如何共存？
-> 在该问题裁定前不应开工。可复用的是它的 **NDK 构建管线**（见「构建」一节）。
+> ✅ **B4 已关闭**（[ADR-AND-004](docs/adr/zh/ADR-AND-004-independent-apk-deliverable.md)）：
+> 主仓 mobile = 客户端；本仓 APK = 宿主。CLI / APK 都是本仓交付物；宿主 APK 在 [`apps/android`](apps/android)。
 
-两个版本共享同一套 Agent 引擎，差别在于**生命周期管理方式**（Termux 进程 vs. 前台服务）与
+本仓两个版本共享同一套 Agent 引擎，差别在于**生命周期管理方式**（Termux 进程 vs. 前台服务）与
 **存储 / 权限策略**，而非运行时语义本身。
 
 ## 宿主档（Host Profiles）
@@ -146,22 +145,24 @@ Android「打样」的交付物因此不只是能跑的代码，而是
 
 ## 仓库结构
 
-`crates/` 下两个库**已存在并可构建可测试**；`crates/acowork-android-cli` 与 `apps/android` 仍是 🚧 *规划中*。
+`crates/` 下库与宿主 CLI、以及 `apps/android` 宿主 APK **已存在并可构建**。C1 Termux CLI 可对真实 Gateway 做 MQTT enroll；APK 经 JNI enroll（本切片 start/stop/install 仍走 CLI）。
 
 ```mermaid
 graph TD
     subgraph Repo["ACoworkRuntimeAndroid"]
         Contract["crates/acowork-platform-contract<br/>✅ 平台中立规则层：只依赖 serde，可在裸机 target 编译"]
-        Lib["crates/acowork-android<br/>✅ Android 的事实与机制：探测、capability 取值、su 包装、avc 回灌"]
-        Cli["crates/acowork-android-cli<br/>🚧 命令行二进制：acowork-android"]
-        App["apps/android<br/>🚧 APK：前台服务 + 界面"]
+        Lib["crates/acowork-android<br/>✅ host + node：探测、EngineSpec、进程表、enroll 形状"]
+        Cli["crates/acowork-android-cli<br/>✅ acowork-android：宿主 CLI + serve/runtime"]
+        App["apps/android<br/>✅ APK：前台服务 + JNI"]
+        Ffi["crates/acowork-android-ffi<br/>✅ JNI cdylib"]
     end
     Node["Node Agent 层<br/>注册 / 进程表 / 包仓库"]
     Rt["Runtime 层<br/>LLM 循环 / 记忆 / 工具"]
     Gw["acowork-gateway<br/>远端控制面"]
 
     Cli --> Lib
-    App --> Lib
+    App --> Ffi
+    Ffi --> Lib
     Lib --> Contract
     Lib --> Node
     Lib --> Rt
@@ -172,10 +173,11 @@ graph TD
 | 路径 | 内容 |
 |------|------|
 | `crates/acowork-platform-contract/` | **平台中立的规则层**：能力四轴、探测证据纪律、执行信封、授权闸门、反馈原语。只依赖 `serde`，`no_std + alloc` 可编译。任何平台（Android、ESP32、后续端口）挂进集群都要满足这里的 R1–R13。见 [ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md)。 |
-| `crates/acowork-android/` | **Android 的事实与机制**：探测哪些命令、输出怎么解析、五个 `android:*` 能力的四轴取值、`su -c` 包装、`avc: denied` 回灌。判据是「换一个平台，契约层一行不改，这里全部重写」。 |
-| `crates/`（规划） | 两个版本共用的其余 Rust crate —— 适配 Android 的 runtime + node 引擎。 |
-| `apps/`（规划） | APK 应用（Gradle 工程，Kotlin/Java 外壳，前台服务）。 |
-| `docs/` | 设计说明、平台笔记与移植取舍记录 —— 见 [ADR-AND-001](docs/adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md)（宿主档与权限模型）、[ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md)（平台契约层）、[android-host-probe.md](docs/design/zh/android-host-probe.md)（启动能力探测）、[android-runtime-settings.md](docs/design/zh/android-runtime-settings.md)（哪些参数归人定、哪些只有设备能答）与 [开发就绪度评估](docs/review/zh/2026-10-28-readiness-assessment.md)（与上游的冲突核对）。 |
+| `crates/acowork-android/` | **Android 事实 + 独立 Node 半边**：宿主探测/`ExecutionBackend`，以及 `node::{EngineSpec, ProcessTable, EnrollRequest, capability_tags}`（[ADR-AND-003](docs/adr/zh/ADR-AND-003-independent-engine-and-spawn-contract.md)）。不依赖上游 `acowork-node` / `acowork-runtime`。 |
+| `crates/acowork-android-cli/` | **一体二进制、两个角色**：`probe` / `exec` / `settings` / `evidence` / `restore`；**Node** = `serve`，**Runtime** = `runtime`（或 `--engine PATH`）。Root-shell 是同二进制的探测模式。 |
+| `crates/acowork-android-ffi/` | **JNI `cdylib`**：`libacowork_android_ffi.so`，供宿主 APK（enroll / ping / probe / settings）。 |
+| `apps/android/` | **宿主 APK**（`com.acowork.androidhost`）：Gradle + Kotlin 前台服务、作用域 `filesDir/acowork`、连通性重连。见 [`apps/android/README.md`](apps/android/README.md)。 |
+| `docs/` | 设计说明、平台笔记与移植取舍 —— 见 [ADR-AND-001](docs/adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md)、[ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md)、[ADR-AND-003](docs/adr/zh/ADR-AND-003-independent-engine-and-spawn-contract.md)、[android-host-probe.md](docs/design/zh/android-host-probe.md)、[android-runtime-settings.md](docs/design/zh/android-runtime-settings.md) 与 [开发就绪度评估](docs/review/zh/2026-10-28-readiness-assessment.md)。 |
 
 ## 与上游的关系
 
@@ -191,15 +193,15 @@ graph TD
 
 | # | 范围 | 状态 |
 |---|------|------|
-| 1 | 仓库骨架、许可证与本 README | ✅ **已交付** —— 两个 crate 的 workspace（[`acowork-platform-contract`](crates/acowork-platform-contract) + [`acowork-android`](crates/acowork-android)），Apache-2.0 [LICENSE](LICENSE) 与上游一致以便代码双向流动，工具链对齐上游 `core/Cargo.toml`（edition 2024、rust-version 1.95），双语 README，`docs/` 下 ADR、探测设计与就绪评估齐备 |
-| 2 | 共享 crate：把 node + runtime 引擎抽取到平台 trait 之后 | ⛔ **阻塞（B3）** —— 上游 design 30 §5 与 §9 对「Android 引擎是编进 `acowork-runtime` 的 crate，还是依赖已发布 Host crate 的独立引擎」给出两种答案，且后者依赖的契约 crate 尚不存在。⚠️ 注意本项阻塞的是**引擎**归属；**宿主规则层**已按 #5a 独立交付，不受 B3 裁定影响 |
-| 3 | 命令行版本在 Termux 下运行，并注册到真实 Gateway | ⬜ 计划中（依赖 #2） |
-| 4 | App 版本：前台服务、受作用域存储、保活 | ⛔ **阻塞（B4）** —— 与上游 `apps/acowork-mobile`（Tauri v2 Android APK，design 25 / ADR-086）形态撞车而定位相反，归属未裁定 |
+| 1 | 仓库骨架、许可证与本 README | ✅ **已交付** —— workspace（[`acowork-platform-contract`](crates/acowork-platform-contract) + [`acowork-android`](crates/acowork-android) + [`acowork-android-cli`](crates/acowork-android-cli)），Apache-2.0 [LICENSE](LICENSE) 与上游一致以便代码双向流动，工具链对齐上游 `core/Cargo.toml`（edition 2024、rust-version 1.95），双语 README，`docs/` 下 ADR、探测设计与就绪评估齐备 |
+| 2 | 独立 Android node+runtime 引擎（仅协议耦合 Gateway） | ✅ **已交付（B3/B6 关闭）** —— [ADR-AND-003](docs/adr/zh/ADR-AND-003-independent-engine-and-spawn-contract.md)：`node::EngineSpec` + 进程表；默认一体 `serve`→`runtime`；零上游 node/runtime 二进制依赖 |
+| 3 | 命令行版本在 Termux 下运行，并注册到真实 Gateway | ✅ **已交付（C1 + 完整 Runtime）** —— MQTT enroll、反代、`.agent`/`package_url` 安装；`runtime` 跑 **vendor 全量 `acowork-runtime`**（`android-host`：shell → `ExecutionBackend`）。出处见 [docs/VENDOR.md](docs/VENDOR.md)。 |
+| 4 | App 版本：前台服务、受作用域存储、保活 | ✅ **已交付（C2 切片）** —— [`apps/android`](apps/android) + [`acowork-android-ffi`](crates/acowork-android-ffi)：前台服务、`filesDir/acowork`、连通性 → MQTT 重连、JNI enroll/ping/probe/settings。本切片 agent start/stop/install 仍走 CLI；签名发布见 #7。 |
 | 5 | `ExecutionBackend` trait + 启动时 HostProfile 能力探测 | ✅ **已交付**（P0）—— `crates/acowork-android/src/host/` |
 | 5a | **平台中立契约层** `acowork-platform-contract`：R1–R13 规则 + 逐条一致性测试（为 ESP32 等后续端口打样） | ✅ **已交付** —— 裸机 target 编译通过，见 [ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md) |
 | 5b | 执行栈：脚本装配、`SpawnRunner` 平台接缝、`ShellBackend` / `RootShellBackend` / `AppSandboxBackend`、adb 传输层 | ✅ **已交付并在真机上验证** —— `cargo run --example device_probe` 端到端驱动真机；把它的回包与 fixture 逐字段对账后，修正了 5 处 fixture 编造出来的事实（见[地面实况测试](crates/acowork-android/tests/device_ground_truth.rs)） |
 | 6 | 电池 / Doze 调优与长跑稳定性测试 | ⬜ 计划中 |
-| 7 | 发布产物（Termux 包 + 签名 APK） | ⬜ 计划中（依赖 #2/#4；NDK 管线可复用上游 `apps/acowork-mobile`） |
+| 7 | 发布产物（Termux 包 + 签名 APK） | ⬜ 计划中（依赖 #4 APK 工程） |
 | 5c | §7.1 上报边界的**三个出口**：能力摘要 / 后端错误文案 / 命令自己的 stdout·stderr | ✅ **已交付** —— 第三个出口是量出来的而不是想出来的：`logcat -d` 的 181 条 avc 审计记录原本原样过线，而守门测试对 `Vec<u8>` 的 JSON 序列化做子串断言，**任何内容都能通过**。现在审计记录在投影处重写成「权限集 + 对象类 + 目标类型」，user / role / MLS 区间与路径留在设备上；`ps -Z` 这类非记录行逐字节不动 |
 | 8 | `root-shell` 宿主档，**仅只读能力**（`logcat` / `dumpsys` / `getprop`） | 🚧 **大部分交付** —— 只读档现在按**脚本内容**放行而非按调用方标签（[`host/commands.rs`](crates/acowork-android/src/host/commands.rs)），覆盖的命令是被探测出来的而非假定的（探测项 6c），且这一档说到做到：路径说不清的读（`$F`、相对名、以 `/data` 为中心的通配）与读别人 uid 的文件都不在这一档里。已在 BLA-AL00 上端到端验证。剩余：`RootShellBackend` 在一台真有 `su` 的设备上跑一次——它至今没碰过真实的 su |
 | 9 | Android 调试工具集（截屏、ANR / tombstone / bugreport 采集）+ 命令审计日志 | 🚧 **交付一半** —— 审计日志已交付（[`host/audit.rs`](crates/acowork-android/src/host/audit.rs)）：`AuditedBackend` 在碰设备**之前**落一条 `attempted`、出结果后落收尾记录；开口记录写不进去就**不执行命令**。证据面已实测（探测项 13 / 13b）：无 root 时 ADR §4.6 item 6 那六个源**没有一个能取到 `/data/anr` 的内容**，`dumpsys` 那边是 246 个服务各自一项。**采集动作现已交付**（[`host/evidence.rs`](crates/acowork-android/src/host/evidence.rs)）：`screencap -p`、`logcat -d`、`dumpsys <service>`、`bugreportz` 都能作为文件落进 Agent 工作区，并用**设备在传输前自己算出的 digest** 验收——BLA-AL00 实测 1 377 361 字节的 PNG 走 6 次读、4 101 144 字节的 bugreport zip 走 16 次读。仍未做的是**关联分析**那一半（把产物交给分析步骤）；`/data/anr` 与 `/data/tombstones` 依旧读不到，那是设备说的，不是端口没写到 |
@@ -209,22 +211,29 @@ graph TD
 顺序是刻意安排的：**先只读，后可写**。只读的 root 档已经能覆盖绝大多数系统调试诉求（日志、状态、属性），
 且几乎没有变砖风险；而写能力档集中了所有不可逆决策，因此被单独隔离到最后交付。
 
-三条 ⛔ 都不是本仓库内部能自决的，而是「本仓库裁定 vs 上游权威」的冲突。完整核对记录、已采用的架构解法、
-以及实现期新发现的 5 处契约缺口（B8–B12）见
+B3/B6 已由 [ADR-AND-003](docs/adr/zh/ADR-AND-003-independent-engine-and-spawn-contract.md) 关闭；B4 已由 [ADR-AND-004](docs/adr/zh/ADR-AND-004-independent-apk-deliverable.md) 关闭。完整核对记录见
 [开发就绪度评估](docs/review/zh/2026-10-28-readiness-assessment.md)。
 
 ## 构建
 
 ### 宿主侧（当前可构建的部分）
 
-两个 crate 都是纯 Rust 库，不含平台相关代码，可在任意宿主上构建与测试：
+库与宿主 CLI 可在任意宿主上构建与测试：
 
 ```bash
-cargo build                                        # 构建
-cargo test                                         # 636 个测试（Android 单元 446 + 组装链路 6 + 契约层 86 + 契约集成 27 + 规则一致性 43 + 真进程 13 + 真机地面实况 15）
+cargo build                                        # 构建（含 acowork-android 二进制）
+cargo build -p acowork-android-cli --release       # 发布形态的 CLI bin
+cargo test                                         # 测试数字只在本段维护一处；以 `cargo test` 实跑为准
 cargo clippy --all-targets -- -D warnings          # 上游 CI 约定，须零告警
 cargo fmt --check
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps      # 文档链接必须都能解析
+```
+
+```bash
+# 宿主 CLI（开发机经 adb，或 Termux 上 --transport local）
+ACOWORK_ADB=adb ACOWORK_ADB_SERIAL=<serial> cargo run -p acowork-android-cli -- probe
+ACOWORK_ADB=adb ACOWORK_ADB_SERIAL=<serial> \
+  cargo run -p acowork-android-cli -- exec -- "getprop ro.build.version.release"
 ```
 
 规则层还要在**裸机 target** 上过一遍——这是 R12（契约不预设任何 OS 设施）的硬门，不是可选检查：
@@ -258,7 +267,7 @@ fixture 永远只能证明解析器与自己自洽，证明不了它对上了任
 
 工具链对齐上游 `core/Cargo.toml`：edition 2024、rust-version 1.95、license Apache-2.0。
 
-**依赖纪律**：`acowork-platform-contract` 只依赖 `serde`（`default-features = false` + `alloc`/`derive`），连 `async-trait` 都不用——异步靠 `core::future::Future` + GAT 关联 future 类型，不装箱。`acowork-android` 的唯一非 serde 依赖就是契约层。二者都**刻意不依赖** `acowork-runtime` / `acowork-core`：上游 design 30 §9 自己指出「`ExecutionBackend` 在引擎内部，EIP 在引擎外部」，二者正交；保持零引擎依赖使本仓库在 B3 的两种裁定下同时成立。这现在是**结构保证**而非约定——可用 `cargo tree -p acowork-platform-contract --no-default-features -e features --edges no-dev` 复核 lib 依赖图里没有 `serde_core feature "std"` 边（必须带 `--edges no-dev`，否则 dev-dependency `serde_json` 会误导）。
+**依赖纪律**：`acowork-platform-contract` 只依赖 `serde`（`default-features = false` + `alloc`/`derive`），连 `async-trait` 都不用——异步靠 `core::future::Future` + GAT 关联 future 类型，不装箱。`acowork-android` 的唯一非 serde 依赖就是契约层。二者都**刻意不依赖** `acowork-runtime` / `acowork-core` / `acowork-node`：B3 已裁定为独立引擎，零上游引擎依赖是**结构保证**（[ADR-AND-003](docs/adr/zh/ADR-AND-003-independent-engine-and-spawn-contract.md)）。可用 `cargo tree -p acowork-android-cli` 复核无 `acowork-node` / `acowork-runtime`；契约层裸机依赖图用 `cargo tree -p acowork-platform-contract --no-default-features -e features --edges no-dev`。
 
 ### 我设的数，是不是正在生效的数
 
@@ -278,13 +287,22 @@ ACOWORK_ADB=/path/to/adb ACOWORK_ADB_SERIAL=<serial> \
 代答，并在输出里说明是代答。BLA-AL00 实测：`printf ... > /data/local/tmp/f` 跑通，快照存下原有字节，
 `restore` 把它们放了回去；审计文件里随后是捕获、写、撤销三对 attempt/result，按 `(session_id, id)` 归组。
 
-### Android 侧（尚未开始）
+### Android 宿主 APK
 
-交叉编译、JNI 与 `.so` 打包的管线还没有建立，因此确切的 NDK 版本与目标三元组尚未固定。
+NDK **26.1.10909125**，目标 **`aarch64-linux-android`**（本切片仅 arm64-v8a）。
 
-**不要从零搭**：上游 `apps/acowork-mobile` 已经跑通 Tauri v2 的 Android 构建（其 `Cargo.toml`
-含 `cfg(target_os = "android")` 段与 `jni` 依赖），NDK 版本、target triple 与打包步骤应先以它为基准，
-再按本仓库需要调整。这是评估 B4 里「已有事实未被复用」的那一条。
+```powershell
+# 仓库根目录 —— 为 zstd-sys 等设置 CC/CFLAGS/sysroot
+. .\scripts\android-ndk-env.ps1
+cargo build -p acowork-android-ffi --release --target aarch64-linux-android
+# 或：cd apps/android && ./gradlew cargoNdkArm64
+
+cd apps/android
+./gradlew :app:assembleDebug
+```
+
+细节见 [`apps/android/README.md`](apps/android/README.md)。主仓 mobile 仍是独立的
+**客户端**产品（[ADR-AND-004](docs/adr/zh/ADR-AND-004-independent-apk-deliverable.md)）。
 
 ## 参与贡献
 

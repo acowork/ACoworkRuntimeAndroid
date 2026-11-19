@@ -1,0 +1,21 @@
+[package]
+name = "acowork-android-cli"
+description = "acowork-android — Termux / on-device CLI for the Android host runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "acowork-android"
+path = "src/main.rs"
+
+[dependencies]
+acowork-android = { path = "../acowork-android" }
+acowork-runtime = { workspace = true, features = ["android-host"] }
+acowork-platform-contract = { workspace = true, features = ["std"] }
+tokio.workspace = true
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio.workspace = true

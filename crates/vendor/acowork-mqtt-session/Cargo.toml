@@ -1,0 +1,28 @@
+[package]
+name = "acowork-mqtt-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+description = "Shared MQTT session lifecycle (ADR-039 Phase 2 / ADR-065) - MqttSession, MqttClient, BootstrapAction, ErrClass, SessionState, reconnect policy"
+
+[features]
+default = []
+# Backward-compat no-op: rumqttc is now a hard dependency (MqttClient<B>
+# needs its types). Consumers that previously enabled "rumqttc-0-25" to
+# get From<&ConnectionError> keep working unchanged.
+"rumqttc-0-25" = []
+
+[dependencies]
+async-trait = { workspace = true }
+libc = { workspace = true }
+rumqttc = { workspace = true }
+# rustls with the `ring` provider (workspace-unified crypto backend,
+# design doc 24 M4): guarantees exactly one CryptoProvider is compiled
+# into every graph that hosts the MQTT client, and lets
+# `ensure_crypto_provider()` install it explicitly.
+rustls = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+tracing = { workspace = true }

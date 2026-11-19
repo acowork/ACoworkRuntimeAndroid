@@ -1,0 +1,116 @@
+[package]
+name = "acowork-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+description = "Agent Runtime - unified execution engine for .agent packages"
+
+[[bin]]
+name = "acowork-runtime"
+path = "src/main.rs"
+
+[features]
+# WASM tool sandbox (Wasmtime-based) — not an Android delivery target.
+wasm-tools = ["wasmtime", "wasmtime-wasi"]
+# Interactive CLI approval (dialoguer-based confirmation prompts)
+interactive-cli = ["dialoguer"]
+# Unit tests that spin up acowork-gateway's embedded broker — never enabled
+# in this workspace (gateway is not vendored).
+upstream-gateway-tests = []
+# Route shell tools through acowork-android ExecutionBackend (Termux/APK host).
+android-host = ["dep:acowork-android"]
+[dependencies]
+acowork-core.workspace = true
+acowork-android = { workspace = true, optional = true }
+# ADR-101: `acowork-memory` is a standalone service now — the Runtime no
+# longer links it. `acowork-sqlite` stays because the conversation index and
+# the session-metadata rows still live in the Runtime's workspace SQLite file.
+
+# ADR-039 Phase 2: shared MQTT session lifecycle
+acowork-mqtt-session = { workspace = true, features = ["rumqttc-0-25"] }
+# ADR-082 D1: SQLite sidecars (conversation index + session meta).
+acowork-sqlite = { workspace = true }
+acowork-mcp.workspace = true
+indexmap.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+# Raw workspace-file streaming (ADR-055 L2-7 preview path):
+# tokio_util::io::ReaderStream turns the on-disk File into a byte stream.
+tokio-util.workspace = true
+bytes = "1"
+reqwest = { workspace = true, features = ["blocking"] }
+clap = { workspace = true, features = ["derive", "env"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+directories.workspace = true
+parking_lot.workspace = true
+regex.workspace = true
+rusqlite.workspace = true
+futures = "0.3"
+futures-core.workspace = true
+futures-util = { workspace = true }
+tokio-stream.workspace = true
+rand.workspace = true
+sha2.workspace = true
+zip.workspace = true
+# Document parsing (doc_reader tool)
+pdf-extract.workspace = true
+calamine.workspace = true
+quick-xml.workspace = true
+lopdf.workspace = true
+toml.workspace = true
+serde_yaml.workspace = true
+prost.workspace = true
+rumqttc.workspace = true
+axum.workspace = true
+
+# Base64 encoding for binary file reads (workspace file read returns
+# base64-encoded content for image / PDF / archive types).
+base64.workspace = true
+
+# Raster decode/scale/encode for the `image_read` builtin tool
+# (design doc t-65a1a89e). Only the four formats the tool sniffs and
+# the five provider protocols all accept; no default features so the
+# rest of the format matrix (and rayon) stays out of the binary.
+# Already in the workspace dependency graph via acowork-user — not a
+# new third-party.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+
+# File system watching
+notify.workspace = true
+
+# ripgrep-based file traversal (gitignore-aware)
+ignore.workspace = true
+
+# Glob pattern matching (used by glob_search tool, transitive via ignore)
+globset.workspace = true
+
+# Interactive CLI (feature-gated)
+dialoguer = { workspace = true, optional = true }
+
+# Token counting
+tiktoken-rs.workspace = true
+
+# WASM runtime (feature-gated)
+wasmtime = { workspace = true, optional = true }
+wasmtime-wasi = { workspace = true, optional = true }
+
+[dev-dependencies]
+acowork-core = { workspace = true }
+# ADR-044 Phase 1: test-util enables paused time + auto-advance helpers.
+# Gateway / acowork-eval are NOT vendored into this Android workspace.
+tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+mockito = { workspace = true }
+tempfile = { workspace = true }
+reqwest = { workspace = true, features = ["json", "multipart"] }
+futures-util = { workspace = true }
+

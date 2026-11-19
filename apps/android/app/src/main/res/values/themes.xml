@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.ACoworkHost" parent="Theme.Material3.Light.NoActionBar">
+        <item name="colorPrimary">#1B4D3E</item>
+        <item name="colorSecondary">#C45C26</item>
+        <item name="android:statusBarColor">#1B4D3E</item>
+    </style>
+</resources>

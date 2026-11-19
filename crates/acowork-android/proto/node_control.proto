@@ -1,0 +1,127 @@
+syntax = "proto3";
+
+package acowork.mqtt.v1;
+
+// Minimal subset of upstream mqtt_payload.proto for Android Node ↔ Gateway
+// control-plane traffic (ADR-AND-003). Field numbers MUST match upstream so
+// a Gateway that speaks the full schema can decode what we publish.
+//
+// We do not path/git-depend on acowork-core; this file is the protocol
+// contract we maintain locally.
+
+message DataEnvelope {
+  uint32 version = 1;
+  reserved 4;
+  oneof payload {
+    NodeInfo           node_info            = 28;
+    NodeControlCommand node_control_command = 29;
+    NodeEvent          node_event           = 30;
+    InstalledAgentInfo installed_agent_info = 31;
+    NodeEnroll         node_enroll          = 32;
+    NodeEnrollResult   node_enroll_result   = 33;
+    NodeReady          node_ready           = 34;
+  }
+}
+
+message NodeInfo {
+  string node_id = 1;
+  string hostname = 2;
+  string os = 3;
+  string arch = 4;
+  string node_version = 5;
+  uint32 protocol_version = 6;
+  repeated string capabilities = 7;
+  uint32 max_agents = 8;
+  uint32 agent_count = 9;
+  string http_endpoint = 10;
+  string node_name = 11;
+  reserved 12;
+  reserved "gateway_managed";
+}
+
+message NodeControlCommand {
+  string node_id = 1;
+  string request_id = 2;
+  oneof command {
+    NodePing      ping      = 3;
+    NodeStart     start     = 4;
+    NodeStop      stop      = 5;
+    NodeInstall   install   = 6;
+    NodeUninstall uninstall = 7;
+  }
+}
+
+message NodePing {}
+
+message NodeStart {
+  string agent_id = 1;
+  bool dev_mode = 2;
+  string instance_id = 3;
+}
+
+message NodeStop {
+  string agent_id = 1;
+  string reason = 2;
+  string instance_id = 3;
+}
+
+message NodeInstall {
+  string agent_id = 1;
+  string package_url = 2;
+  string local_path = 3;
+  bool dev_mode = 4;
+  string instance_id = 5;
+  reserved 6;
+  bool ensure = 7;
+}
+
+message NodeUninstall {
+  string agent_id = 1;
+  string instance_id = 2;
+}
+
+message InstalledAgentInfo {
+  string agent_id = 1;
+  string version = 2;
+  string name = 3;
+  string install_path = 4;
+  string manifest_toml = 5;
+  string instance_id = 6;
+  AgentIdentity identity = 7;
+}
+
+message AgentIdentity {
+  string name = 1;
+  string avatar = 2;
+  string builtin_avatar = 3;
+}
+
+message NodeEvent {
+  string node_id = 1;
+  string request_id = 2;
+  string status = 3;
+  string message = 4;
+  optional string result_json = 5;
+}
+
+message NodeEnroll {
+  string node_id = 1;
+  string os = 2;
+  string arch = 3;
+  string node_version = 4;
+  uint32 protocol_version = 5;
+  repeated string capabilities = 6;
+  string enrollment_token = 7;
+}
+
+message NodeEnrollResult {
+  string node_id = 1;
+  string node_token = 2;
+  string status = 3;
+  string message = 4;
+}
+
+message NodeReady {
+  string node_id = 1;
+  uint32 protocol_version = 2;
+}

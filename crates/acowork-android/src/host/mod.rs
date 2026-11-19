@@ -29,6 +29,7 @@
 //! | Contract | [`backend`] | `ExecutionBackend`, and the gate that composes both authorities | Pure gate + async trait |
 //! | Backends | [`backends`] | The tier-specific `ExecutionBackend` implementations | Composes script + spawn + commands |
 //! | Transport | [`adb`] | Drive a device from the host over `adb` (feature `device`) | I/O |
+//! | Transport | [`local`] | Drive *this* process's shell (on-device / Termux CLI) | I/O |
 //! | Feedback | [`denial`] | `avc: denied` → an actionable next step | Pure, plus a session ledger |
 //! | Accountability | [`audit`] | §4.6.1: one record per attempt, written before and after | I/O on the way in, pure mapping |
 //! | Reversibility | [`rollback`] | §4.6.4: capture a write's pre-state, restore it at session end | Pure planner, plus a backend decorator |
@@ -72,9 +73,10 @@ pub mod tools;
 
 #[cfg(feature = "device")]
 pub mod adb;
+pub mod local;
 
 #[cfg(feature = "device")]
-pub use adb::{AdbTransport, CANDIDATE_ROOTS, RemoteArg};
+pub use adb::{AdbTransport, RemoteArg};
 pub use audit::{
     AuditError, AuditEvent, AuditOutcome, AuditSink, AuditedBackend, DEFAULT_MAX_FILE_BYTES,
     FileAuditSink, MAX_COMMAND_BYTES, MemoryAuditSink,
@@ -114,6 +116,7 @@ pub use facts::{
     ShellDialect, SuProbe, VerityState, parse_bool_prop, parse_mount_table, parse_prop,
     parse_su_probe, su_helper_missing, su_prompt_denied,
 };
+pub use local::{CANDIDATE_ROOTS, LocalHost, resolved_shell_path};
 pub use probe::{
     CommandOutput, PROBE_ITEM_TIMEOUT, PROBE_TOTAL_BUDGET, ProbeCommand, ProbeError, ProbeOutput,
     ProbeRunner, SPOT_CHECK_APPLETS, all_commands, parse_spot_checks, run_probe,

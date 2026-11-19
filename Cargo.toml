@@ -2,6 +2,14 @@
 members = [
     "crates/acowork-platform-contract",
     "crates/acowork-android",
+    "crates/acowork-android-cli",
+    "crates/acowork-android-ffi",
+    "crates/vendor/acowork-core",
+    "crates/vendor/acowork-memory",
+    "crates/vendor/acowork-sqlite",
+    "crates/vendor/acowork-mcp",
+    "crates/vendor/acowork-mqtt-session",
+    "crates/vendor/acowork-runtime",
 ]
 resolver = "2"
 
@@ -15,23 +23,83 @@ license = "Apache-2.0"
 rust-version = "1.95"
 
 [workspace.dependencies]
+# ── This repo's own crates ───────────────────────────────────────────
 acowork-platform-contract = { path = "crates/acowork-platform-contract", default-features = false }
+# Vendored Runtime closure (snapshot from ACowork core @ c9d28271).
+acowork-core = { path = "crates/vendor/acowork-core" }
+acowork-memory = { path = "crates/vendor/acowork-memory" }
+acowork-sqlite = { path = "crates/vendor/acowork-sqlite" }
+acowork-mcp = { path = "crates/vendor/acowork-mcp" }
+acowork-mqtt-session = { path = "crates/vendor/acowork-mqtt-session" }
+acowork-runtime = { path = "crates/vendor/acowork-runtime" }
+acowork-android = { path = "crates/acowork-android" }
+
+# ── Shared third-party (aligned with upstream core/Cargo.toml) ───────
+tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "process", "io-std", "fs", "signal"] }
+# Platform-contract still opts into std explicitly. Vendor crates use
+# `serde.workspace = true` and need the default std feature set — so the
+# workspace default here matches upstream (std on). Bare-metal builds of
+# acowork-platform-contract pass `--no-default-features` and pin serde locally.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+bincode = { version = "2.0", features = ["serde", "derive"] }
+indexmap = { version = "2", features = ["serde"] }
+anyhow = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+log = "0.4"
+tracing-subscriber = { version = "0.3", features = ["fmt", "ansi", "env-filter"] }
+tracing-appender = "0.2"
 async-trait = "0.1.92"
-# `default-features = false` at the root, so a port that writes `serde.workspace = true` gets a
-# `no_std` serde and has to opt in to `std` on purpose. `acowork-android` does opt in, and says
-# why at its own declaration.
-#
-# This is hardening, not a bug fix. The bare-metal build was broken once during this change and
-# the cause was the command, not the graph: `acowork-platform-contract` carries `std` in its own
-# default features, so `cargo build -p acowork-platform-contract --target
-# riscv32imc-unknown-none-elf` compiles serde_core with `--cfg feature="std"` and fails. The
-# verification command is the one with `--no-default-features`, and a counterfactual run with the
-# previous serde_json declaration passed it too — the workspace defaults were never the leak.
-serde = { version = "1.0", default-features = false, features = ["derive"] }
-# Alloc-only. `preserve_order` was set here and reached two tests that asserted a JSON
-# object's key *order* — a serialisation detail, not an invariant — so dropping it meant
-# changing those two assertions to compare keys as a set, which is what they should have
-# measured anyway: with `preserve_order` off, serde_json's `Value` is a BTreeMap and the keys
-# come out sorted. It also took indexmap, hashbrown and foldhash out of every test build.
-serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
-tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "time", "process", "io-util", "sync"] }
+rand = "0.10"
+toml = "1.0"
+directories = "6.0"
+chrono = { version = "0.4", features = ["clock", "std", "serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+axum = { version = "0.8", features = ["ws", "macros", "multipart"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tiktoken-rs = "0.12"
+zip = { version = "8.1", default-features = true, features = ["deflate-flate2"] }
+base64 = "0.22"
+hex = "0.4"
+urlencoding = "2.1"
+pdf-extract = "0.12"
+calamine = "0.26"
+quick-xml = "0.37"
+lopdf = "0.44"
+parking_lot = "0.12"
+uuid = { version = "1.22", features = ["v4", "std", "serde"] }
+futures-util = { version = "0.3", features = ["sink", "io"] }
+futures-core = "0.3"
+tokio-stream = { version = "0.1", features = ["io-util"] }
+tokio-util = { version = "0.7", default-features = false, features = ["io", "compat"] }
+tokio-tungstenite = "0.29"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+regex = "1.0"
+ed25519-dalek = { version = "2.1", features = ["std"] }
+sha2 = "0.10"
+serde_yaml = "0.9"
+tempfile = "3.0"
+mockito = "1"
+expect-test = "1.5"
+libc = "0.2"
+notify = "8"
+ignore = "0.4"
+globset = "0.4"
+dialoguer = "0.11"
+wasmtime = "29"
+wasmtime-wasi = "29"
+prost = "0.13"
+prost-build = "0.13"
+protoc-bin-vendored = "3"
+rumqttc = { version = "0.25", default-features = false, features = ["websocket", "use-rustls-no-provider"] }
+yamux = "0.14"
+signal-hook = "0.3"
+bytes = "1"
+# Sync HTTP GET for Gateway package_url (node inventory); blocking.
+ureq = { version = "2", default-features = false, features = ["tls"] }

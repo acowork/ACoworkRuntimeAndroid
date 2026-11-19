@@ -126,24 +126,19 @@ design 30 §9 自己说「`ExecutionBackend` 在**引擎内部**，EIP 在**引�
 
 ## 3. 中等阻塞（事实补全，不涉争议）
 
-### B4 —— APK 交付物与上游 `apps/acowork-mobile` 形态撞车，文档零交叉引用
+### B4 —— APK 交付物与上游 `apps/acowork-mobile`「形态撞车」【已关闭 · 2026-11-18】
 
-上游**已有** Android APK：`apps/acowork-mobile`（Tauri v2，`Cargo.toml` 含 `cfg(target_os = "android")` + `jni`），对应 design 25 v1.3「工程开发中」+ ADR-086。
+**原判断**：本仓 APK 与主仓 `acowork-mobile` 同为 Android APK，归属未裁定。
 
-定位**相反**：
+**裁定**（[ADR-AND-004](../../adr/zh/ADR-AND-004-independent-apk-deliverable.md)）：二者用途本就不重叠——
 
-| | 上游 acowork-mobile | 本仓库 acowork-android-app |
+| | 主仓 `acowork-mobile` | 本仓 `acowork-android-app` |
 |---|---|---|
-| 定位 | 「IM 形态的对话控制终端」 | 「常在线、可被 Gateway 访问的 Agent 宿主」 |
-| 本地 Gateway | ❌ 明确无 | 需承载 Node Agent |
-| Agent 管理 | ❌ v1 不做 | 核心职责 |
-| 依赖 | 刻意不带 `acowork-core` / `rumqttc` | 需完整 Node + Runtime |
+| 层级 | **客户端**（与 desktop 同等地位） | **宿主**（Node + Runtime） |
+| Runtime | **无** | 有 |
+| 角色 | 对话 / 控制集群的 App | 设备上跑 Agent、向 Gateway 注册 |
 
-在三份文档里 grep `acowork-mobile|ADR-086|Tauri|25-mobile`：**零命中**。
-
-未回答的产品问题：用户装两个 APK？还是 mobile 长出 host mode？包名 / 签名 / 前台服务 / 电池白名单如何共存？
-
-**附带浪费**：上游 mobile 已跑通 Android NDK + Tauri 构建管线，而 README 写「构建：目前尚无可构建内容……待补充确切的 NDK 版本与目标三元组」——已有事实未被复用。
+不是「装两个还是合并」的产品选择题；并列安装合理。本仓自建宿主 APK，不依赖 mobile 工程。
 
 ### B5 —— 上游平台矩阵与工具命名未对齐
 
@@ -266,7 +261,7 @@ ADR §7.4 只裁定了 `fs:system` 与 `selinux:permissive` 两条需要 owner �
 |---|---|---|---|
 | P0 | 把 B1 的「两权威」方案与 B2 的注册表提案提交上游评审 | 需上游 | ✅ 已提交（2026-10-29）——`AgentCowork/docs/review/zh/37-android-write-tier-attribution-and-capability-registry-review.md`，B1 含三个必答问题 Q1 执行点 / Q2 契约归属 / Q3 无主节点，B2 给出 a/b/c/d 四个选项；B1 方案在契约层已落地为 R7，文档直接附 `r7_*` 测试作为可执行说明。**状态：已送达上游分支，含默认值与截止日期（2026-11-16），等待裁定** |
 | P0 | 修正 ADR 日期、把 §7.1/§7.4 标注为待对齐 | 本仓库 | ✅ 已完成 |
-| P1 | 与 mobile app 负责人对齐 B4 的 APK 形态归属 | 需产品 | 🚧 配置面已定（2026-11-02）—— [android-runtime-settings.md](../../design/zh/android-runtime-settings.md) 盘点了全部散落参数，并给出 13 行可编辑 + 一段只读设备事实的界面草图；`HostConfig` 是纯 Rust 类型，mobile 长出 host mode 或独立 APK 两种形态都能直接消费（JNI 侧一次 `to_json`/`from_json`）。**仍待产品回答的是形态本身**：装两个 APK 还是合并、包名/签名/前台服务/电池白名单如何共存 |
+| P1 | 与 mobile app 负责人对齐 B4 的 APK 形态归属 | 需产品 | ✅ **已关闭（2026-11-18）** —— [ADR-AND-004](../../adr/zh/ADR-AND-004-independent-apk-deliverable.md)：主仓 mobile = 客户端（无 Runtime，与 desktop 同级）；本仓 APK = 宿主。无需合并或长 host mode |
 | P1 | 回写 probe §3（B8 `dialects`、B12 shell 前置条件）与 §4（B10 ledger） | 本仓库 | ✅ 已完成（2026-10-29） |
 | — | 抽出平台中立契约层，使规则不绑在 Android 上（规避 B3、为第二个端口打样） | 本仓库 | ✅ 已完成 —— [ADR-AND-002](../../adr/zh/ADR-AND-002-platform-contract-layer.md)，完成时 476 测试（现数见 README 质量门段落） |
 | — | 在真实嵌入式 target 上验证 R12（ESP32-C3 `riscv32imac-unknown-none-elf` 或 `riscv32imac-esp-espidf`） | 本仓库 | ⚠️ 部分 —— 已在更严格的 `riscv32imc`（无原子）上编译通过；`imac` 与 ESP-IDF 的 rust-std 组件下载被网络策略阻断 |

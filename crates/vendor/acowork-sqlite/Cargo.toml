@@ -1,0 +1,23 @@
+[package]
+name = "acowork-sqlite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+description = "SQLite storage backend for the ACowork memory system (ADR-082)"
+
+[dependencies]
+acowork-core.workspace = true
+acowork-memory.workspace = true
+async-trait.workspace = true
+# bundled → FTS5 + the `trigram` tokenizer are always available (ADR-082 D3).
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

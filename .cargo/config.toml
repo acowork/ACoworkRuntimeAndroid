@@ -1,0 +1,7 @@
+# Optional Android NDK cross-link helpers. Prefer sourcing
+# `scripts/android-ndk-env.ps1` which sets CC/CFLAGS with the NDK sysroot
+# (required for crates like zstd-sys). The linker line alone is not enough
+# on Windows when cc-rs falls back to a host clang without headers.
+#
+# [target.aarch64-linux-android]
+# linker = "aarch64-linux-android26-clang"

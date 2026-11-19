@@ -1,0 +1,53 @@
+[
+    {
+        "type": "file_upload",
+        "documentId": "0123456789ab-3",
+        "filename": "Q3-report.pdf",
+        "format": "pdf",
+        "sizeBytes": 482301,
+        "clientId": "msg-a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+    },
+    {
+        "type": "image_upload",
+        "documentId": "fedcba987654-7",
+        "filename": "screen.png",
+        "format": "png",
+        "sizeBytes": 987654,
+        "width": 1920,
+        "height": 1080,
+        "clientId": "msg-b2c3d4e5-f6a7-8901-bcde-f12345678901"
+    },
+    {
+        "type": "image_upload",
+        "documentId": "112233445566-a",
+        "filename": "diagram.jpg",
+        "format": "jpg",
+        "sizeBytes": 12345
+    },
+    {
+        "type": "attached_file",
+        "absPath": "/Users/alice/projects/agentcow/core/acowork-runtime/src/lib.rs",
+        "name": "lib.rs",
+        "clientId": "msg-c3d4e5f6-a7b8-9012-cdef-123456789012"
+    },
+    {
+        "type": "attached_selection",
+        "absPath": "/Users/alice/projects/agentcow/core/acowork-runtime/src/agent/loop_.rs",
+        "name": "loop_.rs",
+        "startLine": 521,
+        "endLine": 540,
+        "clientId": "msg-d4e5f6a7-b8c9-0123-defa-234567890123"
+    },
+    {
+        "type": "attached_selection",
+        "absPath": "/Users/alice/projects/agentcow/core/acowork-runtime/src/main.rs",
+        "name": "main.rs",
+        "startLine": 42,
+        "endLine": 42
+    },
+    {
+        "type": "attached_folder",
+        "absPath": "/Users/alice/projects/agentcow/core/acowork-runtime/src/agent/session",
+        "name": "session"
+    }
+]

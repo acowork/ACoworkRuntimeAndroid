@@ -365,12 +365,17 @@ impl HostProfile {
         // unreachable from an assembled profile — reachable only from a hand-written one.
         let su_path = resolved_path(probe.su_path.as_ref());
 
-        let paths = ShellPaths {
+        let mut paths = ShellPaths {
             bash,
             su: su_path,
             termux_prefix: probe.termux_prefix.clone(),
             ..ShellPaths::android_default()
         };
+        // Prefer the same packaged/local shell LocalHost probes with, so
+        // ShellBackend does not fall back to /system/bin/sh (shell_exec).
+        if let Some(sh) = crate::host::local::resolved_shell_path() {
+            paths.system_sh = sh;
+        }
 
         // ── Item 6: applets ────────────────────────────────────────────────
         let mut applets = AppletSet::new();
