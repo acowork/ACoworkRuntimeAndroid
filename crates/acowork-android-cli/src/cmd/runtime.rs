@@ -45,6 +45,10 @@ pub fn run(args: RuntimeArgs) -> Result<(), String> {
         ));
     }
 
+    acowork_android::host::set_dangerous_mode(
+        args.common.dangerous_mode
+            || std::env::var("ACOWORK_DANGEROUS_MODE").ok().as_deref() == Some("1"),
+    );
     // Probe + backend on a short-lived runtime, then drop it before Cli::run
     // builds its own multi-thread runtime (nested runtimes panic).
     {

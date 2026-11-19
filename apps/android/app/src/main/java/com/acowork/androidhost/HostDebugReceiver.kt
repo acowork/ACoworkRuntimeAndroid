@@ -64,6 +64,12 @@ class HostDebugReceiver : BroadcastReceiver() {
                     }
                     "device_status" -> deviceStatus(context)
                     "device_photo" -> devicePhoto(context)
+                    "device_use" -> deviceUse(context, intent)
+                    "request_root" -> Native.invoke { requestRoot() }
+                    "dangerous" -> {
+                        val on = intent?.getStringExtra("on").orEmpty() == "1"
+                        Native.invoke { setDangerousMode(on) }
+                    }
                     else -> """{"ok":false,"error":"unknown cmd `$cmd`"}"""
                 }
                 Log.i(TAG, result)
@@ -100,5 +106,16 @@ class HostDebugReceiver : BroadcastReceiver() {
             org.json.JSONObject(),
             "adb-smoke",
         ).toString()
+    }
+
+    private fun deviceUse(context: Context, intent: Intent?): String {
+        val op = intent?.getStringExtra("op").orEmpty().ifBlank { "status" }
+        val args = org.json.JSONObject().put("op", op)
+        if (!DeviceBridge.isReady() && op != "status") {
+            return """{"ok":false,"error_code":"bridge_unavailable","error":"start the host first"}"""
+        }
+        val work = context.filesDir.resolve("acowork").absolutePath
+        val app = if (DeviceBridge.isReady()) DeviceBridge.appContext else context.applicationContext
+        return AndroidUseHandler.handle(app, work, args, "adb-smoke").toString()
     }
 }

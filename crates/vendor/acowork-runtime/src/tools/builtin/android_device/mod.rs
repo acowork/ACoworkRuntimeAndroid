@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::agent::attachment_to_image::build_data_url;
 
-/// Build the eight device tools. Caller has already checked the bridge env.
+/// Build the Android device tools. Caller has already checked the feature gate.
 pub fn tools() -> Vec<std::sync::Arc<dyn Tool>> {
     device::TOOL_NAMES
         .iter()
@@ -138,7 +138,7 @@ fn to_result(tool: &str, resp: device::DeviceResponse) -> ToolResult {
         error: None,
         token_usage: None,
     };
-    if tool == "android_photo" {
+    if tool == "android_photo" || tool == "android_use" {
         if let Some(part) = preview_part(&resp.data) {
             result.content_parts = Some(vec![part]);
         }
@@ -218,6 +218,9 @@ fn description(name: &str) -> &'static str {
         }
         "android_usb_hid" => {
             "USB host for a device that has a HID interface (class 3). op is list, open, close, claim, release, set_configuration, set_interface, control_transfer, transfer, or get_raw_descriptors. control_transfer takes the public UsbDeviceConnection.controlTransfer arguments. This does not make the phone a USB gadget."
+        }
+        "android_use" => {
+            "Computer-use on this phone: observe the screen and act on it. op is status, screenshot, snapshot (accessibility tree), tap, long_press, swipe, drag, gesture, type, node, or global. Gestures need the ACowork Host accessibility service. Screenshots use AccessibilityService.takeScreenshot on API 30+, otherwise MediaProjection. Does not inject KeyEvents or bypass FLAG_SECURE. include_screenshot defaults true after an action."
         }
         _ => "Android device tool",
     }
@@ -422,6 +425,45 @@ fn schema(name: &str) -> Value {
             },
             "required": ["op"]
         }),
+        "android_use" => json!({
+            "type": "object",
+            "properties": {
+                "op": {
+                    "type": "string",
+                    "enum": ["status", "screenshot", "snapshot", "tap", "long_press", "swipe", "drag", "gesture", "type", "node", "global"],
+                    "description": "status: accessibility and displays, no prompt. screenshot: JPEG of the display. snapshot: accessibility window tree. tap/long_press/swipe/drag/gesture: dispatchGesture. type: ACTION_SET_TEXT on the focused editable node or selector. node: AccessibilityNodeInfo.performAction. global: AccessibilityService.performGlobalAction. Default status."
+                },
+                "x": { "type": "number", "description": "Screen X in pixels, or 0-1 when normalized is true." },
+                "y": { "type": "number", "description": "Screen Y in pixels, or 0-1 when normalized is true." },
+                "x2": { "type": "number", "description": "Swipe/drag end X." },
+                "y2": { "type": "number", "description": "Swipe/drag end Y." },
+                "normalized": { "type": "boolean", "description": "When true, x/y/x2/y2 and gesture points are fractions of the display size. Default false (pixels)." },
+                "duration_ms": { "type": "integer", "description": "Stroke duration. tap default 50, long_press default 700, swipe/drag default 300." },
+                "strokes": {
+                    "type": "array",
+                    "description": "Custom GestureDescription strokes. At most GestureDescription.getMaxStrokeCount(). Each item: points [{x,y}], start_ms, duration_ms.",
+                    "items": { "type": "object" }
+                },
+                "text": { "type": "string", "description": "For type and node action=set_text. This is the string to write, not a selector." },
+                "action": { "type": "string", "description": "node: click, long_click, focus, clear_focus, select, copy, cut, paste, clear, set_text, scroll_forward, scroll_backward, expand, collapse, dismiss, ime_enter (API 30). global: back, home, recents, notifications, quick_settings, power_dialog, split_screen, lock_screen, take_screenshot, dismiss_notification_shade." },
+                "selector": {
+                    "type": "object",
+                    "description": "Find a node. Fields: view_id, class_name, text, text_contains, content_description, clickable, editable, focused, scrollable, index (nth match, default 0).",
+                    "additionalProperties": true
+                },
+                "view_id": { "type": "string", "description": "Shorthand for selector.view_id (resource-name, e.g. com.foo:id/bar)." },
+                "display_id": { "type": "integer", "description": "DisplayManager display id. Default DEFAULT_DISPLAY (0)." },
+                "include_screenshot": { "type": "boolean", "description": "After tap/swipe/type/node/global, capture a JPEG so the model sees the new screen. Default true." },
+                "include_tree": { "type": "boolean", "description": "Attach the accessibility tree to a screenshot. snapshot always includes the tree. Default false." },
+                "max_nodes": { "type": "integer", "description": "Tree walk cap. Default 200, max 2000." },
+                "max_depth": { "type": "integer", "description": "Tree depth cap. Default 24." },
+                "max_edge": { "type": "integer", "description": "Downscale JPEG so the long edge is at most this many pixels. Default 1280. 0 keeps the native size." },
+                "jpeg_quality": { "type": "integer", "description": "JPEG quality 1-100. Default 80." },
+                "output_path": { "type": "string", "description": "JPEG path under the agent work dir. Default device-captures/<id>.jpg." },
+                "wait_ms": { "type": "integer", "description": "Sleep after an action before the follow-up screenshot. Default 250, max 5000." },
+                "output": { "type": "string", "enum": ["inline", "file"] }
+            }
+        }),
         _ => json!({"type": "object"}),
     }
 }
@@ -433,7 +475,7 @@ mod tests {
     #[test]
     fn eight_tools_and_each_schema_names_itself() {
         let built = tools();
-        assert_eq!(built.len(), 8);
+        assert_eq!(built.len(), 9);
         for tool in built {
             let spec = tool.spec();
             assert!(device::TOOL_NAMES.contains(&spec.name.as_str()));

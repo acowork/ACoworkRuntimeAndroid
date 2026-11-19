@@ -54,6 +54,7 @@ pub async fn run(args: ServeArgs) -> Result<(), String> {
         identity.node_id, identity.node_name, identity.enrollment
     );
 
+    acowork_android::host::set_dangerous_mode(args.common.dangerous_mode);
     let loaded = HostConfig::load(&args.common.root).map_err(|e| e.to_string())?;
     let probe = run_probe(
         transport.as_probe(),
@@ -156,6 +157,8 @@ pub async fn run(args: ServeArgs) -> Result<(), String> {
             root: &args.common.root,
             tags: &tags,
             http_endpoint: &http_endpoint,
+            package: &args.common.package,
+            dangerous_mode: args.common.dangerous_mode,
         };
         start_agent(&mut ctx, agent_id, None, token).await?;
         refresh_info(&mut ctx).await?;
@@ -226,6 +229,8 @@ pub async fn run(args: ServeArgs) -> Result<(), String> {
                             root: &args.common.root,
                             tags: &tags,
                             http_endpoint: &http_endpoint,
+                            package: &args.common.package,
+                            dangerous_mode: args.common.dangerous_mode,
                         };
                         handle_incoming(&pubmsg, &mut ctx, &home, &mut live_token).await;
                     }
@@ -252,6 +257,8 @@ pub async fn run(args: ServeArgs) -> Result<(), String> {
                     root: &args.common.root,
                     tags: &tags,
                     http_endpoint: &http_endpoint,
+                    package: &args.common.package,
+                    dangerous_mode: args.common.dangerous_mode,
                 };
                 if !handle_repl(&line, &mut ctx).await? {
                     break;

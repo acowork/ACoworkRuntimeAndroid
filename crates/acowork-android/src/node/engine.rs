@@ -92,6 +92,10 @@ pub struct RuntimeLaunch {
     /// retained `http_endpoint` so the Gateway dials the Node, not the
     /// phone's unreachable `127.0.0.1:{port}` (ADR-055 §6.3 / D3).
     pub http_advertise_endpoint: Option<String>,
+    /// Own package name for HostProfile fs_roots (APK = `com.acowork.androidhost`).
+    pub package: Option<String>,
+    /// Session dangerous-mode for this child. Never persisted.
+    pub dangerous_mode: bool,
 }
 
 impl RuntimeLaunch {
@@ -135,6 +139,13 @@ impl RuntimeLaunch {
         if let Some(base) = &self.http_advertise_endpoint {
             args.push(OsString::from("--http-advertise-endpoint"));
             args.push(OsString::from(base));
+        }
+        if let Some(pkg) = &self.package {
+            args.push(OsString::from("--package"));
+            args.push(OsString::from(pkg));
+        }
+        if self.dangerous_mode {
+            args.push(OsString::from("--dangerous-mode"));
         }
         args
     }
@@ -212,6 +223,8 @@ mod tests {
             work_dir: PathBuf::from("/tmp/ws"),
             package_path: None,
             http_advertise_endpoint: Some("http://192.168.1.20:19900".into()),
+            package: Some("com.acowork.androidhost".into()),
+            dangerous_mode: true,
         };
         let args: Vec<String> = launch
             .args()
@@ -220,6 +233,9 @@ mod tests {
             .collect();
         assert!(args.contains(&"--http-advertise-endpoint".into()));
         assert!(args.contains(&"http://192.168.1.20:19900".into()));
+        assert!(args.contains(&"--package".into()));
+        assert!(args.contains(&"com.acowork.androidhost".into()));
+        assert!(args.contains(&"--dangerous-mode".into()));
         // rebuild launch without advertise for the rest of the assertions
         let launch = RuntimeLaunch {
             agent_id: "com.example.demo".into(),
@@ -232,6 +248,8 @@ mod tests {
             work_dir: PathBuf::from("/tmp/ws"),
             package_path: None,
             http_advertise_endpoint: None,
+            package: None,
+            dangerous_mode: false,
         };
         let args: Vec<String> = launch
             .args()
@@ -242,6 +260,7 @@ mod tests {
         assert!(args.contains(&"com.example.demo".into()));
         assert!(args.contains(&"--root".into()));
         assert!(args.contains(&"/tmp/ws".into()));
+        assert!(!args.contains(&"--dangerous-mode".into()));
         assert!(args.contains(&"--http-port".into()));
         assert!(args.contains(&"19901".into()));
         assert!(args.contains(&"agent:inst-1".into()));

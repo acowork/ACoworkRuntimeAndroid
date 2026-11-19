@@ -51,6 +51,10 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 - Probe summary / node status via JNI
 - Node enroll (C1) over MQTT; Gateway control `ping` / `start` / `stop` / `install` / `uninstall` handled in FFI
 - Packaged engine: `libacowork_engine.so` (CLI `acowork-android` as jniLibs binary)
+- Root-shell is the same APK + Magisk/KSU grant (no extra bin). **Request Magisk / KSU root**, then Stop/Start host. **Dangerous mode** is a session switch for system writes and is never persisted.
+- Agents page → per-agent **detail page** with its session history (newest activity
+  first, title / relative time / message count — the desktop list's fields). Read-only:
+  see [docs/design/zh/android-agent-sessions.md](../../docs/design/zh/android-agent-sessions.md)
 - adb smoke without unlocking UI: see [DEVICE_SMOKE.md](DEVICE_SMOKE.md)
 
 **Do not** `adb forward tcp:19900` while a desktop Node is using that port — use `adb reverse` for `:19875`/`:19876` only.

@@ -5,8 +5,10 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.hardware.usb.UsbManager
+import android.content.Intent
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.view.View
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -27,6 +29,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private val agentList = AgentListAdapter { row -> openAgent(row) }
     private var applyingEnroll = false
+    private var applyingDangerous = false
 
     private val cameraPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
@@ -77,9 +80,26 @@ class MainActivity : AppCompatActivity() {
         binding.btnPaste.setOnClickListener { pasteEnrollFromClipboard() }
         binding.btnScan.setOnClickListener { requestCameraAndScan() }
         binding.btnDevicePermissions.setOnClickListener { requestDevicePermissions(null) }
+        binding.btnScreenControl.setOnClickListener { openScreenControlSettings() }
+        binding.btnRequestRoot.setOnClickListener { requestRoot() }
+        binding.switchDangerous.setOnCheckedChangeListener { _, checked ->
+            if (applyingDangerous) return@setOnCheckedChangeListener
+            if (checked && !rootGrantedFromStatus()) {
+                applyingDangerous = true
+                binding.switchDangerous.isChecked = false
+                applyingDangerous = false
+                Toast.makeText(this, R.string.dangerous_needs_root, Toast.LENGTH_LONG).show()
+                return@setOnCheckedChangeListener
+            }
+            Native.invoke { setDangerousMode(checked) }
+            Toast.makeText(this, R.string.dangerous_mode_hint, Toast.LENGTH_SHORT).show()
+        }
         binding.btnStart.setOnClickListener { startHost() }
         binding.btnStop.setOnClickListener {
             HostForegroundService.stop(this)
+            applyingDangerous = true
+            binding.switchDangerous.isChecked = false
+            applyingDangerous = false
             binding.statusText.text = getString(R.string.status_stopped)
             refreshAgentsPanel()
         }
@@ -94,8 +114,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** The row is the entry point. The agent screen for [row] is not built yet. */
-    @Suppress("UNUSED_PARAMETER")
+    /** Drill-down: one installed agent, its session history on this phone. */
     private fun openAgent(row: AgentRow) {
+        startActivity(AgentDetailActivity.intent(this, row.instanceId))
     }
 
     override fun onNewIntent(intent: android.content.Intent) {
@@ -108,10 +129,18 @@ class MainActivity : AppCompatActivity() {
     private fun handleDeviceIntent(intent: android.content.Intent?) {
         val permission = intent?.getStringExtra(DevicePermissions.EXTRA_PERMISSION)
         val usbDevice = intent?.getStringExtra(DevicePermissions.EXTRA_USB_DEVICE)
-        if (permission == null && usbDevice == null) return
+        val screen = intent?.getStringExtra(DevicePermissions.EXTRA_SCREEN)
+        if (permission == null && usbDevice == null && screen == null) return
         selectNav(agents = false)
         if (permission != null) requestDevicePermissions(permission)
         if (usbDevice != null) requestUsbPermission(usbDevice)
+        if (screen == "accessibility") openScreenControlSettings()
+        if (screen == "projection") ScreenCaptureConsentActivity.launch(this)
+    }
+
+    private fun openScreenControlSettings() {
+        Toast.makeText(this, R.string.screen_control_hint, Toast.LENGTH_LONG).show()
+        startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
     }
 
     private fun requestDevicePermissions(only: String?) {
@@ -255,7 +284,48 @@ class MainActivity : AppCompatActivity() {
                 Native.probeSummary(home, packageName)
             }
             binding.statusText.text = json
+            applyRootUi(json)
         }
+    }
+
+    private fun requestRoot() {
+        if (!Native.loaded) {
+            Toast.makeText(this, R.string.native_required, Toast.LENGTH_LONG).show()
+            return
+        }
+        lifecycleScope.launch {
+            binding.statusText.text = getString(R.string.root_requesting)
+            val json = withContext(Dispatchers.IO) { Native.invoke { requestRoot() } }
+            binding.statusText.text = json
+            applyRootUi(json)
+            val obj = runCatching { JSONObject(json) }.getOrNull()
+            val message = when {
+                obj?.optBoolean("su_granted") == true -> R.string.root_granted
+                obj?.optBoolean("su_denied") == true -> R.string.root_denied
+                obj?.optBoolean("su_timed_out") == true -> R.string.root_timeout
+                else -> R.string.root_unavailable
+            }
+            Toast.makeText(this@MainActivity, message, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun applyRootUi(json: String) {
+        val obj = runCatching { JSONObject(json) }.getOrNull()
+        val granted = obj?.optBoolean("su_granted") == true
+            || obj?.optString("profile") == "root-shell"
+        binding.switchDangerous.isEnabled = granted
+        if (!granted && binding.switchDangerous.isChecked) {
+            applyingDangerous = true
+            binding.switchDangerous.isChecked = false
+            applyingDangerous = false
+            Native.invoke { setDangerousMode(false) }
+        }
+    }
+
+    private fun rootGrantedFromStatus(): Boolean {
+        val json = binding.statusText.text?.toString().orEmpty()
+        val obj = runCatching { JSONObject(json) }.getOrNull() ?: return false
+        return obj.optBoolean("su_granted") || obj.optString("profile") == "root-shell"
     }
 
     private fun startHost() {
@@ -277,6 +347,7 @@ class MainActivity : AppCompatActivity() {
         }
         val token = binding.tokenInput.text?.toString()?.trim().orEmpty()
         val name = binding.nameInput.text?.toString()?.trim().orEmpty()
+        Native.invoke { setDangerousMode(binding.switchDangerous.isChecked) }
         HostForegroundService.start(this, gateway, token, name)
         binding.statusText.text = getString(R.string.status_starting)
         binding.root.postDelayed({
@@ -290,6 +361,7 @@ class MainActivity : AppCompatActivity() {
         lifecycleScope.launch {
             val json = withContext(Dispatchers.IO) { Native.nodeStatus() }
             binding.statusText.text = json
+            applyRootUi(json)
         }
     }
 

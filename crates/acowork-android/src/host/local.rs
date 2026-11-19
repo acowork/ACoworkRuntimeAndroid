@@ -18,6 +18,7 @@ use tokio::process::Command;
 
 use super::facts::FsRoot;
 use super::probe::{CommandOutput, PROBE_ITEM_TIMEOUT, ProbeCommand, ProbeError, ProbeRunner};
+use super::profile::ShellPaths;
 use super::spawn::run_captured;
 
 /// Output cap for a single local probe command. Same number as the adb harness: larger than any
@@ -84,6 +85,33 @@ impl LocalHost {
     }
 
     async fn probe_line(&self, line: &str) -> Result<CommandOutput, ProbeError> {
+        self.probe_line_timed(line, PROBE_ITEM_TIMEOUT).await
+    }
+
+    /// One probe line with an explicit timeout (Magisk grant UI needs tens of seconds).
+    pub async fn run_timed(
+        &self,
+        command: ProbeCommand,
+        timeout: Duration,
+    ) -> Result<CommandOutput, ProbeError> {
+        if command.is_mutating() {
+            return Err(ProbeError::Runner(format!(
+                "`{}` mutates device state; the on-device runner will not run it. Probe item 7b \
+                 needs an explicit operator decision, not a side effect of starting the node.",
+                command.command_line()
+            )));
+        }
+        if let Some(out) = su_path_from_stat(command) {
+            return Ok(out);
+        }
+        self.probe_line_timed(&su_aware_line(command), timeout).await
+    }
+
+    async fn probe_line_timed(
+        &self,
+        line: &str,
+        timeout: Duration,
+    ) -> Result<CommandOutput, ProbeError> {
         let started = std::time::Instant::now();
         let mut command = Command::new(&self.shell);
         // `-c` + one argument: the probe line is meant to be parsed by the shell. Inherited
@@ -108,7 +136,7 @@ impl LocalHost {
             child,
             String::new(),
             PROBE_OUTPUT_CAP,
-            Some(PROBE_ITEM_TIMEOUT),
+            Some(timeout),
             started,
         )
         .await
@@ -122,6 +150,24 @@ impl LocalHost {
             duration_ms: None,
         })
     }
+}
+
+/// Prefer an absolute Magisk/KSU `su` so the packaged ash PATH does not have to
+/// contain the overlay.
+fn su_aware_line(command: ProbeCommand) -> String {
+    if matches!(command, ProbeCommand::Su) {
+        let su = ShellPaths::resolve_su().unwrap_or_else(|| PathBuf::from("su"));
+        return format!("{} -c 'id -u; cat /proc/self/attr/current'", su.display());
+    }
+    command.command_line().into_owned()
+}
+
+/// Item 4a via `stat`, not `command -v`: Magisk overlay is not on untrusted_app PATH.
+fn su_path_from_stat(command: ProbeCommand) -> Option<CommandOutput> {
+    if !matches!(command, ProbeCommand::SuPath) {
+        return None;
+    }
+    ShellPaths::resolve_su().map(|p| CommandOutput::ok(&p.display().to_string()))
 }
 
 fn resolve_shell() -> Option<PathBuf> {
@@ -187,7 +233,10 @@ impl ProbeRunner for LocalHost {
                 command.command_line()
             )));
         }
-        self.probe_line(command.command_line().as_ref()).await
+        if let Some(out) = su_path_from_stat(command) {
+            return Ok(out);
+        }
+        self.probe_line(&su_aware_line(command)).await
     }
 
     async fn discover_fs_roots(&self, own_package: &str) -> Result<Vec<FsRoot>, ProbeError> {
@@ -272,6 +321,21 @@ mod tests {
         }
         assert!(CANDIDATE_ROOTS.contains(&"/data/local/tmp"));
         assert!(CANDIDATE_ROOTS.contains(&"/sdcard"));
+    }
+
+    #[test]
+    fn su_probe_prefers_an_absolute_helper() {
+        let line = su_aware_line(ProbeCommand::Su);
+        if let Some(su) = ShellPaths::resolve_su() {
+            assert!(
+                line.starts_with(&su.display().to_string()),
+                "expected {}…, got {line}",
+                su.display()
+            );
+        } else {
+            assert!(line.starts_with("su -c "), "{line}");
+        }
+        assert!(line.contains("id -u"), "{line}");
     }
 
     #[tokio::test]

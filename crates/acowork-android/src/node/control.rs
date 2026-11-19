@@ -42,6 +42,10 @@ pub struct ControlCtx<'a> {
     pub tags: &'a [String],
     /// Advertised Node HTTP base (`http://host:port`) for Runtime announce.
     pub http_endpoint: &'a str,
+    /// Own package name for HostProfile fs_roots.
+    pub package: &'a str,
+    /// Session dangerous-mode forwarded to Runtime children.
+    pub dangerous_mode: bool,
 }
 
 /// Handle one inbound MQTT publish that may be a control command.
@@ -364,6 +368,8 @@ pub async fn start_agent(
         // ADR-055 §6.3: Node LAN base so Runtime publishes
         // `{base}/agents/{id}` instead of unreachable 127.0.0.1.
         http_advertise_endpoint: Some(ctx.http_endpoint.to_string()),
+        package: Some(ctx.package.to_string()),
+        dangerous_mode: ctx.dangerous_mode,
     };
     let handle = ctx
         .table

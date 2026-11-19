@@ -34,6 +34,7 @@ object DeviceBridge {
     private val cameraOwner = AtomicReference<String?>(null)
     private val micOwner = AtomicReference<String?>(null)
     private val bleScanOwner = AtomicReference<String?>(null)
+    private val screenOwner = AtomicReference<String?>(null)
     private val inflight = AtomicInteger(0)
     private val auditLock = Any()
     private var server: LocalServerSocket? = null
@@ -125,6 +126,10 @@ object DeviceBridge {
     fun bleScanHolder(): String? = bleScanOwner.get()
     fun releaseBleScan() { bleScanOwner.set(null) }
 
+    fun tryAcquireScreen(agent: String): Boolean = screenOwner.compareAndSet(null, agentLabel(agent))
+    fun screenHolder(): String? = screenOwner.get()
+    fun releaseScreen() { screenOwner.set(null) }
+
     fun busyMessage(resource: String, holder: String?): String =
         "$resource is in use" + if (holder.isNullOrBlank()) "" else " by $holder"
 
@@ -137,6 +142,7 @@ object DeviceBridge {
         .put("camera", cameraOwner.get() ?: JSONObject.NULL)
         .put("microphone", micOwner.get() ?: JSONObject.NULL)
         .put("ble_scan", bleScanOwner.get() ?: JSONObject.NULL)
+        .put("screen", screenOwner.get() ?: JSONObject.NULL)
 
     fun pushKind(kind: String) { host?.pushDeviceKind(kind) }
     fun popKind(kind: String) { host?.popDeviceKind(kind) }
@@ -218,6 +224,7 @@ object DeviceBridge {
                 "android_ble_scan" -> BleScanHandler.scan(appContext, handler, workDir, args, agent)
                 "android_ble_gatt" -> BleGattHandler.handle(appContext, handler, args, agent)
                 "android_usb_hid" -> UsbHidHandler.handle(appContext, handler, workDir, args, agent)
+                "android_use" -> AndroidUseHandler.handle(appContext, workDir, args, agent)
                 else -> DeviceJson.err("invalid_argument", "unknown device tool $tool")
             }
         } catch (t: DeviceBusyException) {

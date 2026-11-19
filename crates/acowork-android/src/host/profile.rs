@@ -72,9 +72,10 @@ pub enum HostProfileName {
 impl HostProfileName {
     /// True when this profile can spawn processes at all.
     ///
-    /// `ApkSandbox` cannot, which is why ADR-AND-001 §7.3 rules that
-    /// `dangerous-mode` has no APK UI switch: there is no shell and no `su` on
-    /// that profile, so `android:fs:system` is simply unreachable there.
+    /// `ApkSandbox` cannot. ADR-AND-001 §7.3 withheld the APK dangerous-mode
+    /// switch while that was the only APK profile. Magisk `su` can lift the
+    /// same APK into `RootShell`; the switch is then a session flag, not a
+    /// settings field.
     pub fn has_shell(&self) -> bool {
         !matches!(self, HostProfileName::ApkSandbox)
     }
@@ -140,8 +141,13 @@ impl ShellPaths {
         "/sbin/su",
         "/system/bin/su",
         "/system/xbin/su",
-        "/data/adb/magisk/su",
         "/debug_ramdisk/su",
+        "/debug_ramdisk/bin/su",
+        "/data/adb/magisk/su",
+        "/data/adb/ksu/bin/su",
+        "/data/local/xbin/su",
+        "/data/local/bin/su",
+        "/su/bin/su",
     ];
 
     /// The Android default: system shell present, nothing else resolved yet.
@@ -163,7 +169,31 @@ impl ShellPaths {
             .iter()
             .map(PathBuf::from)
             .find(|p| p.exists())
+            .or_else(magisk_tmp_su)
     }
+}
+
+/// Magisk 26+ may keep `su` only on its tmpfs, whose mountpoint is not always
+/// one of [`ShellPaths::SU_CANDIDATES`].
+fn magisk_tmp_su() -> Option<PathBuf> {
+    let mounts = std::fs::read_to_string("/proc/self/mounts").ok()?;
+    for line in mounts.lines() {
+        let mut parts = line.split_whitespace();
+        let src = parts.next().unwrap_or("");
+        let dest = parts.next().unwrap_or("");
+        if !(src.contains("magisk")
+            || dest.contains("magisk")
+            || dest == "/debug_ramdisk"
+            || dest == "/sbin")
+        {
+            continue;
+        }
+        let su = PathBuf::from(dest).join("su");
+        if su.is_file() {
+            return Some(su);
+        }
+    }
+    None
 }
 
 impl Default for ShellPaths {
@@ -375,6 +405,16 @@ impl HostProfile {
         // ShellBackend does not fall back to /system/bin/sh (shell_exec).
         if let Some(sh) = crate::host::local::resolved_shell_path() {
             paths.system_sh = sh;
+        }
+        // Item 4 can succeed via PATH while item 4a prints nothing (Magisk
+        // overlay not on the packaged ash PATH). RootShellBackend will not
+        // construct without an absolute helper. Only fill from a local stat
+        // on-device — adb assemble must not Path::exists() the desktop FS.
+        if paths.su.is_none() && su.got_root() {
+            #[cfg(target_os = "android")]
+            {
+                paths.su = ShellPaths::resolve_su();
+            }
         }
 
         // ── Item 6: applets ────────────────────────────────────────────────

@@ -33,6 +33,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "android_ble_scan",
     "android_ble_gatt",
     "android_usb_hid",
+    "android_use",
 ];
 
 /// One tool call from the engine.
@@ -296,9 +297,10 @@ mod tests {
 
     #[test]
     fn tool_name_list_matches_the_design() {
-        assert_eq!(TOOL_NAMES.len(), 8);
+        assert_eq!(TOOL_NAMES.len(), 9);
         assert!(TOOL_NAMES.contains(&"android_usb_hid"));
         assert!(TOOL_NAMES.contains(&"android_device_status"));
+        assert!(TOOL_NAMES.contains(&"android_use"));
     }
 
     #[cfg(unix)]

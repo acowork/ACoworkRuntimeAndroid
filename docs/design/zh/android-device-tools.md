@@ -1,9 +1,9 @@
 # Android 设备内置工具
 
-- **状态**：已实现。桥、八个工具、权限入口和前台服务类型都在代码里。真机步骤见 `apps/android/DEVICE_SMOKE.md`。
+- **状态**：已实现。桥、九个工具（含 `android_use`）、权限入口和前台服务类型都在代码里。真机步骤见 `apps/android/DEVICE_SMOKE.md`。
 - **日期**：2026-11-19
 - **相关**：[ADR-AND-001](../../adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md)、[ADR-AND-003](../../adr/zh/ADR-AND-003-independent-engine-and-spawn-contract.md)
-- **目的**：让装在手机上的 agent 使用 App 进程里已经能申请到的硬件能力（拍照、录像、录音、播放、BLE、USB HID）。这些能力走一组只在本 App 注册的内置工具，安装后默认开启。工具的参数按公开 Android SDK 留全，用法由以后的 skill 来写。
+- **目的**：让装在手机上的 agent 使用 App 进程里已经能申请到的硬件能力（拍照、录像、录音、播放、BLE、USB HID），以及无障碍 + 投屏授权下的屏幕观察/点击（`android_use`，对标 PC computer-use）。这些能力走一组只在本 App 注册的内置工具，安装后默认开启。工具的参数按公开 Android SDK 留全，用法由以后的 skill 来写。
 
 ---
 
@@ -32,11 +32,11 @@ sequenceDiagram
 
 ## 2. 注册与默认开启
 
-八个工具只在 `android-host` 打开、且环境变量 `ACOWORK_DEVICE_BRIDGE` 有值时注册。桌面 runtime 不编这组工具，创建 agent 的向导列表 [`BUILTIN_TOOLS`](../../../crates/vendor/acowork-core/src/tools/mod.rs) 也不加入它们。手机上该 agent 的 Tools 面板能看到它们，因为 runtime 会把它们写进 `{work_dir}/config/agent_tools.json`。
+这些工具只在 `android-host` 打开时注册。桌面 runtime 不编这组工具，创建 agent 的向导列表 [`BUILTIN_TOOLS`](../../../crates/vendor/acowork-core/src/tools/mod.rs) 也不加入它们。手机上该 agent 的 Tools 面板能看到它们，因为 runtime 会把它们写进 `{work_dir}/config/agent_tools.json`。
 
 现有规则会把新工具关掉：首次启动只打开 manifest `[[tools]]` 里点名的工具（[`init_tools_config_from_manifest`](../../../crates/vendor/acowork-runtime/src/agent_config.rs)），之后新出现的工具在 [`merge_tools_config`](../../../crates/vendor/acowork-runtime/src/agent_config.rs) 里默认 `enabled = false`。手机上装的 agent 包不会列出这些名字。
 
-例外只覆盖下面这八个名字，并且只在桥存在时生效：
+例外只覆盖下面这些名字，并且只在手机引擎里生效：
 
 - `android_device_status`
 - `android_photo`
@@ -46,6 +46,7 @@ sequenceDiagram
 - `android_ble_scan`
 - `android_ble_gatt`
 - `android_usb_hid`
+- `android_use`
 
 第一次写入 `agent_tools.json` 时，这组工具 `enabled = true`，不管 manifest 有没有写。升级后第一次出现在代码注册表里时，同样默认打开。文件里已经有这一行时，沿用用户的开关。
 
@@ -190,6 +191,20 @@ agent 用它判断要不要请用户去点通知。
 
 `list` 的每台设备带上：`deviceId`、`deviceName`、vid、pid、device class / subclass / protocol、厂商、产品、序列号、版本、`hasPermission`；每个 configuration 的 id、name、max power、self powered、remote wakeup；每个 interface 的 id、alternate、class / subclass / protocol、name；每个 endpoint 的 address、number、direction、type、maxPacketSize、interval、attributes。
 
+### 4.9 `android_use`
+
+一个工具覆盖屏幕观察和点击，不把拍照/BLE/USB 塞进来。`op`：
+
+- `status`：无障碍是否开启/已连接、MediaProjection 是否已授权、各 `Display` 的宽高 dpi 旋转。不弹框。
+- `screenshot`：JPEG。API 30+ 走 `AccessibilityService.takeScreenshot`；更低版本（含 BLA-AL00 的 29）走 `MediaProjection` + `ImageReader`。`max_edge` 默认 1280。`include_tree` 可附带控件树。
+- `snapshot`：只走无障碍窗口树（`getWindows` / `rootInActiveWindow`），带 class、view_id、text、contentDescription、bounds、clickable 等。
+- `tap` / `long_press` / `swipe` / `drag` / `gesture`：`dispatchGesture`。坐标默认屏幕像素，`normalized=true` 时为 0–1。
+- `type`：对焦的可编辑节点，或 `selector`，`ACTION_SET_TEXT`。不能注入 `KeyEvent`。
+- `node`：`performAction`（click、long_click、scroll_*、set_text、ime_enter…）。
+- `global`：`performGlobalAction`（back、home、recents、notifications…）。
+
+动作默认再截一张图（`include_screenshot`，可用 `wait_ms`）。`FLAG_SECURE`、锁屏密码、系统权限框点不到。无障碍必须用户在系统设置里打开；API 29 截屏还要再同意一次投屏。屏幕一把独占锁。
+
 ## 5. 设备桥
 
 [`HostForegroundService`](../../../apps/android/app/src/main/java/com/acowork/androidhost/HostForegroundService.kt) 在 `Native.startNode` 之前拉起桥，停服务时关掉。
@@ -200,7 +215,7 @@ agent 用它判断要不要请用户去点通知。
 
 协议是一行一个 JSON，带版本号。Kotlin 与 Rust 各写一份结构。照片和音视频不走 socket，只走路径。
 
-前台服务类型从现在的单独 `dataSync` 改成清单里声明 `dataSync|camera|microphone|mediaPlayback|connectedDevice`。启动时仍然只用 `dataSync`。某次操作开始前，在已经授予对应权限的前提下，`startForeground` 加上那一种类型，通知文案写成正在使用摄像头、麦克风、蓝牙或 USB，做完退回 `dataSync`。没授权就不带上那种类型，否则 `startForeground` 会抛 `SecurityException`。USB 和 BLE 共用 `connectedDevice`。
+前台服务类型从现在的单独 `dataSync` 改成清单里声明 `dataSync|camera|microphone|mediaPlayback|connectedDevice|mediaProjection`。启动时仍然只用 `dataSync`。某次操作开始前，在已经授予对应权限的前提下，`startForeground` 加上那一种类型，通知文案写成正在使用摄像头、麦克风、蓝牙、USB 或屏幕，做完退回 `dataSync`。没授权就不带上那种类型，否则 `startForeground` 会抛 `SecurityException`。USB 和 BLE 共用 `connectedDevice`。`android_use` 的 MediaProjection 截屏带上 `mediaProjection`。
 
 权限在现有 `CAMERA`（目前只给扫码）之外补上：
 
@@ -209,6 +224,7 @@ agent 用它判断要不要请用户去点通知。
 - `FOREGROUND_SERVICE_MICROPHONE`
 - `FOREGROUND_SERVICE_MEDIA_PLAYBACK`
 - `FOREGROUND_SERVICE_CONNECTED_DEVICE`
+- `FOREGROUND_SERVICE_MEDIA_PROJECTION`
 - `BLUETOOTH_SCAN`（`neverForLocation`）
 - `BLUETOOTH_CONNECT`
 - API 30 及以下的 `BLUETOOTH`、`BLUETOOTH_ADMIN`
@@ -226,8 +242,8 @@ USB Host 没有运行时权限字符串。声明 `android.hardware.usb.host` 且
 | 层 | 行为 |
 |---|---|
 | 连接 | 每次工具调用一条短 Unix 连接。accept 线程不跑硬件。工作线程 `core=4 / max=16`，队列是 `SynchronousQueue`：第 17 路立刻 `busy`，不排队 |
-| 独占 | 相机、麦克风、BLE scan 各一把 CAS 锁，占用者是 `agent_id`。GATT 按地址、USB 按 `deviceId` 归属到打开它的 agent；别人碰返回 `busy` |
-| 可并行 | `android_device_status`、不同地址的 GATT、不同 USB 设备、录音与播放、最多 4 路播放 |
+| 独占 | 相机、麦克风、BLE scan、屏幕（`android_use` 除 status 外）各一把 CAS 锁，占用者是 `agent_id`。GATT 按地址、USB 按 `deviceId` 归属到打开它的 agent；别人碰返回 `busy` |
+| 可并行 | `android_device_status`、`android_use` 的 `status`、不同地址的 GATT、不同 USB 设备、录音与播放、最多 4 路播放 |
 | 会话内 | 同一条 GATT 连接、同一台 USB 设备上的 transfer 串行，避免回调 latch 和 `UsbDeviceConnection` 交叉 |
 | 客户端 | `connect` 在 `NotFound` / `ConnectionRefused` 上退避重试约 300ms，避免引擎比桥的 listen 更早起来 |
 
@@ -240,7 +256,7 @@ USB Host 没有运行时权限字符串。声明 `android.hardware.usb.host` 且
 - `crates/acowork-android/src/device/`：协议结构、socket 客户端、错误码。引擎和单测都能用，不碰 Android SDK。
 - `crates/vendor/acowork-runtime/src/tools/builtin/android_device/`：`Tool` 实现，`cfg(feature = "android-host")`。在 [`all_builtin_tools`](../../../crates/vendor/acowork-runtime/src/tools/builtin/mod.rs) 里，仅当 `ACOWORK_DEVICE_BRIDGE` 已设置时追加。schema 按本文第 4 节一次定完。
 - `apps/android`：桥的 Server、各 handler、权限入口、前台服务类型切换。拍摄和录像用 Camera2。`CaptureRequest`、`CaptureResult`、`CameraCharacteristics` 的键表按 compileSdk 35 的公开常量生成，不手抄一份短名单。
-- 默认开启的例外写在 `init_tools_config_from_manifest` 和 `merge_tools_config`。名单是第 2 节的八个名字，桥不在就不生效。
+- 默认开启的例外写在 `init_tools_config_from_manifest` 和 `merge_tools_config`。名单是第 2 节的名字。
 
 ## 7. 实现顺序
 

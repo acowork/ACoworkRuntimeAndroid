@@ -123,6 +123,7 @@ class HostForegroundService : Service() {
         if (deviceKinds.containsKey("microphone")) parts += "microphone"
         if (deviceKinds.containsKey("media")) parts += "playback"
         if (deviceKinds.containsKey("connected")) parts += "bluetooth/usb"
+        if (deviceKinds.containsKey("projection")) parts += "screen"
         return "Using " + parts.joinToString(", ")
     }
 
@@ -139,6 +140,9 @@ class HostForegroundService : Service() {
         }
         if (deviceKinds.containsKey("connected") && connectedTypeAllowed()) {
             type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+        }
+        if (deviceKinds.containsKey("projection") && Build.VERSION.SDK_INT >= 29) {
+            type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
         }
         return type
     }

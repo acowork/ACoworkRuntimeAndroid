@@ -556,6 +556,17 @@ async fn execute_via_android_backend(
         request.cwd = Some(PathBuf::from(dir));
     }
 
+    if let Err(refusal) = acowork_android::host::exec_allowed(backend.profile(), &request, true)
+    {
+        return Ok(ToolResult {
+            content_parts: None,
+            ok: false,
+            content: String::new(),
+            error: Some(format!("android host gate: {refusal}")),
+            token_usage: None,
+        });
+    }
+
     match backend.exec(request).await {
         Ok(record) => {
             let content = if record.stderr.is_empty() {

@@ -5,6 +5,7 @@
 
 #![allow(non_snake_case)]
 
+mod jni_exports;
 mod node_host;
 
 use std::path::PathBuf;
@@ -15,7 +16,7 @@ use jni::sys::jstring;
 use once_cell::sync::OnceCell;
 
 use acowork_android::host::{
-    HostConfig, HostProfile, LocalHost, ProbeCommand, catalog, run_probe,
+    HostConfig, HostProfile, LocalHost, ProbeCommand, ShellPaths, catalog, run_probe,
 };
 use acowork_android::node::capability_tags;
 
@@ -93,8 +94,12 @@ pub extern "system" fn Java_com_acowork_androidhost_Native_probeSummary(
             "ok": true,
             "profile": profile.name.as_str(),
             "privilege": format!("{:?}", profile.privilege),
+            "su_granted": profile.su.got_root(),
+            "su_denied": profile.su.prompt_denied,
+            "su_path": profile.paths.su.as_ref().map(|p| p.display().to_string()),
             "caps": tags,
             "home": home.display().to_string(),
+            "dangerous_mode": acowork_android::host::dangerous_mode(),
         })
         .to_string())
     })()
@@ -204,6 +209,7 @@ pub extern "system" fn Java_com_acowork_androidhost_Native_startNode(
                 } else {
                     Some(PathBuf::from(engine_path))
                 },
+                dangerous_mode: acowork_android::host::dangerous_mode(),
             },
         )
     })()
@@ -228,4 +234,89 @@ pub extern "system" fn Java_com_acowork_androidhost_Native_nodeStatus(
     _class: JClass,
 ) -> jstring {
     jstring(&mut env, node_host::status_json())
+}
+
+/// `Native.setDangerousMode(enabled: Boolean): String`
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_acowork_androidhost_Native_setDangerousMode(
+    mut env: JNIEnv,
+    _class: JClass,
+    enabled: jni::sys::jboolean,
+) -> jstring {
+    let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        acowork_android::host::set_dangerous_mode(enabled != 0);
+        serde_json::json!({
+            "ok": true,
+            "dangerous_mode": acowork_android::host::dangerous_mode(),
+        })
+        .to_string()
+    }))
+    .unwrap_or_else(|_| err_json("setDangerousMode panicked"));
+    jstring(&mut env, body)
+}
+
+/// `Native.requestRoot(): String` — Magisk/KSU grant prompt (up to 60s).
+///
+/// Does not exec `su` unless a helper is actually present. On a stock phone
+/// that would wait 60s (or abort under OEM root-detection).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_acowork_androidhost_Native_requestRoot(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    init_log();
+    let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(request_root_json))
+        .unwrap_or_else(|_| err_json("requestRoot panicked"));
+    jstring(&mut env, body)
+}
+
+fn request_root_json() -> String {
+    (|| -> Result<String, String> {
+        let host = LocalHost::new().map_err(|e| e.to_string())?;
+        let probe = rt().block_on(async {
+            let mut out = acowork_android::host::ProbeOutput::default();
+            out.su_path = host
+                .run_timed(ProbeCommand::SuPath, std::time::Duration::from_secs(2))
+                .await
+                .ok();
+            let has_helper = ShellPaths::resolve_su().is_some()
+                || out
+                    .su_path
+                    .as_ref()
+                    .is_some_and(|o| o.succeeded() && !o.stdout.trim().is_empty());
+            if has_helper {
+                out.su = host
+                    .run_timed(ProbeCommand::Su, std::time::Duration::from_secs(60))
+                    .await
+                    .ok();
+            }
+            out.id = host
+                .run_timed(ProbeCommand::Id, std::time::Duration::from_secs(2))
+                .await
+                .ok();
+            out.system_sh_version = host
+                .run_timed(
+                    ProbeCommand::SystemShVersion,
+                    std::time::Duration::from_secs(2),
+                )
+                .await
+                .ok();
+            out
+        });
+        let profile = HostProfile::assemble(&probe, "com.acowork.androidhost");
+        let tags = capability_tags(&profile);
+        Ok(serde_json::json!({
+            "ok": true,
+            "profile": profile.name.as_str(),
+            "su_granted": profile.su.got_root(),
+            "su_denied": profile.su.prompt_denied,
+            "su_unavailable": profile.su.unavailable || probe.su.is_none(),
+            "su_timed_out": probe.su.as_ref().is_some_and(|o| o.timed_out),
+            "su_path": profile.paths.su.as_ref().map(|p| p.display().to_string()),
+            "caps": tags,
+            "jni_rev": crate::jni_exports::JNI_EXPORT_REV,
+        })
+        .to_string())
+    })()
+    .unwrap_or_else(err_json)
 }

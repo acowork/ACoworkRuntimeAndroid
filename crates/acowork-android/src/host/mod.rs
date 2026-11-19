@@ -68,6 +68,7 @@ pub mod probe;
 pub mod profile;
 pub mod rollback;
 pub mod script;
+pub mod session_flag;
 pub mod spawn;
 pub mod tools;
 
@@ -122,6 +123,7 @@ pub use probe::{
     ProbeRunner, SPOT_CHECK_APPLETS, all_commands, parse_spot_checks, run_probe,
 };
 pub use profile::{HostCapabilitySummary, HostProfile, HostProfileName, ShellPaths};
+pub use session_flag::{dangerous_mode, decide_exec, exec_allowed, set_dangerous_mode};
 pub use rollback::{
     Capture, FilePreState, PackagePreState, Plan, PreState, RestoreReport, ReversibleBackend,
     RollbackLedger, SNAPSHOT_BUDGET_BYTES, SNAPSHOT_CHUNK_BYTES, SNAPSHOT_STAGING_DIR,

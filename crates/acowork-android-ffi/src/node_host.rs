@@ -39,6 +39,8 @@ pub struct StartArgs {
     pub package_name: String,
     /// Absolute path to the packaged CLI engine (`libacowork_engine.so`).
     pub engine_path: Option<PathBuf>,
+    /// Session dangerous-mode. Never persisted.
+    pub dangerous_mode: bool,
 }
 
 struct Lifecycle {
@@ -51,6 +53,7 @@ struct Lifecycle {
 struct HostState {
     lifecycle: Mutex<Lifecycle>,
     status: Mutex<String>,
+    profile: Mutex<String>,
 }
 
 static STATE: OnceCell<HostState> = OnceCell::new();
@@ -62,6 +65,7 @@ fn state() -> &'static HostState {
             stop_tx: None,
         }),
         status: Mutex::new(json!({ "ok": true, "running": false }).to_string()),
+        profile: Mutex::new(String::new()),
     })
 }
 
@@ -72,15 +76,34 @@ fn set_status(value: serde_json::Value) {
 }
 
 pub fn status_json() -> String {
-    state()
+    let raw = state()
         .status
         .lock()
         .map(|g| g.clone())
-        .unwrap_or_else(|_| err_json("status lock poisoned"))
+        .unwrap_or_else(|_| err_json("status lock poisoned"));
+    let mut value: serde_json::Value =
+        serde_json::from_str(&raw).unwrap_or_else(|_| json!({ "ok": false, "error": raw }));
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "dangerous_mode".into(),
+            json!(acowork_android::host::dangerous_mode()),
+        );
+        if let Ok(profile) = state().profile.lock()
+            && !profile.is_empty()
+            && let Ok(extra) = serde_json::from_str::<serde_json::Value>(&profile)
+            && let Some(map) = extra.as_object()
+        {
+            for (k, v) in map {
+                obj.entry(k.clone()).or_insert(v.clone());
+            }
+        }
+    }
+    value.to_string()
 }
 
 pub fn stop() -> Result<String, String> {
     signal_stop();
+    acowork_android::host::set_dangerous_mode(false);
     set_status(json!({ "ok": true, "running": false, "stopped": true }));
     Ok(json!({ "ok": true, "running": false }).to_string())
 }
@@ -195,11 +218,21 @@ async fn run_loop(args: StartArgs, mut stop_rx: watch::Receiver<bool>) -> Result
     )
     .map_err(|e| e.to_string())?;
 
+    acowork_android::host::set_dangerous_mode(args.dangerous_mode);
     let host = LocalHost::new().map_err(|e| e.to_string())?;
     let probe = run_probe(&host, &ProbeCommand::read_only_set(), &args.package_name).await;
     let profile = HostProfile::assemble(&probe, &args.package_name);
     let _ = HostConfig::load(&args.home).map_err(|e| e.to_string())?;
     let tags = capability_tags(&profile);
+    if let Ok(mut g) = state().profile.lock() {
+        *g = json!({
+            "profile": profile.name.as_str(),
+            "su_granted": profile.su.got_root(),
+            "su_denied": profile.su.prompt_denied,
+            "su_path": profile.paths.su.as_ref().map(|p| p.display().to_string()),
+        })
+        .to_string();
+    }
     // Engine may be absent until libacowork_engine.so is packaged; enroll/ping still work.
     let engine = resolve_engine(args.engine_path.as_ref()).unwrap_or_else(|e| {
         tracing::warn!("{e}");
@@ -288,6 +321,8 @@ async fn run_loop(args: StartArgs, mut stop_rx: watch::Receiver<bool>) -> Result
         "node_id": identity.node_id,
         "node_name": identity.node_name,
         "profile": profile.name.as_str(),
+        "su_granted": profile.su.got_root(),
+        "su_denied": profile.su.prompt_denied,
         "caps": tags,
         "http_endpoint": http_endpoint,
         "packages": packages.agents.len(),
@@ -354,6 +389,8 @@ async fn run_loop(args: StartArgs, mut stop_rx: watch::Receiver<bool>) -> Result
                             root: &args.home,
                             tags: &tags,
                             http_endpoint: &http_endpoint,
+                            package: &args.package_name,
+                            dangerous_mode: acowork_android::host::dangerous_mode(),
                         };
                         handle_control(&pubmsg, &mut ctx).await;
                         let snap = identity_cell.read().await;

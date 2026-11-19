@@ -125,6 +125,9 @@ impl ProcessTable {
         // Device tools (camera, audio, BLE, USB HID) call back into the app
         // process. The token file is written when the bridge starts; engines
         // spawned before that simply do not see the tools.
+        if launch.dangerous_mode {
+            cmd.env("ACOWORK_DANGEROUS_MODE", "1");
+        }
         if let Some(home) = std::env::var_os("HOME") {
             // Do not rely on inherit: tokio Command may snapshot env without
             // later set_var mutations. Pass the node home explicitly.

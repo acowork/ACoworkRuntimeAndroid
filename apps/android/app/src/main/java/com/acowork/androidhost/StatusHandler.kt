@@ -197,6 +197,7 @@ object StatusHandler {
 object DevicePermissions {
     const val EXTRA_PERMISSION = "com.acowork.androidhost.EXTRA_PERMISSION"
     const val EXTRA_USB_DEVICE = "com.acowork.androidhost.EXTRA_USB_DEVICE"
+    const val EXTRA_SCREEN = "com.acowork.androidhost.EXTRA_SCREEN"
 
     fun declared(): List<String> {
         val names = mutableListOf(
@@ -237,10 +238,30 @@ object DevicePermissions {
     }
 
     fun usb(context: Context, deviceName: String) {
-        notify(context, null, deviceName)
+        notify(context, null, deviceName, null)
     }
 
-    private fun notify(context: Context, permission: String?, usbDevice: String?) {
+    fun requiredAccessibility(context: Context): JSONObject {
+        notifyAccessibility(context)
+        return DeviceJson.err(
+            "permission_required",
+            "Enable the ACowork Host accessibility service in Android Settings, then retry. The app cannot turn this on by itself.",
+        )
+    }
+
+    fun requiredProjection(context: Context): JSONObject {
+        notifyProjection(context)
+        return DeviceJson.err(
+            "permission_required",
+            "Grant screen capture from the ACowork Host notification, then retry. Needed for screenshots when Accessibility takeScreenshot is unavailable.",
+        )
+    }
+
+    fun notifyAccessibility(context: Context) = notify(context, null, null, "accessibility")
+
+    fun notifyProjection(context: Context) = notify(context, null, null, "projection")
+
+    private fun notify(context: Context, permission: String?, usbDevice: String?, screen: String? = null) {
         val channel = "acowork_device"
         if (Build.VERSION.SDK_INT >= 26) {
             val mgr = context.getSystemService(android.app.NotificationManager::class.java)
@@ -254,14 +275,17 @@ object DevicePermissions {
             flags = android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP or android.content.Intent.FLAG_ACTIVITY_NEW_TASK
             if (permission != null) putExtra(EXTRA_PERMISSION, permission)
             if (usbDevice != null) putExtra(EXTRA_USB_DEVICE, usbDevice)
+            if (screen != null) putExtra(EXTRA_SCREEN, screen)
         }
         val pi = android.app.PendingIntent.getActivity(
             context,
-            (permission ?: usbDevice ?: "device").hashCode(),
+            (permission ?: usbDevice ?: screen ?: "device").hashCode(),
             open,
             android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE,
         )
         val text = when {
+            screen == "accessibility" -> "Enable ACowork screen control"
+            screen == "projection" -> "Allow screen capture"
             usbDevice != null -> "USB device needs permission"
             permission != null -> "Allow $permission"
             else -> "Device permission needed"

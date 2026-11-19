@@ -41,4 +41,19 @@ object Native {
     ): String
     external fun stopNode(): String
     external fun nodeStatus(): String
+    external fun setDangerousMode(enabled: Boolean): String
+    external fun requestRoot(): String
+
+    /** JNI that must not crash the Activity if the .so is stale or panics. */
+    fun invoke(block: Native.() -> String): String {
+        if (!loaded) {
+            return """{"ok":false,"error":"${loadError ?: "native library not loaded"}"}"""
+        }
+        return try {
+            block()
+        } catch (t: Throwable) {
+            val msg = (t.message ?: t.toString()).replace("\\", "\\\\").replace("\"", "'")
+            """{"ok":false,"error":"${t.javaClass.simpleName}: $msg"}"""
+        }
+    }
 }

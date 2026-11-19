@@ -550,7 +550,10 @@ impl<R: SpawnRunner> RootShellBackend<R> {
         })?;
 
         Ok(RootShellBackend {
-            shell: profile.paths.system_sh.clone(),
+            // Magisk/KSU can exec /system/bin/sh. The APK overwrites
+            // `paths.system_sh` with packaged ash so untrusted_app can
+            // probe; an escalated command must not depend on app storage.
+            shell: PathBuf::from("/system/bin/sh"),
             default_budget: crate::host::backend::default_budget(),
             profile,
             runner,
@@ -1059,6 +1062,14 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("declined"), "{msg}");
         assert!(msg.contains("not retryable"), "{msg}");
+    }
+
+    #[test]
+    fn root_backend_ignores_the_apk_packaged_ash() {
+        let mut profile = rooted_profile();
+        profile.paths.system_sh = PathBuf::from("/data/app/libacowork_ash.so");
+        let backend = RootShellBackend::new(profile).unwrap();
+        assert_eq!(backend.shell_path(), Path::new("/system/bin/sh"));
     }
 
     #[test]
