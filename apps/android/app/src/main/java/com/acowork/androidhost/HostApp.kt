@@ -16,7 +16,17 @@ class HostApp : Application() {
             ).apply {
                 description = getString(R.string.notification_channel_desc)
             }
-            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+            val manager = getSystemService(NotificationManager::class.java)
+            manager.createNotificationChannel(channel)
+            manager.createNotificationChannel(
+                NotificationChannel(
+                    "acowork_device",
+                    getString(R.string.notification_channel_device),
+                    NotificationManager.IMPORTANCE_HIGH,
+                ).apply {
+                    description = getString(R.string.notification_channel_device)
+                },
+            )
         }
     }
 }

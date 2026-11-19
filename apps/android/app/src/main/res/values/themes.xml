@@ -5,4 +5,9 @@
         <item name="colorSecondary">#C45C26</item>
         <item name="android:statusBarColor">#1B4D3E</item>
     </style>
+
+    <style name="ShapeAppearance.ACowork.Avatar" parent="">
+        <item name="cornerFamily">rounded</item>
+        <item name="cornerSize">50%</item>
+    </style>
 </resources>

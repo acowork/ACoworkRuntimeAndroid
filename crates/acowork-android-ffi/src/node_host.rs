@@ -177,8 +177,9 @@ fn resolve_engine(path: Option<&PathBuf>) -> Result<EngineSpec, String> {
 
 async fn run_loop(args: StartArgs, mut stop_rx: watch::Receiver<bool>) -> Result<(), String> {
     std::fs::create_dir_all(&args.home).map_err(|e| e.to_string())?;
-    // PC Node browses via $HOME; set it to the node data home so /fs/browse
-    // root_entries match without Android-only plaster roots.
+    // Node data lives at `home`. Point $HOME there so `/fs/browse` offers
+    // that directory in the same HOME shortcut slot a PC node fills with
+    // the user home. Other volumes are probed the same way as /tmp or C:/.
     set_node_home(&args.home);
     // Previous host sessions can leave Runtime children with PPID=1. They keep
     // MQTT CONNECT alive (Desktop shows the agent "running") while advertising

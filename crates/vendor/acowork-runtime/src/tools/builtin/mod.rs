@@ -34,6 +34,8 @@
 //! `CONDITIONALLY_REGISTERED_TOOL_NAMES`, and its `BUILTIN_TOOLS`
 //! entry.
 
+#[cfg(feature = "android-host")]
+mod android_device;
 pub mod ask_user_question;
 pub mod chat_history_read;
 pub mod codebase;
@@ -179,6 +181,19 @@ pub fn all_builtin_tools(
 
     // Append platform-specific shell tools
     tools.extend(shell_tools);
+    // Phone engine only (`android-host`). Always register so the Tools panel
+    // lists them even if the bridge env was missing at spawn; invoke still
+    // fails with `bridge_unavailable` until the host socket is up.
+    #[cfg(feature = "android-host")]
+    {
+        let device_tools = android_device::tools();
+        eprintln!(
+            "acowork-android runtime: {} android device tools (bridge_active={})",
+            device_tools.len(),
+            acowork_android::device::bridge_active()
+        );
+        tools.extend(device_tools);
+    }
     tools
 }
 

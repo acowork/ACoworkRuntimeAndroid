@@ -122,6 +122,28 @@ impl ProcessTable {
                 cmd.env("ACOWORK_ASH", &ash);
             }
         }
+        // Device tools (camera, audio, BLE, USB HID) call back into the app
+        // process. The token file is written when the bridge starts; engines
+        // spawned before that simply do not see the tools.
+        if let Some(home) = std::env::var_os("HOME") {
+            // Do not rely on inherit: tokio Command may snapshot env without
+            // later set_var mutations. Pass the node home explicitly.
+            cmd.env("HOME", &home);
+            cmd.env("ACOWORK_NODE_HOME", &home);
+            if let Some(value) = crate::device::endpoint_from_home(std::path::Path::new(&home)) {
+                cmd.env(crate::device::ENV_BRIDGE, value);
+            } else {
+                eprintln!(
+                    "acowork-android control: device bridge token missing under {}",
+                    std::path::Path::new(&home).display()
+                );
+            }
+        } else {
+            eprintln!(
+                "acowork-android control: HOME unset — cannot inject {}",
+                crate::device::ENV_BRIDGE
+            );
+        }
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(stderr)

@@ -27,6 +27,8 @@ class HostForegroundService : Service() {
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     @Volatile private var everLostNetwork = false
     @Volatile private var startKey: String? = null
+    private var gatewayLabel: String = ""
+    private val deviceKinds = java.util.concurrent.ConcurrentHashMap<String, Int>()
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -34,6 +36,7 @@ class HostForegroundService : Service() {
         when (intent?.action) {
             ACTION_STOP -> {
                 startKey = null
+                DeviceBridge.stop()
                 if (Native.loaded) {
                     Native.stopNode()
                 }
@@ -52,6 +55,8 @@ class HostForegroundService : Service() {
                     ?: prefs().getString(PREF_NAME, "")
                     ?: ""
                 startAsForeground(gateway)
+                DeviceBridge.attach(this)
+                DeviceBridge.start(filesDir.resolve("acowork"))
                 startNative(gateway, token, name, force = false)
                 // Observe network only — MQTT soft-reconnect owns recovery.
                 // Restarting the whole native host here re-fires LWT and
@@ -67,6 +72,7 @@ class HostForegroundService : Service() {
             runCatching { connectivityManager().unregisterNetworkCallback(it) }
         }
         networkCallback = null
+        DeviceBridge.stop()
         if (Native.loaded) {
             Native.stopNode()
         }
@@ -75,28 +81,98 @@ class HostForegroundService : Service() {
     }
 
     private fun startAsForeground(gateway: String) {
+        gatewayLabel = gateway
+        refreshForeground()
+    }
+
+    /** Refcounted device-tool kinds. The notification and foreground type follow the set. */
+    @Synchronized
+    fun pushDeviceKind(kind: String) {
+        deviceKinds.merge(kind, 1, Int::plus)
+        runCatching { refreshForegroundLocked() }.onFailure {
+            Log.w(TAG, "foreground type update failed: ${it.message}")
+        }
+    }
+
+    @Synchronized
+    fun popDeviceKind(kind: String) {
+        deviceKinds.compute(kind) { _, n ->
+            val next = (n ?: 1) - 1
+            if (next <= 0) null else next
+        }
+        runCatching { refreshForegroundLocked() }.onFailure {
+            Log.w(TAG, "foreground type update failed: ${it.message}")
+        }
+    }
+
+    private fun refreshForeground() = synchronized(this) { refreshForegroundLocked() }
+
+    private fun refreshForegroundLocked() {
+        val notification = buildNotification(usageText())
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(NOTIFICATION_ID, notification, foregroundTypes())
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+    }
+
+    private fun usageText(): String {
+        if (deviceKinds.isEmpty()) return getString(R.string.notification_text, gatewayLabel)
+        val parts = mutableListOf<String>()
+        if (deviceKinds.containsKey("camera")) parts += "camera"
+        if (deviceKinds.containsKey("microphone")) parts += "microphone"
+        if (deviceKinds.containsKey("media")) parts += "playback"
+        if (deviceKinds.containsKey("connected")) parts += "bluetooth/usb"
+        return "Using " + parts.joinToString(", ")
+    }
+
+    private fun foregroundTypes(): Int {
+        var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+        if (Build.VERSION.SDK_INT >= 30 && deviceKinds.containsKey("camera") && granted(android.Manifest.permission.CAMERA)) {
+            type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+        }
+        if (Build.VERSION.SDK_INT >= 30 && deviceKinds.containsKey("microphone") && granted(android.Manifest.permission.RECORD_AUDIO)) {
+            type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+        }
+        if (deviceKinds.containsKey("media")) {
+            type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+        }
+        if (deviceKinds.containsKey("connected") && connectedTypeAllowed()) {
+            type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+        }
+        return type
+    }
+
+    private fun connectedTypeAllowed(): Boolean {
+        if (Build.VERSION.SDK_INT < 34) return true
+        if (Build.VERSION.SDK_INT >= 31 &&
+            (granted(android.Manifest.permission.BLUETOOTH_CONNECT) ||
+                granted(android.Manifest.permission.BLUETOOTH_SCAN))
+        ) {
+            return true
+        }
+        val usb = getSystemService(android.hardware.usb.UsbManager::class.java)
+        return usb.deviceList.values.any { usb.hasPermission(it) }
+    }
+
+    private fun granted(permission: String): Boolean =
+        androidx.core.content.ContextCompat.checkSelfPermission(this, permission) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+
+    private fun buildNotification(text: String): Notification {
         val open = PendingIntent.getActivity(
             this,
             0,
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
-        val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
+        return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(getString(R.string.notification_title))
-            .setContentText(getString(R.string.notification_text, gateway))
+            .setContentText(text)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentIntent(open)
             .setOngoing(true)
             .build()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
-        }
     }
 
     private fun startNative(

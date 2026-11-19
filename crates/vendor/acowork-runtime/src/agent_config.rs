@@ -1177,7 +1177,13 @@ pub fn merge_tools_config(
     let mut merged: Vec<AgentToolEntry> = code_tool_names
         .iter()
         .map(|name| {
-            let user_wants = persisted_map.get(name.as_str()).copied().unwrap_or(false); // new tool → disabled (opt-in)
+            // New tools are opt-in, except the Android device tools, which
+            // default on the first time they appear while the device bridge
+            // is present. A row that already exists keeps the user's flag.
+            let user_wants = persisted_map
+                .get(name.as_str())
+                .copied()
+                .unwrap_or_else(|| android_device_default_enabled(name));
             AgentToolEntry::new(name, user_wants)
         })
         .collect();
@@ -1237,8 +1243,9 @@ pub fn apply_builtin_tools_patch(
 
 /// Initialize an `AgentToolsConfig` from a `manifest.toml`
 /// `[[tools]]` tool-names list. Any builtin tool whose name appears
-/// in the manifest gets `enabled = true`; everything else gets
-/// `enabled = false`. Used when `agent_tools.json` is absent.
+/// in the manifest gets `enabled = true`. Android device tools also
+/// start enabled when the device bridge is present. Everything else
+/// gets `enabled = false`. Used when `agent_tools.json` is absent.
 pub fn init_tools_config_from_manifest(
     code_tool_names: &[String],
     manifest_tool_names: &[String],
@@ -1249,10 +1256,25 @@ pub fn init_tools_config_from_manifest(
     code_tool_names
         .iter()
         .map(|name| {
-            let enabled = manifest_set.contains(name.as_str());
+            let enabled = manifest_set.contains(name.as_str()) || android_device_default_enabled(name);
             AgentToolEntry::new(name, enabled)
         })
         .collect()
+}
+
+/// Android device tools turn on by themselves in the phone engine.
+/// Desktop builds omit the names. A persisted row always wins over this
+/// default; see [`merge_tools_config`].
+fn android_device_default_enabled(name: &str) -> bool {
+    #[cfg(feature = "android-host")]
+    {
+        acowork_android::device::TOOL_NAMES.contains(&name)
+    }
+    #[cfg(not(feature = "android-host"))]
+    {
+        let _ = name;
+        false
+    }
 }
 
 /// Build the canonical list of builtin tools when no manifest

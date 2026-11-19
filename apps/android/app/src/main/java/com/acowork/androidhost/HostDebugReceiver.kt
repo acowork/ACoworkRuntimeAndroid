@@ -62,6 +62,8 @@ class HostDebugReceiver : BroadcastReceiver() {
                         HostForegroundService.stop(context)
                         """{"ok":true,"stopped":true}"""
                     }
+                    "device_status" -> deviceStatus(context)
+                    "device_photo" -> devicePhoto(context)
                     else -> """{"ok":false,"error":"unknown cmd `$cmd`"}"""
                 }
                 Log.i(TAG, result)
@@ -79,5 +81,24 @@ class HostDebugReceiver : BroadcastReceiver() {
         const val EXTRA_GATEWAY = "gateway"
         const val EXTRA_TOKEN = "token"
         const val EXTRA_NAME = "name"
+    }
+
+    private fun deviceStatus(context: Context): String {
+        val work = context.filesDir.resolve("acowork").absolutePath
+        return StatusHandler.query(context, work, org.json.JSONObject()).toString()
+    }
+
+    private fun devicePhoto(context: Context): String {
+        if (!DeviceBridge.isReady()) {
+            return """{"ok":false,"error_code":"bridge_unavailable","error":"start the host first"}"""
+        }
+        val work = context.filesDir.resolve("acowork").absolutePath
+        return PhotoHandler.take(
+            DeviceBridge.appContext,
+            DeviceBridge.cameraHandler,
+            work,
+            org.json.JSONObject(),
+            "adb-smoke",
+        ).toString()
     }
 }

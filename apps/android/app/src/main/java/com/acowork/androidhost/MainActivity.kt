@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.PackageManager
+import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
 import android.view.View
@@ -13,6 +14,8 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.widget.doAfterTextChanged
 import androidx.lifecycle.lifecycleScope
+import androidx.recyclerview.widget.DividerItemDecoration
+import androidx.recyclerview.widget.LinearLayoutManager
 import com.acowork.androidhost.databinding.ActivityMainBinding
 import com.google.zxing.integration.android.IntentIntegrator
 import kotlinx.coroutines.Dispatchers
@@ -22,6 +25,7 @@ import org.json.JSONObject
 
 class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
+    private val agentList = AgentListAdapter { row -> openAgent(row) }
     private var applyingEnroll = false
 
     private val cameraPermission = registerForActivityResult(
@@ -30,6 +34,14 @@ class MainActivity : AppCompatActivity() {
         if (granted) launchScanner() else {
             Toast.makeText(this, R.string.camera_required, Toast.LENGTH_LONG).show()
         }
+    }
+
+    private val devicePermission = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { result ->
+        val denied = result.filterValues { granted -> !granted }.keys
+        val message = if (denied.isEmpty()) R.string.device_permissions_ok else R.string.device_permissions_denied
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
     }
 
     private val scanLauncher = registerForActivityResult(
@@ -64,6 +76,7 @@ class MainActivity : AppCompatActivity() {
         binding.btnProbe.setOnClickListener { runProbe() }
         binding.btnPaste.setOnClickListener { pasteEnrollFromClipboard() }
         binding.btnScan.setOnClickListener { requestCameraAndScan() }
+        binding.btnDevicePermissions.setOnClickListener { requestDevicePermissions(null) }
         binding.btnStart.setOnClickListener { startHost() }
         binding.btnStop.setOnClickListener {
             HostForegroundService.stop(this)
@@ -72,11 +85,52 @@ class MainActivity : AppCompatActivity() {
         }
         binding.btnRefresh.setOnClickListener { refreshStatus() }
         binding.btnAgentsRefresh.setOnClickListener { refreshAgentsPanel() }
+        binding.agentsList.layoutManager = LinearLayoutManager(this)
+        binding.agentsList.adapter = agentList
+        binding.agentsList.addItemDecoration(
+            DividerItemDecoration(this, DividerItemDecoration.VERTICAL),
+        )
+        handleDeviceIntent(intent)
+    }
+
+    /** The row is the entry point. The agent screen for [row] is not built yet. */
+    @Suppress("UNUSED_PARAMETER")
+    private fun openAgent(row: AgentRow) {
     }
 
     override fun onNewIntent(intent: android.content.Intent) {
         super.onNewIntent(intent)
+        setIntent(intent)
+        handleDeviceIntent(intent)
         maybeApplyDeepLink(intent.data?.toString())
+    }
+
+    private fun handleDeviceIntent(intent: android.content.Intent?) {
+        val permission = intent?.getStringExtra(DevicePermissions.EXTRA_PERMISSION)
+        val usbDevice = intent?.getStringExtra(DevicePermissions.EXTRA_USB_DEVICE)
+        if (permission == null && usbDevice == null) return
+        selectNav(agents = false)
+        if (permission != null) requestDevicePermissions(permission)
+        if (usbDevice != null) requestUsbPermission(usbDevice)
+    }
+
+    private fun requestDevicePermissions(only: String?) {
+        val requested = if (only != null) listOf(only) else DevicePermissions.declared()
+        val missing = requested.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isEmpty()) {
+            Toast.makeText(this, R.string.device_permissions_none, Toast.LENGTH_SHORT).show()
+            return
+        }
+        devicePermission.launch(missing.toTypedArray())
+    }
+
+    private fun requestUsbPermission(deviceName: String) {
+        val usb = getSystemService(UsbManager::class.java)
+        val device = usb.deviceList[deviceName] ?: return
+        if (usb.hasPermission(device)) return
+        usb.requestPermission(device, UsbHidHandler.permissionIntent(this))
     }
 
     override fun onResume() {
@@ -86,23 +140,21 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupBottomNav() {
-        binding.bottomNav.setOnItemSelectedListener { item ->
-            when (item.itemId) {
-                R.id.nav_agents -> {
-                    showPanel(agents = true)
-                    refreshAgentsPanel()
-                    true
-                }
-                R.id.nav_settings -> {
-                    showPanel(agents = false)
-                    refreshStatus()
-                    true
-                }
-                else -> false
-            }
-        }
-        binding.bottomNav.selectedItemId = R.id.nav_agents
+        binding.navAgents.setOnClickListener { selectNav(agents = true) }
+        binding.navSettings.setOnClickListener { selectNav(agents = false) }
+        applyNavSelection(agents = true)
         showPanel(agents = true)
+    }
+
+    private fun selectNav(agents: Boolean) {
+        applyNavSelection(agents)
+        showPanel(agents)
+        if (agents) refreshAgentsPanel() else refreshStatus()
+    }
+
+    private fun applyNavSelection(agents: Boolean) {
+        binding.navAgents.isSelected = agents
+        binding.navSettings.isSelected = !agents
     }
 
     private fun showPanel(agents: Boolean) {
@@ -244,21 +296,22 @@ class MainActivity : AppCompatActivity() {
     private fun refreshAgentsPanel() {
         if (!Native.loaded) {
             binding.agentsSummary.text = getString(R.string.native_required)
-            binding.agentsList.text = ""
+            agentList.submit(emptyList())
+            binding.agentsEmpty.visibility = View.VISIBLE
             return
         }
         lifecycleScope.launch {
             val statusJson = withContext(Dispatchers.IO) { Native.nodeStatus() }
+            val home = filesDir.resolve("acowork")
             val installed = withContext(Dispatchers.IO) {
-                runCatching {
-                    filesDir.resolve("acowork/installed.json").takeIf { it.exists() }?.readText()
-                }.getOrNull()
+                runCatching { home.resolve("installed.json").takeIf { it.exists() }?.readText() }.getOrNull()
             }
-            renderAgents(statusJson, installed)
+            val rows = withContext(Dispatchers.IO) { AgentRows.load(this@MainActivity, home, installed) }
+            renderAgents(statusJson, rows)
         }
     }
 
-    private fun renderAgents(statusJson: String, installedJson: String?) {
+    private fun renderAgents(statusJson: String, rows: List<AgentRow>) {
         val status = runCatching { JSONObject(statusJson) }.getOrNull()
         val running = status?.optBoolean("running") == true
         val nodeName = status?.optString("node_name").orEmpty()
@@ -272,24 +325,8 @@ class MainActivity : AppCompatActivity() {
                 if (packages >= 0) append(" · packages=").append(packages)
             }
         }
-
-        val agents = installedJson
-            ?.let { runCatching { JSONObject(it).optJSONObject("agents") }.getOrNull() }
-        if (agents == null || agents.length() == 0) {
-            binding.agentsList.text = getString(R.string.agents_empty)
-            return
-        }
-        val lines = mutableListOf<String>()
-        val keys = agents.keys()
-        while (keys.hasNext()) {
-            val id = keys.next()
-            val row = agents.optJSONObject(id) ?: continue
-            val name = row.optString("name").ifBlank { row.optString("agent_id") }
-            val ver = row.optString("version")
-            lines += "$name  $ver\n  instance=$id\n  package=${row.optString("agent_id")}"
-        }
-        lines.sort()
-        binding.agentsList.text = lines.joinToString("\n\n")
+        agentList.submit(rows)
+        binding.agentsEmpty.visibility = if (rows.isEmpty()) View.VISIBLE else View.GONE
     }
 
     private fun requestPostNotifications() {

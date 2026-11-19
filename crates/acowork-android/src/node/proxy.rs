@@ -431,6 +431,10 @@ struct FsBrowseResponse {
 
 fn browse_fs(requested: &str, show_hidden: bool) -> Result<String, String> {
     let requested = requested.trim();
+    // Same contract as PC `acowork-node` / Gateway: empty and `/` are the
+    // shortcut set, not a listing of `/`. Putting `/` in that set loops
+    // RemoteFolderPicker, so volume roots have to appear as siblings of
+    // HOME (Windows already does this with drive letters).
     if requested.is_empty() || requested == "/" {
         let resp = FsBrowseResponse {
             path: requested.to_string(),
@@ -484,9 +488,57 @@ fn browse_fs(requested: &str, show_hidden: bool) -> Result<String, String> {
     serde_json::to_string(&resp).map_err(|e| e.to_string())
 }
 
-/// Root listing for the empty/`/` browse path — PC `fs_browse::root_entries` shape.
-///
-/// Relies on process `HOME` (set to the node data home at Node start).
+/// Well-known Unix volume paths. Each is offered only when it exists —
+/// `/var` on a PC node, `/sdcard` on a phone, nothing invented.
+fn unix_volume_candidates() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("tmp", "/tmp"),
+        ("/var", "/var"),
+        ("/opt", "/opt"),
+        ("sdcard", "/sdcard"),
+        ("storage", "/storage"),
+    ]
+}
+
+/// A volume path is present if it is a directory we can stat, or a
+/// symlink that exists in the namespace. Android `/sdcard` is a public
+/// symlink whose target is often EACCES for `stat` under scoped storage;
+/// `is_dir()` is then false even though the volume is the one users pick.
+fn volume_exists(path: &Path) -> bool {
+    if path.is_dir() {
+        return true;
+    }
+    path.symlink_metadata()
+        .map(|m| m.is_dir() || m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+fn push_browse_root(
+    entries: &mut Vec<FsBrowseEntry>,
+    name: String,
+    path: &Path,
+    show_hidden: bool,
+) {
+    if !volume_exists(path) {
+        return;
+    }
+    let path_str = path.to_string_lossy().replace('\\', "/");
+    if entries.iter().any(|e| e.path == path_str) {
+        return;
+    }
+    entries.push(FsBrowseEntry {
+        name,
+        entry_type: "directory".into(),
+        path: path_str,
+        size: None,
+        children_count: Some(count_children(path, show_hidden)),
+    });
+}
+
+/// Starting points for empty/`/` browse. Same JSON shape and the same
+/// empty-or-`/` shortcut contract as PC `acowork-node`. Unix extras are
+/// probed with `is_dir` (like Windows drive letters): `/tmp` `/var`
+/// `/opt` on a PC, `/sdcard` `/storage` when those volumes exist here.
 fn root_entries(show_hidden: bool) -> Vec<FsBrowseEntry> {
     let mut entries = Vec::new();
 
@@ -500,45 +552,15 @@ fn root_entries(show_hidden: bool) -> Vec<FsBrowseEntry> {
 
     if let Some(home_str) = &home {
         let home_path = Path::new(home_str);
-        if home_path.is_dir() {
-            let name = home_path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "Home".to_string());
-            entries.push(FsBrowseEntry {
-                name,
-                entry_type: "directory".into(),
-                path: home_str.replace('\\', "/"),
-                size: None,
-                children_count: Some(count_children(home_path, show_hidden)),
-            });
-        }
+        let name = home_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Home".to_string());
+        push_browse_root(&mut entries, name, home_path, show_hidden);
     }
 
-    #[cfg(unix)]
-    {
-        let tmp = Path::new("/tmp");
-        if tmp.is_dir() {
-            entries.push(FsBrowseEntry {
-                name: "tmp".into(),
-                entry_type: "directory".into(),
-                path: "/tmp".into(),
-                size: None,
-                children_count: Some(count_children(tmp, show_hidden)),
-            });
-        }
-        for (label, path) in [("/var", "/var"), ("/opt", "/opt")] {
-            let p = Path::new(path);
-            if p.is_dir() {
-                entries.push(FsBrowseEntry {
-                    name: label.into(),
-                    entry_type: "directory".into(),
-                    path: path.into(),
-                    size: None,
-                    children_count: Some(count_children(p, show_hidden)),
-                });
-            }
-        }
+    for (label, path) in unix_volume_candidates() {
+        push_browse_root(&mut entries, (*label).into(), Path::new(path), show_hidden);
     }
 
     #[cfg(windows)]
@@ -623,6 +645,52 @@ mod tests {
         let json = browse_fs("", false).unwrap();
         assert!(json.contains(&want), "browse JSON missing HOME: {json}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn entry_paths(json: &str) -> Vec<String> {
+        serde_json::from_str::<serde_json::Value>(json)
+            .ok()
+            .and_then(|v| v.get("entries").cloned())
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|e| e.get("path")?.as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn empty_and_slash_share_shortcut_set() {
+        let _guard = HOME_LOCK.lock().unwrap();
+        let empty = entry_paths(&browse_fs("", false).unwrap());
+        let slash = entry_paths(&browse_fs("/", false).unwrap());
+        assert_eq!(
+            empty, slash,
+            "empty and `/` must match PC node shortcut contract"
+        );
+        assert!(
+            !empty.iter().any(|p| p == "/"),
+            "shortcut set must not contain `/` (RemoteFolderPicker loop)"
+        );
+    }
+
+    #[test]
+    fn existing_unix_volumes_are_offered() {
+        let _guard = HOME_LOCK.lock().unwrap();
+        assert!(
+            unix_volume_candidates()
+                .iter()
+                .any(|(name, path)| *name == "sdcard" && *path == "/sdcard")
+        );
+        let entries = root_entries(false);
+        for (name, path) in unix_volume_candidates() {
+            let p = Path::new(path);
+            if volume_exists(p) {
+                assert!(
+                    entries.iter().any(|e| e.path == *path),
+                    "{name} ({path}) exists but is missing from {entries:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -423,7 +423,8 @@ pub async fn sync_ports_from_table(ports: &PortTable, table: &mut ProcessTable) 
     sync_ports(ports, &rows).await;
 }
 
-/// Point process `HOME` at the node data home so `/fs/browse` matches PC.
+/// Point process `HOME` at the node data home so empty-path `/fs/browse`
+/// offers that directory as the HOME shortcut.
 pub fn set_node_home(home: &Path) {
     // Rust 2024: env mutation is unsafe (process-global).
     unsafe {

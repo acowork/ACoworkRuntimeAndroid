@@ -109,7 +109,8 @@ user 版上 `/system` 依然有 verity 保护且只读；`/system/bin/sh` 是 mk
 
 设计取舍：[ADR-AND-001](docs/adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md) ·
 探测规格：[android-host-probe.md](docs/design/zh/android-host-probe.md) ·
-设置面盘点：[android-runtime-settings.md](docs/design/zh/android-runtime-settings.md)
+设置面盘点：[android-runtime-settings.md](docs/design/zh/android-runtime-settings.md) ·
+设备内置工具：[android-device-tools.md](docs/design/zh/android-device-tools.md)
 真机测试手册：[android-device-test.md](docs/design/zh/android-device-test.md)（接上手机之后跑什么、什么算通过）
 
 ## 为什么独立建仓？
@@ -177,7 +178,7 @@ graph TD
 | `crates/acowork-android-cli/` | **一体二进制、两个角色**：`probe` / `exec` / `settings` / `evidence` / `restore`；**Node** = `serve`，**Runtime** = `runtime`（或 `--engine PATH`）。Root-shell 是同二进制的探测模式。 |
 | `crates/acowork-android-ffi/` | **JNI `cdylib`**：`libacowork_android_ffi.so`，供宿主 APK（enroll / ping / probe / settings）。 |
 | `apps/android/` | **宿主 APK**（`com.acowork.androidhost`）：Gradle + Kotlin 前台服务、作用域 `filesDir/acowork`、连通性重连。见 [`apps/android/README.md`](apps/android/README.md)。 |
-| `docs/` | 设计说明、平台笔记与移植取舍 —— 见 [ADR-AND-001](docs/adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md)、[ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md)、[ADR-AND-003](docs/adr/zh/ADR-AND-003-independent-engine-and-spawn-contract.md)、[android-host-probe.md](docs/design/zh/android-host-probe.md)、[android-runtime-settings.md](docs/design/zh/android-runtime-settings.md) 与 [开发就绪度评估](docs/review/zh/2026-10-28-readiness-assessment.md)。 |
+| `docs/` | 设计说明、平台笔记与移植取舍 —— 见 [ADR-AND-001](docs/adr/zh/ADR-AND-001-android-host-profiles-and-execution-backend.md)、[ADR-AND-002](docs/adr/zh/ADR-AND-002-platform-contract-layer.md)、[ADR-AND-003](docs/adr/zh/ADR-AND-003-independent-engine-and-spawn-contract.md)、[android-host-probe.md](docs/design/zh/android-host-probe.md)、[android-runtime-settings.md](docs/design/zh/android-runtime-settings.md)、[android-device-tools.md](docs/design/zh/android-device-tools.md) 与 [开发就绪度评估](docs/review/zh/2026-10-28-readiness-assessment.md)。 |
 
 ## 与上游的关系
 

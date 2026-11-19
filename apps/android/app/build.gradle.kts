@@ -65,13 +65,14 @@ val workspaceRoot = layout.projectDirectory.dir("../../..")
 
 tasks.register<Exec>("cargoNdkArm64") {
     group = "build"
-    description = "Cross-compile acowork-android-ffi for arm64-v8a"
+    description = "Cross-compile host FFI and engine CLI for arm64-v8a"
     workingDir = workspaceRoot.asFile
     environment("ANDROID_NDK_HOME", System.getenv("ANDROID_NDK_HOME")
         ?: (System.getenv("ANDROID_HOME")?.let { "$it/ndk/26.1.10909125" } ?: ""))
     commandLine(
         "cargo", "build",
         "-p", "acowork-android-ffi",
+        "-p", "acowork-android-cli",
         "--release",
         "--target", cargoTarget,
     )
@@ -89,11 +90,10 @@ tasks.register<Exec>("cargoNdkArm64") {
             "target/$cargoTarget/release/acowork-android",
         )
         val engineDst = jniOut.asFile.resolve("libacowork_engine.so")
-        if (engineSrc.exists()) {
-            engineSrc.copyTo(engineDst, overwrite = true)
-        } else {
-            logger.warn("engine binary missing at $engineSrc — start/stop agents will fail until built")
+        if (!engineSrc.exists()) {
+            throw GradleException("missing $engineSrc — android device tools will not appear until the engine is rebuilt")
         }
+        engineSrc.copyTo(engineDst, overwrite = true)
     }
 }
 

@@ -50,6 +50,7 @@
 #![deny(missing_docs)]
 #![warn(clippy::all)]
 
+pub mod device;
 pub mod host;
 pub mod node;
 pub mod runtime;
