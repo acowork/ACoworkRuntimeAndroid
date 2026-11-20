@@ -14,14 +14,15 @@ use std::sync::{Arc, Mutex};
 
 use once_cell::sync::OnceCell;
 use serde_json::json;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 use acowork_android::host::{HostConfig, HostProfile, LocalHost, ProbeCommand, run_probe};
 use acowork_android::node::{
     ControlCtx, EngineSpec, GATEWAY_MQTT_PORT, GatewayReachability, IncomingPublish,
     NODE_PROXY_PORT, NodeIdentity, PackageInventory, PortTable, ProcessTable, ProxyState,
-    SharedIdentity, announce, capability_tags, check_gateway_http, decode_enroll_result,
-    handle_control, mqtt_connect, proxy_start, set_node_home, shared_identity, sync_ports,
+    SharedIdentity, announce, announce_with_enroll, capability_tags, check_gateway_http,
+    decode_enroll_result, handle_control, mqtt_connect, proxy_start, set_node_home,
+    shared_identity, sync_ports,
 };
 
 #[derive(Clone)]
@@ -211,12 +212,32 @@ async fn run_loop(args: StartArgs, mut stop_rx: watch::Receiver<bool>) -> Result
     let gateway_host = host_of(&args.gateway_http);
     let gateway_mqtt = format!("{gateway_host}:{GATEWAY_MQTT_PORT}");
 
-    let identity = NodeIdentity::load_or_create(
+    let mut identity = NodeIdentity::load_or_create(
         &args.home,
         args.node_name.as_deref(),
         Some(&gateway_mqtt),
     )
     .map_err(|e| e.to_string())?;
+    // `load_or_create` only reads the name when it mints an identity; after
+    // that the file owns it. The host UI prefills its name field from the live
+    // identity, so a difference here is a deliberate edit made on the phone —
+    // apply it, or "stop host, start host" silently keeps the old name.
+    if let Some(raw) = args.node_name.as_deref().filter(|n| !n.trim().is_empty()) {
+        match NodeIdentity::normalize_name(raw) {
+            Some(name) => match identity.set_name(&args.home, &name) {
+                Ok(true) => {
+                    tracing::info!(node_name = %identity.node_name, "node renamed from host UI");
+                }
+                Ok(false) => {}
+                Err(e) => tracing::warn!(error = %e, "could not persist node name from host UI"),
+            },
+            None => tracing::warn!(
+                input = %raw,
+                current = %identity.node_name,
+                "node name from host UI has no usable slug characters — keeping the current name"
+            ),
+        }
+    }
 
     acowork_android::host::set_dangerous_mode(args.dangerous_mode);
     let host = LocalHost::new().map_err(|e| e.to_string())?;
@@ -254,11 +275,16 @@ async fn run_loop(args: StartArgs, mut stop_rx: watch::Receiver<bool>) -> Result
     let identity_cell: SharedIdentity = shared_identity(identity.clone());
     let ports: PortTable = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let proxy_bind = SocketAddr::from(([0, 0, 0, 0], NODE_PROXY_PORT));
+    // The proxy owns no MQTT session; a rename it persists is announced by
+    // the host loop, which does. Shared edge-triggered signal between them.
+    let republish = Arc::new(Notify::new());
     let proxy = proxy_start(
         proxy_bind,
         ProxyState {
             identity: Arc::clone(&identity_cell),
             ports: Arc::clone(&ports),
+            home: args.home.clone(),
+            republish: Arc::clone(&republish),
         },
     )
     .await
@@ -270,23 +296,23 @@ async fn run_loop(args: StartArgs, mut stop_rx: watch::Receiver<bool>) -> Result
         args.advertise_port
     };
     let http_endpoint = format!("http://{}:{advertise_port}", args.advertise_host);
-    // Prefer persisted node_token. Passing a one-shot enrollment token after
-    // enroll already succeeded makes CONNECT NotAuthorized → soft-restart
-    // → LWT offline/online flap (Desktop sees the node drop every second).
-    let enroll_token = identity
-        .node_token
-        .clone()
-        .or_else(|| args.enrollment_token.clone())
-        .unwrap_or_default();
+    // CONNECT credential and `/enroll` payload are separate decisions —
+    // see [`NodeIdentity::plan_join`] for why conflating them either flaps
+    // the connection or leaves the node without an owner.
+    let plan = identity.plan_join(args.enrollment_token.as_deref());
+    let fresh_enrollment = plan.presented_fresh;
+    let connect_token = plan.connect_token;
+    let enroll_token = plan.enroll_token;
+    let enroll_now = plan.enroll;
 
     let mut session = match mqtt_connect(
         &gateway_host,
         GATEWAY_MQTT_PORT,
         &identity.node_id,
-        if enroll_token.is_empty() {
+        if connect_token.is_empty() {
             None
         } else {
-            Some(enroll_token.clone())
+            Some(connect_token.clone())
         },
     )
     .await
@@ -302,13 +328,14 @@ async fn run_loop(args: StartArgs, mut stop_rx: watch::Receiver<bool>) -> Result
     // running, and the next `start` opened a second `node:{id}` client.
     let outcome: Result<(), String> = async {
     let mut packages = PackageInventory::load(&args.home).map_err(|e| e.to_string())?;
-    announce(
+    announce_with_enroll(
         &session,
         &identity,
         tags.clone(),
         &http_endpoint,
         0,
         &enroll_token,
+        enroll_now,
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -334,7 +361,7 @@ async fn run_loop(args: StartArgs, mut stop_rx: watch::Receiver<bool>) -> Result
     }));
 
     let mut table = ProcessTable::new(19901);
-    let mut live_token = enroll_token;
+    let mut live_token = connect_token;
     loop {
         tokio::select! {
             _ = stop_rx.changed() => {
@@ -362,6 +389,23 @@ async fn run_loop(args: StartArgs, mut stop_rx: watch::Receiver<bool>) -> Result
                 // an empty agent list for already-installed packages.
                 publish_inventory(&session, &id.node_id, &packages).await;
             }
+            _ = republish.notified() => {
+                // The proxy persisted a rename. Republish the retained `info`
+                // snapshot so the Gateway's registry carries the new name now
+                // instead of at the next heartbeat — and do NOT re-enroll:
+                // `enroll` is false, ownership was settled at enroll time.
+                let id = identity_cell.read().await.clone();
+                let _ = announce_with_enroll(
+                    &session,
+                    &id,
+                    tags.clone(),
+                    &http_endpoint,
+                    table.running_count() as u32,
+                    &live_token,
+                    false,
+                ).await;
+                tracing::info!(node_name = %id.node_name, "republished node info after rename");
+            }
             msg = session.incoming.recv() => {
                 match msg {
                     Some(pubmsg) => {
@@ -372,9 +416,9 @@ async fn run_loop(args: StartArgs, mut stop_rx: watch::Receiver<bool>) -> Result
                                 &identity_cell,
                                 &args.home,
                                 &mut live_token,
-                                &tags,
                                 &http_endpoint,
                                 table.running_count() as u32,
+                                fresh_enrollment.clone(),
                             ).await;
                             continue;
                         }
@@ -426,9 +470,9 @@ async fn handle_enroll_result(
     identity: &SharedIdentity,
     home: &std::path::Path,
     live_token: &mut String,
-    _tags: &[String],
     http_endpoint: &str,
     agent_count: u32,
+    presented: Option<String>,
 ) {
     // Mirror desktop Node (ADR-055 §6.12): persist the Gateway-issued
     // token and stop. Do NOT call `announce()` here — that republishes
@@ -440,11 +484,22 @@ async fn handle_enroll_result(
         && !result.node_token.is_empty()
     {
         let mut id = identity.write().await;
-        if id.node_token.as_deref() == Some(result.node_token.as_str()) {
-            return; // Same token — nothing to do.
+        // The Gateway mints the same node_token when it already knows this
+        // node, so "token unchanged" cannot mean "nothing to do": a re-scan
+        // is exactly the case where the token is unchanged and the
+        // enrollment record still has to be written — that record is what
+        // stops the next launch from replaying a spent token.
+        let token_same = id.node_token.as_deref() == Some(result.node_token.as_str());
+        let record_same = presented.is_none() || id.enrolled_with == presented;
+        if token_same && record_same {
+            return; // Same token, and this enrollment is already on record.
         }
         let gateway_addr = id.gateway_addr.clone().unwrap_or_default();
-        id.mark_enrolled(&gateway_addr, Some(result.node_token.clone()));
+        id.mark_enrolled(
+            &gateway_addr,
+            Some(result.node_token.clone()),
+            presented.clone(),
+        );
         let _ = id.save(home);
         *session.credentials.lock().await = Some(result.node_token.clone());
         *live_token = result.node_token.clone();

@@ -4,7 +4,7 @@
     <string name="subtitle">Android Node host — not the mobile chat client</string>
     <string name="gateway_hint">Gateway HTTP (auto-filled from enroll code)</string>
     <string name="token_hint">Paste enroll code here, or token only</string>
-    <string name="name_hint">Node name (optional)</string>
+    <string name="name_hint">Node name (optional, lowercase a–z 0–9 and hyphen)</string>
     <string name="paste_enroll">Paste enroll code</string>
     <string name="scan_qr">Scan Desktop enroll QR</string>
     <string name="scan_ok">Gateway + token filled</string>

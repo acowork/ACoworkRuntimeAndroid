@@ -503,6 +503,7 @@ mod tests {
             enrollment: EnrollmentState::Created,
             created_at: 0,
             enrolled_at: None,
+            enrolled_with: None,
         };
         let env = enroll_envelope(&id, vec!["control_plane".into()], "tok");
         let bytes = env.encode_to_vec();
