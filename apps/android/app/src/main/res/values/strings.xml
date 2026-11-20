@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">ACowork Host</string>
+    <string name="app_name">ACoworkNode</string>
     <string name="subtitle">Android Node host — not the mobile chat client</string>
     <string name="gateway_hint">Gateway HTTP (auto-filled from enroll code)</string>
     <string name="token_hint">Paste enroll code here, or token only</string>
@@ -22,7 +22,7 @@
     <string name="dangerous_mode">Dangerous mode (system writes)</string>
     <string name="dangerous_mode_hint">Session only — off when the host stops. Needs an active Magisk/KSU grant. Restart running agents after changing it.</string>
     <string name="dangerous_needs_root">Grant root first</string>
-    <string name="screen_control_hint">Turn on ACowork Host in Accessibility services</string>
+    <string name="screen_control_hint">Turn on ACoworkNode in Accessibility services</string>
     <string name="accessibility_service_description">Lets on-device agents screenshot the display and perform taps, swipes, and node actions. The service does not read keystrokes. You can turn it off in Accessibility settings.</string>
     <string name="device_permissions_ok">Device permissions granted</string>
     <string name="device_permissions_denied">Some device permissions were denied</string>
@@ -40,9 +40,9 @@
     <string name="lan_ip_required">No Wi‑Fi IPv4 — connect to LAN so Gateway can dial back</string>
     <string name="native_required">Native library missing — run cargoNdkArm64 first</string>
     <string name="native_missing">Native lib not loaded: %1$s\nBuild: apps/android ./gradlew cargoNdkArm64</string>
-    <string name="notification_channel">ACowork Host</string>
+    <string name="notification_channel">ACoworkNode</string>
     <string name="notification_channel_desc">Keeps the Node enrolled with the Gateway</string>
-    <string name="notification_title">ACowork Host running</string>
+    <string name="notification_title">ACoworkNode running</string>
     <string name="notification_text">Gateway %1$s</string>
     <string name="nav_agents">Agents</string>
     <string name="nav_settings">Settings</string>

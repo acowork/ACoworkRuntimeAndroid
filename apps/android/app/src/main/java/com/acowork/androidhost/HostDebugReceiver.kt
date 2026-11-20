@@ -82,7 +82,7 @@ class HostDebugReceiver : BroadcastReceiver() {
     }
 
     companion object {
-        const val TAG = "ACoworkHost"
+        const val TAG = "ACoworkNode"
         const val EXTRA_CMD = "cmd"
         const val EXTRA_GATEWAY = "gateway"
         const val EXTRA_TOKEN = "token"

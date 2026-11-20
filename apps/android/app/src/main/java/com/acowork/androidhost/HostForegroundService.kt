@@ -284,7 +284,7 @@ class HostForegroundService : Service() {
     private fun prefs() = getSharedPreferences(PREFS, MODE_PRIVATE)
 
     companion object {
-        private const val TAG = "ACoworkHost"
+        private const val TAG = "ACoworkNode"
         const val CHANNEL_ID = "acowork_host"
         const val NOTIFICATION_ID = 19900
         const val PREFS = "acowork_host"
