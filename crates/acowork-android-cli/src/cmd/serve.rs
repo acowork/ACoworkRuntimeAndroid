@@ -14,11 +14,11 @@ use acowork_android::host::{HostConfig, HostProfile, ProbeCommand, run_probe};
 use acowork_android::node::{
     ControlCtx, EngineSpec, GatewayReachability, IncomingPublish, MqttSession, NodeIdentity,
     PackageInventory, PortTable, ProcessTable, ProxyState, SharedIdentity, announce,
-    capability_tags, check_gateway_http, decode_enroll_result, handle_control, mqtt_connect,
-    proxy_start, refresh_info, set_node_home, shared_identity, start_agent, sync_ports,
-    sync_ports_from_table,
+    announce_with_enroll, capability_tags, check_gateway_http, decode_enroll_result,
+    handle_control, mqtt_connect, proxy_start, refresh_info, set_node_home, shared_identity,
+    start_agent, sync_ports, sync_ports_from_table,
 };
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::session::CommonArgs;
 use crate::transport::Transport;
@@ -91,11 +91,14 @@ pub async fn run(args: ServeArgs) -> Result<(), String> {
     let identity_cell: SharedIdentity = shared_identity(identity.clone());
     let ports: PortTable = Arc::new(Mutex::new(HashMap::new()));
     let proxy_bind = SocketAddr::from(([0, 0, 0, 0], args.proxy_port));
+    let republish = Arc::new(Notify::new());
     let proxy = proxy_start(
         proxy_bind,
         ProxyState {
             identity: Arc::clone(&identity_cell),
             ports: Arc::clone(&ports),
+            home: home.clone(),
+            republish: Arc::clone(&republish),
         },
     )
     .await
@@ -103,21 +106,23 @@ pub async fn run(args: ServeArgs) -> Result<(), String> {
     let http_endpoint = format!("http://{}:{}", args.advertise_host, args.proxy_port);
     println!("proxy      listening on {proxy_bind} (advertise {http_endpoint})");
 
-    // Prefer persisted node_token over a one-shot enrollment token (same as FFI).
-    let enroll_token = identity
-        .node_token
-        .clone()
-        .or_else(|| args.enrollment_token.clone())
-        .unwrap_or_default();
+    // Same rule as the Android host — see [`NodeIdentity::plan_join`]: the
+    // CONNECT credential and the `/enroll` payload are separate decisions, and
+    // conflating them either flaps the connection or leaves the node ownerless.
+    let plan = identity.plan_join(args.enrollment_token.as_deref());
+    let fresh_enrollment = plan.presented_fresh;
+    let connect_token = plan.connect_token;
+    let enroll_token = plan.enroll_token;
+    let enroll_now = plan.enroll;
 
     let mut session = mqtt_connect(
         &gateway_host,
         args.mqtt_port,
         &identity.node_id,
-        if enroll_token.is_empty() {
+        if connect_token.is_empty() {
             None
         } else {
-            Some(enroll_token.clone())
+            Some(connect_token.clone())
         },
     )
     .await
@@ -127,13 +132,14 @@ pub async fn run(args: ServeArgs) -> Result<(), String> {
     let mut packages = PackageInventory::load(&home).map_err(|e| e.to_string())?;
     println!("packages   {} installed", packages.agents.len());
 
-    announce(
+    announce_with_enroll(
         &session,
         &identity,
         tags.clone(),
         &http_endpoint,
         0,
         &enroll_token,
+        enroll_now,
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -143,7 +149,7 @@ pub async fn run(args: ServeArgs) -> Result<(), String> {
     let mut table = ProcessTable::new(19901);
     // Live credential string used on reconnect re-announce (starts as
     // enrollment token; swapped to node_token after enroll_result).
-    let mut live_token = enroll_token.clone();
+    let mut live_token = connect_token;
     if let Some(agent_id) = &args.auto_agent {
         let token = identity_cell.read().await.node_token.clone();
         let mut ctx = ControlCtx {
@@ -215,6 +221,24 @@ pub async fn run(args: ServeArgs) -> Result<(), String> {
                 .await;
                 let _ = republish_inventory(&session, &id.node_id, &packages).await;
             }
+            _ = republish.notified() => {
+                // The proxy persisted a rename — republish the retained
+                // `info` so the Gateway registry converges now, without
+                // re-enrolling (ownership was settled at enroll time).
+                let id = identity_cell.read().await.clone();
+                let agent_count = table.running_count() as u32;
+                let _ = announce_with_enroll(
+                    &session,
+                    &id,
+                    tags.clone(),
+                    &http_endpoint,
+                    agent_count,
+                    &live_token,
+                    false,
+                )
+                .await;
+                println!("rename     re-announced as {}", id.node_name);
+            }
             msg = session.incoming.recv() => {
                 match msg {
                     Some(pubmsg) => {
@@ -232,7 +256,8 @@ pub async fn run(args: ServeArgs) -> Result<(), String> {
                             package: &args.common.package,
                             dangerous_mode: args.common.dangerous_mode,
                         };
-                        handle_incoming(&pubmsg, &mut ctx, &home, &mut live_token).await;
+                        handle_incoming(&pubmsg, &mut ctx, &home, &mut live_token,
+                            fresh_enrollment.clone()).await;
                     }
                     None => {
                         println!("mqtt session closed");
@@ -295,13 +320,18 @@ async fn handle_incoming(
     ctx: &mut ControlCtx<'_>,
     home: &std::path::Path,
     live_token: &mut String,
+    presented: Option<String>,
 ) {
     if msg.topic.ends_with("/enroll_result") {
         if let Some(result) = decode_enroll_result(&msg.payload) {
             if result.status == "ok" && !result.node_token.is_empty() {
                 let mut id = ctx.identity.write().await;
                 let gateway_addr = id.gateway_addr.clone().unwrap_or_default();
-                id.mark_enrolled(&gateway_addr, Some(result.node_token.clone()));
+                id.mark_enrolled(
+                    &gateway_addr,
+                    Some(result.node_token.clone()),
+                    presented.clone(),
+                );
                 if let Err(e) = id.save(home) {
                     eprintln!("persist identity: {e}");
                 }

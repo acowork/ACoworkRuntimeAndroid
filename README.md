@@ -320,15 +320,20 @@ the undo as attempt/result pairs grouped by `(session_id, id)`.
 
 NDK **26.1.10909125**, target **`aarch64-linux-android`** (arm64-v8a only in this slice).
 
-```powershell
-# From repo root — sets CC/CFLAGS/sysroot for zstd-sys etc.
-. .\scripts\android-ndk-env.ps1
-cargo build -p acowork-android-ffi --release --target aarch64-linux-android
-# Copy lands in apps/android/app/src/main/jniLibs/arm64-v8a/ (or: cd apps/android && ./gradlew cargoNdkArm64)
-
-cd apps/android
-./gradlew :app:assembleDebug
+```bash
+./dev/android/build_android.sh            # debug APK   (Linux / macOS)
+./dev/android/build_android.sh --release  # release APK
 ```
+
+```powershell
+.\dev\android\build_android.ps1           # debug APK   (Windows)
+.\dev\android\build_android.ps1 -Release
+```
+
+The build script handles the toolchain discovery, the Rust cross-compile, the
+packaged POSIX shell (mksh R57), the Gradle assemble, and the release signing.
+The keystore stays on your disk and is never committed — see
+[`dev/android/README.md`](dev/android/README.md).
 
 Details: [`apps/android/README.md`](apps/android/README.md). Main-repo mobile remains a separate
 **client** product ([ADR-AND-004](docs/adr/zh/ADR-AND-004-independent-apk-deliverable.md)).

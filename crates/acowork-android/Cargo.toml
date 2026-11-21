@@ -29,6 +29,10 @@ base64 = "0.22"
 # list is the minimum for that one type. A port that supplies its own `SpawnRunner` (over
 # adb, or a blocking thread) does not need this dependency at all.
 tokio.workspace = true
+# `node::mqtt` reports broker rejections through `tracing`, because on Android
+# that is the only channel that survives (stderr is /dev/null and the app has
+# no HOME for the file fallback) — see `log_mqtt_error`.
+tracing.workspace = true
 serde = { workspace = true }
 # The audit trail (§4.6.1) is stored as JSONL, and `host::audit::FileAuditSink` is library code,
 # not test code, so this cannot stay a dev-dependency. Nothing else in the crate serialises to

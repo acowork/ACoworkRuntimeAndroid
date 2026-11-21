@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use prost::Message;
 use rumqttc::{AsyncClient, Event, Incoming, LastWill, MqttOptions, QoS, Transport};
-use tokio::sync::{Mutex, Notify, RwLock, mpsc};
+use tokio::sync::{Mutex, Notify, RwLock, mpsc, watch};
 
 use super::identity::NodeIdentity;
 use super::proto::{
@@ -51,15 +51,27 @@ pub struct MqttSession {
     /// One event per ConnAck after subscriptions are restored — serve
     /// re-announces status/info/ready/enroll on each.
     pub bootstrap: mpsc::UnboundedReceiver<()>,
-    /// Shut down the poll task.
-    shutdown: Arc<Notify>,
+    /// Stop flag for the poll task. A `watch`, deliberately: see `stop()`.
+    stop_tx: watch::Sender<bool>,
     node_id: String,
 }
 
 impl MqttSession {
     /// Stop the background event loop.
+    ///
+    /// This is a level, not an edge. The previous `Notify::notify_waiters()`
+    /// woke only the waiters registered at that instant, and the poll task
+    /// re-creates its `notified()` future on every iteration — so a stop that
+    /// landed while the task was inside `bootstrap_subscriptions` or the
+    /// backoff branch was lost with nobody to receive it. The task then lived
+    /// on holding the MQTT client id `node:{id}`; the next `start` opened a
+    /// second client, the broker evicted one of them as a duplicate, and the
+    /// pair kicked each other forever. Because every attempt still earned a
+    /// CONNACK, the exponential backoff was reset to its 2s floor each time and
+    /// never grew, so the node published `offline` on its LWT roughly twice a
+    /// second and the Desktop could never see it online.
     pub fn stop(&self) {
-        self.shutdown.notify_waiters();
+        let _ = self.stop_tx.send(true);
     }
 
     /// Publish a protobuf [`DataEnvelope`].
@@ -146,8 +158,22 @@ impl std::fmt::Display for MqttError {
 
 impl std::error::Error for MqttError {}
 
+/// Record an MQTT event-loop failure.
+///
+/// This must not be gated on `HOME`. An Android app process has no `HOME`
+/// environment variable at all — its home is handed in explicitly as
+/// `filesDir/acowork` — so the previous shape (`var_os("HOME")` or return)
+/// meant every broker rejection on a phone went only to `eprintln!`, and
+/// Zygote gives an app process a stderr that points at `/dev/null`. The
+/// failure was therefore recorded nowhere, on the one platform where the
+/// developer cannot also read the app's private files.
+///
+/// `tracing` is the channel that survives both worlds: on Android it reaches
+/// logcat via `acowork-android-ffi::logcat`, on a desktop via the subscriber.
+/// The `~/mqtt-error.log` fallback stays for the CLI, where `HOME` exists and
+/// somebody may actually read it.
 fn log_mqtt_error(msg: &str) {
-    eprintln!("{msg}");
+    tracing::warn!("{msg}");
     let Some(home) = std::env::var_os("HOME") else {
         return;
     };
@@ -198,10 +224,16 @@ pub async fn connect(
     let (tx, rx) = mpsc::unbounded_channel();
     let (boot_tx, boot_rx) = mpsc::unbounded_channel();
     let connected = Arc::new(Notify::new());
-    let shutdown = Arc::new(Notify::new());
+    // Level-triggered stop: a `watch` keeps the value, so a `stop()` that
+    // arrives while the task is between select! points is still observed.
+    let (stop_tx, stop_rx) = watch::channel(false);
 
     let connected_task = Arc::clone(&connected);
-    let shutdown_task = Arc::clone(&shutdown);
+    let mut stop_task = stop_rx;
+    // A second receiver for the backoff wait: `changed()` reports transitions
+    // against this receiver's own seen-version, so a clone made per pass would
+    // start already-current and sleep out the whole backoff after a stop.
+    let mut stop_backoff = stop_task.clone();
     let credentials_task = Arc::clone(&credentials);
     let shared_task = Arc::clone(&shared_client);
     let node_id_owned = node_id.to_string();
@@ -212,8 +244,14 @@ pub async fn connect(
         // Floor backoff at 2s so a bad password / broker blip cannot LWT-flap at 1Hz.
         let mut backoff_ms: u64 = 2_000;
         loop {
+            // Re-check the level at the top of every pass: `changed()` only
+            // reports transitions it sees while registered, and this task is
+            // not registered for the duration of the branches below.
+            if *stop_task.borrow_and_update() {
+                break;
+            }
             tokio::select! {
-                _ = shutdown_task.notified() => break,
+                _ = stop_task.changed() => break,
                 event = eventloop.poll() => {
                     match event {
                         Ok(Event::Incoming(Incoming::ConnAck(_))) => {
@@ -245,7 +283,7 @@ pub async fn connect(
                                 "acowork-android mqtt: {e} — retry in {backoff_ms}ms"
                             ));
                             tokio::select! {
-                                _ = shutdown_task.notified() => break,
+                                _ = stop_backoff.changed() => break,
                                 _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
                             }
                             backoff_ms = (backoff_ms.saturating_mul(2)).min(30_000);
@@ -277,7 +315,7 @@ pub async fn connect(
         incoming: rx,
         connected,
         bootstrap: boot_rx,
-        shutdown,
+        stop_tx,
         node_id: node_id.to_string(),
     })
 }
@@ -493,6 +531,57 @@ mod tests {
     use super::*;
     use crate::node::identity::{EnrollmentState, NodeIdentity};
 
+    /// The poll task is not registered for a stop signal while it is inside
+    /// `bootstrap_subscriptions()` or the error branches. A stop landing in
+    /// that window still has to stop it: otherwise the next `start()` opens a
+    /// second client under the same `node:{id}`, the broker kicks both, and the
+    /// node never settles online.
+    #[tokio::test]
+    async fn stop_landed_while_the_poll_task_was_not_waiting_still_stops_it() {
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+
+        let busy = tokio::spawn(async move {
+            loop {
+                // The un-registered window: work between `select!` points.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                if *stop_rx.borrow_and_update() {
+                    return true;
+                }
+                tokio::select! {
+                    _ = stop_rx.changed() => return true,
+                    _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+                }
+            }
+        });
+
+        // Signal while the task is parked in that window, not waiting.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let _ = stop_tx.send(true);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), busy)
+                .await
+                .expect("poll task never observed a stop that arrived outside its select! window")
+                .expect("task panicked")
+        );
+    }
+
+    /// Why the previous mechanism lost that signal: `notify_waiters()` is
+    /// edge-triggered and stores no permit, so a task that was not waiting at
+    /// that instant never learns a stop happened.
+    #[tokio::test]
+    async fn notify_waiters_is_edge_triggered_and_drops_the_signal() {
+        let n = Arc::new(Notify::new());
+        n.notify_waiters();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), n.notified())
+                .await
+                .is_err(),
+            "a waiter registered after the notification must not be woken"
+        );
+    }
+
     #[test]
     fn enroll_envelope_round_trips_through_prost() {
         let id = NodeIdentity {
@@ -503,6 +592,7 @@ mod tests {
             enrollment: EnrollmentState::Created,
             created_at: 0,
             enrolled_at: None,
+            enrolled_with: None,
         };
         let env = enroll_envelope(&id, vec!["control_plane".into()], "tok");
         let bytes = env.encode_to_vec();

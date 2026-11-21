@@ -213,8 +213,9 @@ fn unix_call(
     timeout: Duration,
 ) -> Result<DeviceResponse, DeviceError> {
     use std::io::{BufReader, Write};
-    use std::os::unix::net::UnixStream;
 
+    // The stream type is named in full in connect_with_retry's signature; it
+    // needs no import here because only its methods are used.
     let mut stream = connect_with_retry(sock)?;
     stream
         .set_read_timeout(Some(timeout))

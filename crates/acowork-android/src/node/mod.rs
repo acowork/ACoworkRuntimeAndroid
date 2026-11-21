@@ -19,10 +19,11 @@ pub mod topics;
 pub use control::{ControlCtx, handle_control, refresh_info, set_node_home, start_agent, sync_ports_from_table};
 pub use engine::{EngineError, EngineSpec, RuntimeLaunch};
 pub use enroll::{EnrollError, EnrollRequest, GatewayReachability, check_gateway_http};
-pub use identity::{EnrollmentState, IdentityError, NodeIdentity};
+pub use identity::{EnrollmentState, IdentityError, JoinPlan, NodeIdentity};
 pub use mqtt::{
     IncomingPublish, MqttError, MqttSession, SharedCredentials, SharedIdentity, announce,
-    connect as mqtt_connect, decode_enroll_result, decode_envelope, publish_event,
+    announce_with_enroll, connect as mqtt_connect, decode_enroll_result, decode_envelope,
+    publish_event,
 };
 pub use package::{
     InstalledPackage, ManifestSummary, PackageError, PackageInventory, download_package,

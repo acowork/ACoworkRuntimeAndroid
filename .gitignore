@@ -3,7 +3,10 @@ target/
 **/target/
 **/*.rs.bk
 *.pdb
-Cargo.lock
+# `Cargo.lock` is deliberately NOT ignored. This workspace builds binaries (the
+# host CLI and the JNI cdylib that ship inside the APK), so the resolved
+# dependency versions are part of the release contract: a lockfile that moves
+# under you changes the bytes you ship. The main repo makes the same call.
 
 # Android / Gradle
 .gradle/
@@ -13,9 +16,19 @@ local.properties
 *.aab
 *.ap_
 *.dex
-*.keystore
 captures/
 .cxx/
+
+# Signing material - NEVER commit these.
+# The keystore is the app's upgrade identity: leaking it lets anyone sign an
+# update the device accepts, and losing it means the app can never be updated
+# in place. The local signing properties carry the passwords in plaintext.
+*.keystore
+*.jks
+*.p12
+*.pf2
+keystore.properties
+keys/
 
 # NDK / native artifacts
 *.o

@@ -87,7 +87,7 @@ object UsbHidHandler {
             DevicePermissions.usb(context, device.deviceName)
             return DeviceJson.err(
                 "permission_required",
-                "Grant USB access for ${device.deviceName} (vid=${device.vendorId} pid=${device.productId}) from the ACowork Host notification, then retry.",
+                "Grant USB access for ${device.deviceName} (vid=${device.vendorId} pid=${device.productId}) from the ACoworkNode notification, then retry.",
             )
         }
         val who = DeviceBridge.agentLabel(agent)

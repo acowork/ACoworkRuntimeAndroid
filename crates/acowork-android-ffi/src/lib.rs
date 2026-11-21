@@ -8,6 +8,9 @@
 mod jni_exports;
 mod node_host;
 
+#[cfg(target_os = "android")]
+mod logcat;
+
 use std::path::PathBuf;
 
 use jni::JNIEnv;
@@ -35,13 +38,18 @@ fn rt() -> &'static tokio::runtime::Runtime {
 fn init_log() {
     static ONCE: OnceCell<()> = OnceCell::new();
     let _ = ONCE.get_or_init(|| {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-            )
-            .with_writer(std::io::stderr)
-            .try_init();
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        let builder = tracing_subscriber::fmt().with_env_filter(filter);
+        #[cfg(target_os = "android")]
+        let builder = {
+            // stderr is /dev/null in an app process, and ANSI colours would be
+            // written into logcat as escapes. See `logcat` for the why.
+            builder.with_ansi(false).with_writer(logcat::LogcatWriter)
+        };
+        #[cfg(not(target_os = "android"))]
+        let builder = builder.with_writer(std::io::stderr);
+        let _ = builder.try_init();
     });
 }
 

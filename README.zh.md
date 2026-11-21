@@ -292,15 +292,19 @@ ACOWORK_ADB=/path/to/adb ACOWORK_ADB_SERIAL=<serial> \
 
 NDK **26.1.10909125**，目标 **`aarch64-linux-android`**（本切片仅 arm64-v8a）。
 
-```powershell
-# 仓库根目录 —— 为 zstd-sys 等设置 CC/CFLAGS/sysroot
-. .\scripts\android-ndk-env.ps1
-cargo build -p acowork-android-ffi --release --target aarch64-linux-android
-# 或：cd apps/android && ./gradlew cargoNdkArm64
-
-cd apps/android
-./gradlew :app:assembleDebug
+```bash
+./dev/android/build_android.sh            # debug APK   （Linux / macOS）
+./dev/android/build_android.sh --release  # release APK
 ```
+
+```powershell
+.\dev\android\build_android.ps1           # debug APK   （Windows）
+.\dev\android\build_android.ps1 -Release
+```
+
+构建脚本负责工具链定位、Rust 交叉编译、打包的 POSIX shell（mksh R57）、Gradle 打包与
+发布签名。签名密钥始终留在本地，不进仓库 —— 见
+[`dev/android/README.md`](dev/android/README.md)。
 
 细节见 [`apps/android/README.md`](apps/android/README.md)。主仓 mobile 仍是独立的
 **客户端**产品（[ADR-AND-004](docs/adr/zh/ADR-AND-004-independent-apk-deliverable.md)）。

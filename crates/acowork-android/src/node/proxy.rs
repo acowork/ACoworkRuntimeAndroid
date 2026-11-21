@@ -4,11 +4,12 @@
 //! `X-ACowork-Node-Token` header once a node_token exists. Routes:
 //! - `GET /health`
 //! - `GET /fs/browse?path=&show_hidden=`
+//! - `PATCH /node/name` — rename this node (ADR-075 D4)
 //! - `ANY /agents/{instance_id}/{*rest}` → `http://127.0.0.1:{http_port}/{rest}`
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -16,7 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Notify, RwLock};
 
-use super::identity::NodeIdentity;
+use super::identity::{IdentityError, NodeIdentity};
 use super::mqtt::SharedIdentity;
 
 /// Live map of instance_id → loopback HTTP port.
@@ -28,6 +29,12 @@ pub struct ProxyState {
     pub identity: SharedIdentity,
     /// Running runtimes' loopback ports.
     pub ports: PortTable,
+    /// Where `identity.json` lives — a rename must survive the process.
+    pub home: PathBuf,
+    /// Fired after a rename so the host loop republishes the retained
+    /// `info` snapshot; without it the Gateway keeps serving the old name
+    /// until the next heartbeat.
+    pub republish: Arc<Notify>,
 }
 
 /// Handle for the background proxy listener.
@@ -142,6 +149,15 @@ async fn handle_connection(mut stream: TcpStream, state: &ProxyState) -> Result<
         return Ok(());
     }
 
+    if method == "PATCH" && path == "/node/name" {
+        let resp = handle_rename(state, &body).await;
+        stream
+            .write_all(resp.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
     if let Some(rest) = path.strip_prefix("/agents/") {
         let (instance_id, suffix) = match rest.split_once('/') {
             Some((id, rest)) => (id, rest),
@@ -246,6 +262,51 @@ fn parse_http_request(raw: &[u8]) -> Result<(String, String, RequestHeaders, Vec
     let (method, path, headers) = parse_request_line(header_text)?;
     let body = raw[header_end..].to_vec();
     Ok((method, path, headers, body))
+}
+
+/// `PATCH /node/name` — `{ "nodeName": "gpu-2" }` (ADR-075 D4).
+///
+/// The node owns the file being written, so validation and persistence live
+/// here; the Gateway only proxies. This mirrors the PC node's
+/// `node_api::rename_node` — Desktop's node settings dialog speaks that one
+/// contract to whichever kind of node it is pointed at, and an Android node
+/// that does not answer it surfaces the node's own 404 in the dialog.
+async fn handle_rename(state: &ProxyState, body: &[u8]) -> String {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RenameBody {
+        node_name: String,
+    }
+    let requested = match serde_json::from_slice::<RenameBody>(body) {
+        Ok(b) => b.node_name,
+        Err(e) => {
+            return http_response(
+                400,
+                "application/json",
+                &serde_json::json!({ "error": format!("invalid body: {e}") }).to_string(),
+            );
+        }
+    };
+    let (status, payload) = {
+        let mut id = state.identity.write().await;
+        match id.set_name(&state.home, &requested) {
+            Ok(changed) => {
+                let name = id.node_name.clone();
+                drop(id);
+                if changed {
+                    // Persisted first, announced second: a rename that reached
+                    // the file but not the broker still survives the restart,
+                    // while the republish is only what makes Desktop converge
+                    // before the next heartbeat.
+                    state.republish.notify_one();
+                }
+                (200, serde_json::json!({ "node_name": name }))
+            }
+            Err(IdentityError::Invalid(msg)) => (400, serde_json::json!({ "error": msg })),
+            Err(e) => (500, serde_json::json!({ "error": e.to_string() })),
+        }
+    };
+    http_response(status, "application/json", &payload.to_string())
 }
 
 async fn authorize(state: &ProxyState, headers: &[(String, String)]) -> Option<String> {
@@ -620,6 +681,92 @@ mod tests {
 
     // Env mutation is process-global; serialize HOME-dependent tests.
     static HOME_LOCK: Mutex<()> = Mutex::new(());
+
+    fn rename_state(tag: &str, node_name: &str) -> (ProxyState, Arc<Notify>, PathBuf) {
+        let home = std::env::temp_dir().join(format!(
+            "acowork-rename-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+        let identity = NodeIdentity {
+            node_id: "00000000-0000-4000-8000-000000000001".into(),
+            node_name: node_name.into(),
+            node_token: Some("nd-1".into()),
+            gateway_addr: Some("127.0.0.1:19875".into()),
+            enrollment: crate::node::EnrollmentState::Enrolled,
+            created_at: 0,
+            enrolled_at: None,
+            enrolled_with: None,
+        };
+        identity.save(&home).unwrap();
+        let republish = Arc::new(Notify::new());
+        let state = ProxyState {
+            identity: shared_identity(identity),
+            ports: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            home: home.clone(),
+            republish: Arc::clone(&republish),
+        };
+        (state, republish, home)
+    }
+
+    async fn wait_notified(notify: &Notify) -> bool {
+        tokio::time::timeout(std::time::Duration::from_millis(50), notify.notified())
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn rename_persists_and_asks_for_a_reannounce() {
+        let (state, republish, home) = rename_state("ok", "phone-1");
+        let resp = handle_rename(&state, br#"{"nodeName":"gpu-2"}"#).await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(resp.contains(r#""node_name":"gpu-2""#), "{resp}");
+
+        // The file is the source of truth across a restart — that is the whole
+        // point of letting the node, not the Gateway, perform the write.
+        let on_disk = NodeIdentity::load(&home).unwrap().unwrap();
+        assert_eq!(on_disk.node_name, "gpu-2");
+        assert!(
+            wait_notified(&republish).await,
+            "a rename must republish info, or Desktop shows the old name until the next heartbeat"
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn rename_rejects_an_invalid_slug_without_touching_the_file() {
+        let (state, republish, home) = rename_state("bad", "phone-1");
+        let resp = handle_rename(&state, br#"{"nodeName":"Bad Name!"}"#).await;
+        assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+        assert!(resp.contains("error"), "{resp}");
+        assert_eq!(state.identity.read().await.node_name, "phone-1");
+        assert_eq!(NodeIdentity::load(&home).unwrap().unwrap().node_name, "phone-1");
+        assert!(!wait_notified(&republish).await, "a rejected rename announces nothing");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn rename_to_the_current_name_is_a_quiet_success() {
+        // ADR-075 D4 idempotence: the Gateway may retry, and a no-op must not
+        // churn the retained snapshot.
+        let (state, republish, home) = rename_state("same", "phone-1");
+        let resp = handle_rename(&state, br#"{"nodeName":"phone-1"}"#).await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(!wait_notified(&republish).await);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn rename_without_the_camel_case_field_is_a_bad_request() {
+        // The Gateway sends `nodeName`; a `node_name` body would silently
+        // rename nothing if the field were optional.
+        let (state, _republish, home) = rename_state("missing", "phone-1");
+        let resp = handle_rename(&state, br#"{"node_name":"gpu-2"}"#).await;
+        assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+        assert_eq!(NodeIdentity::load(&home).unwrap().unwrap().node_name, "phone-1");
+        let _ = fs::remove_dir_all(&home);
+    }
 
     #[test]
     fn root_entries_include_home() {

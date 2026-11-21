@@ -233,7 +233,7 @@ object DevicePermissions {
         notify(context, permission, null)
         return DeviceJson.err(
             "permission_required",
-            "Grant $permission from the ACowork Host notification, then retry.",
+            "Grant $permission from the ACoworkNode notification, then retry.",
         )
     }
 
@@ -245,7 +245,7 @@ object DevicePermissions {
         notifyAccessibility(context)
         return DeviceJson.err(
             "permission_required",
-            "Enable the ACowork Host accessibility service in Android Settings, then retry. The app cannot turn this on by itself.",
+            "Enable the ACoworkNode accessibility service in Android Settings, then retry. The app cannot turn this on by itself.",
         )
     }
 
@@ -253,7 +253,7 @@ object DevicePermissions {
         notifyProjection(context)
         return DeviceJson.err(
             "permission_required",
-            "Grant screen capture from the ACowork Host notification, then retry. Needed for screenshots when Accessibility takeScreenshot is unavailable.",
+            "Grant screen capture from the ACoworkNode notification, then retry. Needed for screenshots when Accessibility takeScreenshot is unavailable.",
         )
     }
 
