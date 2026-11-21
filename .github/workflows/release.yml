@@ -103,7 +103,12 @@ jobs:
           key: release-android-registry-${{ hashFiles('Cargo.lock') }}
 
       - name: Set up the Android SDK
-        uses: android-actions/setup-android@v3
+        # v3 is not usable: it installs the legacy `tools` package, which was
+        # removed from the SDK repository, so `sdkmanager tools` exits 1 and
+        # the whole build job dies before the cross-compile. Fixed upstream in
+        # 4.0.2 ("Fix for removed tools package", PR #538); v4 also moved the
+        # action onto Node 24. Do not downgrade this pin.
+        uses: android-actions/setup-android@v4
 
       - name: Install the NDK
         run: |
