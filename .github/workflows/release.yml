@@ -1,0 +1,261 @@
+name: Release
+
+# Release automation for ACoworkNode.
+#
+# The trigger is an annotated v* tag. The workflow builds the APK, signs it
+# with the keystore held in a repository SECRET (never in the repository), and
+# publishes a DRAFT GitHub Release. A maintainer verifies the assets and
+# presses Publish - nothing reaches users automatically.
+#
+# What is deliberately NOT here:
+#   * a PR gate that assembles the APK. The Android build needs the NDK, a
+#     JDK with jlink, and a ~4 minute Rust cross-compile; that is a release
+#     cost, not a per-push cost. See apps/android/README.md for the local
+#     gate a contributor runs instead.
+#
+# The signing secret is the base64 of the .jks. It is a repository secret
+# (Settings -> Secrets -> Actions), NOT a file in the tree: the local
+# keystore stays on the maintainer's disk (see dev/android/setup_keystore.sh)
+# and only its base64 encoding is uploaded to GitHub's encrypted secret store.
+# A keystore that is ever committed to the tree is compromised and must be
+# rotated - see docs/design/zh/release-android.md.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify tag and version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Tag matches VERSION
+        # The repo-root VERSION file is authoritative. A tag that disagrees
+        # with it would ship an APK whose versionName nobody declared.
+        run: |
+          VERSION=$(tr -d '[:space:]' < VERSION)
+          echo "VERSION file : $VERSION"
+          echo "tag          : $GITHUB_REF_NAME"
+          [ "$GITHUB_REF_NAME" = "v$VERSION" ] || {
+            echo "::error::tag $GITHUB_REF_NAME does not match VERSION ($VERSION)"
+            exit 1
+          }
+
+      - name: Version declarations agree
+        # The APK's versionName/versionCode are derived from the same VERSION
+        # file at build time; this proves the Gradle block reads it.
+        run: |
+          VERSION=$(tr -d '[:space:]' < VERSION)
+          MAJOR=$(echo "$VERSION" | cut -d. -f1)
+          MINOR=$(echo "$VERSION" | cut -d. -f2)
+          PATCH=$(echo "$VERSION" | cut -d. -f3 | cut -d- -f1)
+          CODE=$((MAJOR * 1000000 + MINOR * 1000 + PATCH))
+          echo "versionName  : $VERSION"
+          echo "versionCode  : $CODE"
+          [ "$CODE" -gt 0 ] || { echo "::error::bad versionCode"; exit 1; }
+
+  build:
+    name: Build signed APK
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Temurin 17 ships jlink, which AGP's JdkImageTransform requires. IDE
+      # runtimes (IntelliJ JBR, some Android Studio builds) omit it and the
+      # build dies with "jlink executable ... does not exist".
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache the cargo registry
+        # Registry downloads only. Caching target/ across tags risks reusing a
+        # stale native library, which is exactly the class of bug a release
+        # build must not have.
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: release-android-registry-${{ hashFiles('Cargo.lock') }}
+
+      - name: Set up the Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install the NDK
+        run: |
+          sdkmanager --install "ndk;26.1.10909125"
+          sdkmanager --install "build-tools;35.0.0"
+          sdkmanager --install "platforms;android-35"
+          # The licenses are accepted here so the build does not stop on a
+          # prompt. -sdk_root pins the location so later steps agree.
+          yes | sdkmanager --licenses > /dev/null || true
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/26.1.10909125" >> "$GITHUB_ENV"
+
+      - name: Build the packaged shell (mksh R57)
+        # The packaged POSIX shell is a third-party binary, so it is built
+        # from a pinned upstream commit rather than committed. See
+        # dev/android/build_ash.sh for why the app needs one.
+        run: ./dev/android/build_ash.sh
+
+      - name: Cross-compile the Rust artifacts
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+        run: |
+          NDK="$ANDROID_NDK_HOME"
+          PRE="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
+          SYSROOT="$PRE/sysroot"
+          # cc-rs compiles C sources for zstd-sys / rusqlite, so it needs the
+          # NDK sysroot and not merely a linker.
+          export CC_aarch64_linux_android="$PRE/bin/aarch64-linux-android26-clang"
+          export CXX_aarch64_linux_android="$PRE/bin/aarch64-linux-android26-clang++"
+          export AR_aarch64_linux_android="$PRE/bin/llvm-ar"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$PRE/bin/aarch64-linux-android26-clang"
+          export CFLAGS_aarch64_linux_android="--sysroot=$SYSROOT"
+          export CXXFLAGS_aarch64_linux_android="--sysroot=$SYSROOT"
+          cargo build \
+            -p acowork-android-ffi \
+            -p acowork-android-cli \
+            --release \
+            --target aarch64-linux-android
+
+      - name: Stage the native libraries
+        run: |
+          JNI="apps/android/app/src/main/jniLibs/arm64-v8a"
+          mkdir -p "$JNI"
+          cp target/aarch64-linux-android/release/libacowork_android_ffi.so "$JNI/"
+          # The CLI is packaged as lib*.so so AGP extracts it with the +x bit
+          # into nativeLibraryDir, where it can be spawned.
+          cp target/aarch64-linux-android/release/acowork-android "$JNI/libacowork_engine.so"
+          cp build/android/libacowork_ash.so "$JNI/"
+          ls -la "$JNI"
+
+      - name: Restore the signing keystore
+        # The keystore itself is the repository SECRET, base64-encoded. It is
+        # written to the runner's temp directory, used, and deleted - it is
+        # never part of the checkout and never uploaded as an artifact.
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ACOWORK_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ACOWORK_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ACOWORK_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ACOWORK_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::secret ACOWORK_KEYSTORE_BASE64 is not set - the APK cannot be signed"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/signing"
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/signing/acoworknode.jks"
+          # Prove the secret decodes into a real keystore before the build
+          # depends on it.
+          keytool -list -keystore "$RUNNER_TEMP/signing/acoworknode.jks" \
+            -storepass "$KEYSTORE_PASSWORD" > /dev/null
+          echo "keystore OK"
+          {
+            echo "acowork.keystoreFile=$RUNNER_TEMP/signing/acoworknode.jks"
+            echo "acowork.keystorePassword=$KEYSTORE_PASSWORD"
+            echo "acowork.keyAlias=$KEY_ALIAS"
+            echo "acowork.keyPassword=$KEY_PASSWORD"
+          } > keystore.properties
+
+      - name: Assemble the release APK
+        working-directory: apps/android
+        # The tag's "v" prefix is stripped: the APK's versionName is what the
+        # device compares, and it must not carry the prefix.
+        run: |
+          VERSION=$(tr -d '[:space:]' < ../../VERSION)
+          ./gradlew :app:assembleRelease -Pacowork.version="$VERSION"
+
+      - name: Verify the signature
+        # An unsigned or unverified APK must never reach the release assets.
+        run: |
+          APK=$(find apps/android/app/build/outputs/apk/release -name '*.apk' -print -quit)
+          [ -n "$APK" ] || { echo "::error::no release APK produced"; exit 1; }
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/35.0.0/apksigner"
+          "$APKSIGNER" verify --print-certs "$APK"
+          echo "signature VERIFIED"
+
+      - name: Collect the assets
+        run: |
+          mkdir -p release-assets
+          APK=$(find apps/android/app/build/outputs/apk/release -name '*.apk' -print -quit)
+          VERSION=$(tr -d '[:space:]' < VERSION)
+          # Name the asset after the product and the version, so a download
+          # is identifiable without the release page.
+          cp "$APK" "release-assets/ACoworkNode-$VERSION-arm64-v8a.apk"
+          ls -lh release-assets
+
+      - name: Generate SHA256SUMS.txt
+        working-directory: release-assets
+        run: |
+          find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' -print0 \
+            | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: acoworknode-apk
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Draft GitHub Release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download the assets
+        uses: actions/download-artifact@v4
+        with:
+          name: acoworknode-apk
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate release notes
+        run: |
+          PREV=$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)
+          if [ -z "$PREV" ]; then
+            printf '## %s\n\nInitial release — see the commit history for the full list of changes.\n' "$GITHUB_REF_NAME" > RELEASE_NOTES.md
+          else
+            {
+              printf '## %s\n\n' "$GITHUB_REF_NAME"
+              git log --pretty='- %s' "$PREV..$GITHUB_REF_NAME"
+            } > RELEASE_NOTES.md
+          fi
+          cat RELEASE_NOTES.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          body_path: RELEASE_NOTES.md
+          files: release-assets/*
