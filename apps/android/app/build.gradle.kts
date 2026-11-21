@@ -1,7 +1,75 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
+
+// ── Version ──────────────────────────────────────────────────────────────────
+// The repo-root VERSION file is authoritative. `acowork.version` (a Gradle
+// property) and ACOWORK_VERSION (an environment variable) override it, so CI
+// can stamp a tag-derived version without editing a file.
+// `rootProject` is `apps/android`, so the repository root is two levels up.
+val repoRootDir = rootProject.file("../..")
+
+val versionText = (findProperty("acowork.version") as String?)
+    ?: System.getenv("ACOWORK_VERSION")
+    ?: repoRootDir.resolve("VERSION").takeIf { it.isFile }?.readText()?.trim()
+    ?: "0.1.0"
+
+// A release tag carries a "v" prefix ("v0.1.0"); the APK's versionName must
+// not, because it is what the device's package manager compares.
+//
+// NOTE the name: inside `defaultConfig { }` the identifier `versionName`
+// resolves to the DSL property being assigned, not to a variable of the same
+// name, so a variable called `versionName` would silently assign itself.
+val appVersionName = versionText.removePrefix("v").trim()
+
+val versionParts = appVersionName.split('.')
+require(versionParts.size >= 3) { "ACoworkNode version must be MAJOR.MINOR.PATCH, got '$appVersionName'" }
+val versionMajor = versionParts[0].toInt()
+val versionMinor = versionParts[1].toInt()
+val versionPatch = versionParts[2].substringBefore('-').toInt()
+
+// Monotonic versionCode: Play rejects an upload whose code does not increase.
+// major*1_000_000 + minor*1_000 + patch keeps room for 999 patches per minor.
+val versionCodeValue = versionMajor * 1_000_000 + versionMinor * 1_000 + versionPatch
+
+// ── Signing ──────────────────────────────────────────────────────────────────
+// The keystore NEVER lives in the repository. It is read from a local path
+// (gradle property `acowork.keystoreFile`, or env ACOWORK_KEYSTORE_FILE) and
+// the passwords come from the environment, so CI can inject them as secrets.
+//
+// When any piece is missing the release build stays UNSIGNED instead of
+// failing: an unsigned release APK is still useful for local smoke tests, and
+// a release workflow that silently produced an unsigned artifact would be
+// worse than one that says so.
+val signingPropsFile = repoRootDir.resolve("keystore.properties")
+val signingProps = Properties().apply {
+    if (signingPropsFile.isFile) signingPropsFile.inputStream().use { load(it) }
+}
+
+fun signingValue(propName: String, envName: String): String? {
+    val v = (project.findProperty(propName) as String?)?.takeIf { it.isNotBlank() }
+        ?: signingProps.getProperty(propName)?.takeIf { it.isNotBlank() }
+        ?: System.getenv(envName)?.takeIf { it.isNotBlank() }
+    return v
+}
+
+// NOTE the names: inside `create("release") { ... }` the receiver is a
+// SigningConfig, which has properties named storeFile / storePassword /
+// keyAlias / keyPassword. A variable with the same name would make the
+// right-hand side resolve to the receiver's own (unset) property instead of
+// our value, and the build would fail with a confusing "missing required
+// property" error.
+val signingKeystoreFile = signingValue("acowork.keystoreFile", "ACOWORK_KEYSTORE_FILE")
+val signingKeystorePassword = signingValue("acowork.keystorePassword", "ACOWORK_KEYSTORE_PASSWORD")
+val signingKeyAlias = signingValue("acowork.keyAlias", "ACOWORK_KEY_ALIAS")
+val signingKeyPassword = signingValue("acowork.keyPassword", "ACOWORK_KEY_PASSWORD")
+
+val hasSigningMaterial = listOf(
+    signingKeystoreFile, signingKeystorePassword, signingKeyAlias, signingKeyPassword
+).all { !it.isNullOrBlank() }
 
 android {
     namespace = "com.acowork.androidhost"
@@ -11,10 +79,30 @@ android {
         applicationId = "com.acowork.androidhost"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = versionCodeValue
+        versionName = appVersionName
         ndk {
             abiFilters += listOf("arm64-v8a")
+        }
+    }
+
+    signingConfigs {
+        if (hasSigningMaterial) {
+            create("release") {
+                // `file()` resolves against the app module, but the keystore
+                // path comes from a repo-root-relative or absolute location.
+                // Resolve it against the repo root so both work.
+                // `hasSigningMaterial` proves these are non-null, but the
+                // compiler cannot see that through the list check.
+                val store = signingKeystoreFile!!
+                storeFile = file(
+                    if (File(store).isAbsolute) store
+                    else repoRootDir.resolve(store).path
+                )
+                storePassword = signingKeystorePassword
+                keyAlias = signingKeyAlias
+                keyPassword = signingKeyPassword
+            }
         }
     }
 
@@ -25,6 +113,9 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
+            if (hasSigningMaterial) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
         debug {
             isDebuggable = true
@@ -65,12 +156,39 @@ val cargoTarget = "aarch64-linux-android"
 val jniOut = layout.projectDirectory.dir("src/main/jniLibs/arm64-v8a")
 val workspaceRoot = layout.projectDirectory.dir("../../..")
 
+// The NDK toolchain env must be exported for the whole cargo invocation, not
+// just the linker: `zstd-sys` and friends compile C sources with cc-rs, and
+// without CC/CFLAGS pointing at the NDK sysroot they fail with
+// "string.h file not found". Setting the linker alone is not enough.
+val ndkVersion = "26.1.10909125"
+val ndkHome = System.getenv("ANDROID_NDK_HOME")
+    ?: (System.getenv("ANDROID_HOME")?.let { "$it/ndk/$ndkVersion" })
+    ?: ""
+val ndkHostTag = when {
+    System.getProperty("os.name").startsWith("Windows") -> "windows-x86_64"
+    System.getProperty("os.name").startsWith("Mac") -> "darwin-x86_64"
+    else -> "linux-x86_64"
+}
+val ndkPrebuilt = if (ndkHome.isNotBlank()) "$ndkHome/toolchains/llvm/prebuilt/$ndkHostTag" else ""
+val ndkIsWindows = ndkHostTag.startsWith("windows")
+// The NDK ships a `.cmd` shim on Windows and a plain executable elsewhere.
+val clangName = if (ndkIsWindows) "aarch64-linux-android26-clang.cmd" else "aarch64-linux-android26-clang"
+val clangxxName = if (ndkIsWindows) "aarch64-linux-android26-clang++.cmd" else "aarch64-linux-android26-clang++"
+val arName = if (ndkIsWindows) "llvm-ar.exe" else "llvm-ar"
+
 tasks.register<Exec>("cargoNdkArm64") {
     group = "build"
     description = "Cross-compile host FFI and engine CLI for arm64-v8a"
     workingDir = workspaceRoot.asFile
-    environment("ANDROID_NDK_HOME", System.getenv("ANDROID_NDK_HOME")
-        ?: (System.getenv("ANDROID_HOME")?.let { "$it/ndk/26.1.10909125" } ?: ""))
+    environment("ANDROID_NDK_HOME", ndkHome)
+    if (ndkPrebuilt.isNotBlank()) {
+        environment("CC_aarch64_linux_android", "$ndkPrebuilt/bin/$clangName")
+        environment("CXX_aarch64_linux_android", "$ndkPrebuilt/bin/$clangxxName")
+        environment("AR_aarch64_linux_android", "$ndkPrebuilt/bin/$arName")
+        environment("CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER", "$ndkPrebuilt/bin/$clangName")
+        environment("CFLAGS_aarch64_linux_android", "--sysroot=$ndkPrebuilt/sysroot")
+        environment("CXXFLAGS_aarch64_linux_android", "--sysroot=$ndkPrebuilt/sysroot")
+    }
     commandLine(
         "cargo", "build",
         "-p", "acowork-android-ffi",
@@ -96,6 +214,27 @@ tasks.register<Exec>("cargoNdkArm64") {
             throw GradleException("missing $engineSrc — android device tools will not appear until the engine is rebuilt")
         }
         engineSrc.copyTo(engineDst, overwrite = true)
+    }
+}
+
+// The packaged POSIX shell (mksh R57) that the host uses when SELinux forbids
+// untrusted_app from exec'ing /system/bin/sh. It is a third-party binary, so
+// it is built from a pinned upstream commit by dev/android/build_ash.sh and
+// copied in here — never committed, exactly like the Rust artifacts above.
+tasks.register("copyPackagedShell") {
+    group = "build"
+    description = "Copy the prebuilt libacowork_ash.so into jniLibs"
+    val ashSrc = layout.projectDirectory.dir("../../../build/android/libacowork_ash.so")
+    val ashDst = jniOut.dir("libacowork_ash.so")
+    inputs.file(ashSrc).optional()
+    outputs.file(ashDst)
+    doLast {
+        if (!ashSrc.asFile.isFile) {
+            throw GradleException(
+                "missing ${ashSrc.asFile} — run dev/android/build_ash.sh to build the packaged shell"
+            )
+        }
+        ashSrc.asFile.copyTo(ashDst.asFile, overwrite = true)
     }
 }
 
