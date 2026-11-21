@@ -78,7 +78,7 @@ jobs:
       # Temurin 17 ships jlink, which AGP's JdkImageTransform requires. IDE
       # runtimes (IntelliJ JBR, some Android Studio builds) omit it and the
       # build dies with "jlink executable ... does not exist".
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '17'
