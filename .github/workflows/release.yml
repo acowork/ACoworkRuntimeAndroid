@@ -41,6 +41,20 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Shell scripts are executable
+        # A missing exec bit is invisible on a Windows checkout - core.fileMode
+        # is false there, so the working copy always looks executable - and
+        # fatal on a Linux runner, where `./dev/android/build_ash.sh` dies with
+        # exit 126. Check the mode git recorded, not the one on disk, so this
+        # class of bug fails here instead of minutes later in the build job.
+        run: |
+          bad=$(git ls-files -s '*.sh' | awk '$1 != "100755" { print $4 }')
+          if [ -n "$bad" ]; then
+            echo "::error::tracked .sh files without the executable bit: $(echo $bad | tr '\n' ' ')"
+            exit 1
+          fi
+          echo "every tracked shell script is recorded 100755"
+
       - name: Tag matches VERSION
         # The repo-root VERSION file is authoritative. A tag that disagrees
         # with it would ship an APK whose versionName nobody declared.
